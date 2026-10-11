@@ -379,7 +379,7 @@ test('recovery reopens an interrupted approved restart without requesting anothe
   assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart.json'))).outcome, 'interrupted-reopened')
 })
 
-test('an approved plan moves only after shutdown and keeps cloud calls outside its window', async () => {
+test('an approved plan moves held records only after shutdown and keeps cloud calls outside its window', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
   await h.record('P', SOURCE)
@@ -396,7 +396,7 @@ test('an approved plan moves only after shutdown and keeps cloud calls outside i
   assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
   assert.equal(await readFile(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
   const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, cloudRequested: true, report: (stage) => {
-    if (stage === 'scan') assert.ok(calls.includes('/usr/bin/osascript'))
+    if (stage === 'move') assert.ok(calls.includes('/usr/bin/osascript'))
   } })
   assert.equal(result.restarted, true)
   assert.equal(result.receipt.sessions.length, 1)
@@ -5173,8 +5173,8 @@ test('task checkpoint integrity keeps interrupted Undo scoped to the whole recei
   assert.ok((await finishWorkflow(h.paths, { processes: [] })).dest)
   assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
   assert.deepEqual(await Promise.all(h.sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), h.originalRecords)
-  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), { scheduledTasks: [], recordedSkips: {}, runRetries: {} })
-  assert.deepEqual(await readdir(h.dir('T')), ['scheduled-tasks.json'])
+  assert.equal(await stat(h.targetFile).catch(() => null), null)
+  assert.deepEqual(await readdir(h.dir('T')), [])
 })
 
 test('task preflight refuses absent sources and unreadable destination data', async () => {
@@ -5779,7 +5779,7 @@ test('resumed mixed ordinary and task work counts every newly placed record', as
 async function interruptTaskFamily(h, operation, stage) {
   const hook = stage === 'record' ? 'link' : 'rename'
   const destination = stage === 'record' ? path.join(h.dir('T'), `local_${h.notificationId ?? SOURCE}.json`) : stage === 'source' ? h.sourceFile : h.targetFile
-  const matches = stage === 'receipt' ? `args[1].startsWith(paths.state + '/') && JSON.parse(await fs.readFile(args[1], 'utf8')).taskTransfers?.length` : `args[1] === ${JSON.stringify(destination)}`
+  const matches = ['receipt', 'retiring'].includes(stage) ? `args[1].startsWith(paths.state + '/') && JSON.parse(await fs.readFile(args[1], 'utf8')).${stage === 'retiring' ? 'retiring' : 'taskTransfers?.length'}` : `args[1] === ${JSON.stringify(destination)}`
   const script = `
     import childProcess from 'node:child_process'
     import fs from 'node:fs/promises'
@@ -5798,7 +5798,15 @@ async function interruptTaskFamily(h, operation, stage) {
     const paths = layout(${JSON.stringify(h.root)})
     const all = await accounts(paths, [])
     if (${JSON.stringify(operation)} === 'undo') await undo(paths, { processes: [] })
-    else await executeMove(${JSON.stringify(h.sourceAccounts ?? [h.acct.P])}.map(account => all.find(row => row.account === account)), all.find(row => row.account === ${JSON.stringify(h.acct.T)}), paths, { processes: [] })
+    else {
+      const from = ${JSON.stringify(h.sourceAccounts ?? [h.acct.P])}.map(account => all.find(row => row.account === account)), to = all.find(row => row.account === ${JSON.stringify(h.acct.T)})
+      if (${Boolean(h.restart)}) {
+        let rows = ${JSON.stringify([desktopFixture()[0]])}
+        const io = { inspect: () => rows, command: async file => { rows = file.endsWith('osascript') ? [] : ${JSON.stringify([desktopFixture()[0]])}; return { status: 0 } } }
+        const planned = await executeMove(from, to, paths, { io })
+        await executeMove(from, to, paths, { io, approve: planned.plan.token })
+      } else await executeMove(from, to, paths, { processes: [] })
+    }
   `
   const result = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: here, env: { ...process.env, HOME: h.root } })
     .then(() => ({ code: 0 }), error => error)
@@ -6021,33 +6029,295 @@ test('task workers and changed restart inventories never authorize an external s
   assert.deepEqual(calls, [])
 })
 
-test('task restart deadline preserves held families after completed ordinary work', async () => {
-  const h = await taskFamilyFixture(), { from, to } = await h.selection()
-  const mock = taskHarness(), { io } = mock
-  const planned = await executeMove([from], to, h.paths, { io })
-  const original = fs.rename
-  fs.rename = async (...args) => {
-    const result = await original(...args)
-    if (path.dirname(args[1]) === h.paths.state && /^\d.*\.json$/.test(path.basename(args[1]))) {
-      const receipt = JSON.parse(await readFile(args[1]))
-      if (receipt.finalizing === false && receipt.sessions.length === 1) mock.time = 23000
+test('task restart capacity stops before quit and preserves held families after completed ordinary work', async () => {
+  for (const elapsed of [6000, 23000]) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const mock = taskHarness(), { io } = mock
+    const planned = await executeMove([from], to, h.paths, { io })
+    const original = fs.rename
+    fs.rename = async (...args) => {
+      const result = await original(...args)
+      if (path.dirname(args[1]) === h.paths.state && /^\d.*\.json$/.test(path.basename(args[1]))) {
+        const receipt = JSON.parse(await readFile(args[1]))
+        if (receipt.finalizing === false && receipt.sessions.length === 1) mock.time = elapsed
+      }
+      return result
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token }) }
+    finally { fs.rename = original; syncBuiltinESMExports() }
+    assert.equal(result.ok, false)
+    assert.equal(result.restarted, undefined)
+    assert.equal(result.capacity.fits, false)
+    assert.equal(result.code, 'RESTART_CAPACITY')
+    assert.equal(result.capacity.code, result.code)
+    if (elapsed === 6000) {
+      assert.equal(result.capacity.sample.elapsedMs, elapsed)
+      assert.equal(result.capacity.sample.records, 1)
+      assert.ok(result.capacity.estimatedMs > result.capacity.availableMs)
+    } else {
+      assert.equal(result.capacity.availableMs, 0)
+      assert.match(result.reason, /budget was reached before shutdown/)
+    }
+    assert.doesNotMatch(result.reason, /Move fewer sessions/)
+    assert.deepEqual(mock.calls, [])
+    assert.equal(mock.rows.length, 1)
+    assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart-plan.json'))).token, planned.plan.token)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    const receipts = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
+    const receipt = JSON.parse(await readFile(path.join(h.paths.state, receipts[0])))
+    assert.deepEqual(receipt.sessions.map(row => row.id), [h.cold])
+    assert.equal(receipt.held.flatMap(row => row.sources).length, 3)
+    const finished = await finishHeld(h.paths, { processes: [] })
+    assert.equal(finished.ok, true)
+    assert.equal(finished.receipt.sessions.length, 4)
+  }
+})
+
+test('an approved pre-quit scan stops at its mutation deadline before any record is moved', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  mock.io.budget = 1000
+  mock.io.reserve = 200
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  const before = await fixtureSnapshot(h), planFile = path.join(h.paths.state, 'restart-plan.json'), planBefore = await readFile(planFile)
+  let expired = false
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token, report: stage => {
+    if (stage === 'scan' && !expired) { expired = true; mock.time = 800 }
+  } })
+  assert.equal(expired, true)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'RESTART_CAPACITY')
+  assert.equal(result.capacity.availableMs, 0)
+  assert.equal(result.receipt, null)
+  assert.deepEqual(mock.calls, [])
+  assert.equal(mock.time, 800)
+  assert.deepEqual(await fixtureSnapshot(h), before)
+  assert.deepEqual(await readFile(planFile), planBefore)
+  assert.equal(await stat(path.join(h.dir('T'), `local_${h.cold}.json`)).catch(() => null), null)
+  assert.equal(await stat(path.join(h.paths.state, 'restart-events.jsonl')).catch(() => null), null)
+})
+
+test('pre-quit expiry preserves the journal and stops later mutations until recovery', async () => {
+  for (const stage of ['journal', 'placement', 'row', 'retirement']) {
+    const h = await taskFamilyFixture(), second = id(704), mock = taskHarness()
+    await h.write(second, [entry('user', 804, null, second)])
+    await h.record('P', second, rehomeRecord())
+    const { from, to } = await h.selection(), originals = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    mock.io.budget = 1000
+    mock.io.reserve = 200
+    const plan = await executeMove([from], to, h.paths, { io: mock.io })
+    const planFile = path.join(h.paths.state, 'restart-plan.json'), planBefore = await readFile(planFile)
+    const native = { open: fs.open, link: fs.link, rename: fs.rename, writeFile: fs.writeFile, rm: fs.rm }, afterExpiry = []
+    let expired = false, receiptFile, checkpoint, journal
+    const expire = () => {
+      if (expired) return
+      expired = true
+      mock.time = 800
+      receiptFile = path.join(h.paths.state, readdirSync(h.paths.state).find(name => /^\d.*\.json$/.test(name)))
+      checkpoint = readFileSync(receiptFile)
+      try { journal = readFileSync(`${receiptFile}.journal`) } catch (error) { if (error.code !== 'ENOENT') throw error; journal = null }
+    }
+    for (const name of ['link', 'rename', 'writeFile', 'rm']) fs[name] = async (...args) => {
+      if (expired) afterExpiry.push({ name, file: String(args[0]) })
+      const result = await native[name](...args)
+      if (stage === 'placement' && name === 'link' && args[1] === path.join(h.dir('T'), `local_${h.cold}.json`) ||
+          stage === 'retirement' && name === 'rename' && args[0] === path.join(h.dir('P'), `local_${h.cold}.json`)) expire()
+      return result
+    }
+    fs.open = async (...args) => {
+      if (expired) afterExpiry.push({ name: 'open', file: String(args[0]) })
+      const handle = await native.open(...args)
+      if (String(args[0]).endsWith('.journal')) {
+        const write = handle.writeFile.bind(handle)
+        handle.writeFile = async (...data) => {
+          if (expired) afterExpiry.push({ name: 'journal', file: String(args[0]) })
+          const result = await write(...data)
+          if (stage === 'journal' && JSON.parse(data[0]).pending?.created) expire()
+          return result
+        }
+      }
+      return handle
+    }
+    syncBuiltinESMExports()
+    let result
+    try {
+      result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token, report: (phase, text, progress) => {
+        if (stage === 'row' && phase === 'move' && progress?.completed === 1) expire()
+      } })
+    } finally { Object.assign(fs, native); syncBuiltinESMExports() }
+    assert.equal(expired, true, stage)
+    assert.equal(result.ok, false, stage)
+    assert.equal(result.code, 'RESTART_CAPACITY', stage)
+    assert.equal(result.recoveryRequired, true, stage)
+    assert.equal(result.file, receiptFile)
+    assert.equal(mock.time, 800)
+    assert.deepEqual(mock.calls, [])
+    assert.deepEqual(afterExpiry, [], stage)
+    assert.deepEqual(await readFile(receiptFile), checkpoint, stage)
+    assert.deepEqual(await readFile(`${receiptFile}.journal`).catch(error => { if (error.code === 'ENOENT') return null; throw error }), journal, stage)
+    assert.deepEqual(await readFile(planFile), planBefore)
+    if (stage !== 'retirement') assert.equal(await stat(path.join(h.dir('T'), `local_${second}.json`)).catch(() => null), null)
+    if (stage === 'journal') assert.equal(await stat(path.join(h.dir('T'), `local_${h.cold}.json`)).catch(() => null), null)
+    mock.time = 0
+    const recovered = await finishWorkflow(h.paths, { io: mock.io, processes: [] })
+    assert.equal(recovered.recoveryRequired, true, stage)
+    assert.equal(JSON.parse(await readFile(receiptFile)).finalizing, false)
+    if (stage === 'retirement') assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), originals, stage)
+    assert.deepEqual(mock.calls, [])
+  }
+})
+
+test('expiry inside an eligible task dependency check stays typed and starts no recovery writes', async () => {
+  const h = await taskFamilyFixture(), f = await identityFixture(h), { from, to } = await h.selection()
+  await writeFile(h.paths.desktop, JSON.stringify({ lastKnownAccountUuid: h.acct.Z }))
+  await f.write(f.init(1, h.acct.Z, h.org.Z))
+  const mock = taskHarness([{ ...f.processes[0], ppid: 1, worker: true, desktopPid: 500, ids: [] }, desktopFixture(h.cold)[1]])
+  mock.io.budget = 1000
+  mock.io.reserve = 200
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  assert.equal(plan.plan.held.length, 1)
+  const read = fs.readFile, write = fs.writeFile, afterExpiry = []
+  let reads = 0, expired = false
+  fs.readFile = async (...args) => {
+    const result = await read(...args)
+    if (args[0] === h.sourceFile && readdirSync(h.paths.state).some(name => /^\d.*\.json$/.test(name)) && ++reads === 2) {
+      expired = true
+      mock.time = 800
     }
     return result
   }
+  fs.writeFile = async (...args) => { if (expired) afterExpiry.push(String(args[0])); return write(...args) }
   syncBuiltinESMExports()
   let result
-  try { result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token }) }
-  finally { fs.rename = original; syncBuiltinESMExports() }
+  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token }) }
+  finally { fs.readFile = read; fs.writeFile = write; syncBuiltinESMExports() }
+  assert.equal(expired, true)
+  assert.equal(result.code, 'RESTART_CAPACITY')
   assert.equal(result.ok, false)
-  assert.equal(result.restarted, true)
+  assert.deepEqual(afterExpiry, [])
+  assert.deepEqual(mock.calls, [])
+  assert.deepEqual(result.receipt.failed, [])
+  assert.equal(result.receipt.sessions.length, 0)
   assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
-  const receipts = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
-  const receipt = JSON.parse(await readFile(path.join(h.paths.state, receipts[0])))
-  assert.deepEqual(receipt.sessions.map(row => row.id), [h.cold])
-  assert.equal(receipt.held.flatMap(row => row.sources).length, 3)
-  const finished = await finishHeld(h.paths, { processes: [] })
-  assert.equal(finished.ok, true)
-  assert.equal(finished.receipt.sessions.length, 4)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+})
+
+test('restart capacity excludes cloud scans and completed cold parsing from the shutdown forecast', async () => {
+  for (const delay of ['cloud', 'cold']) {
+    const h = await home(), mock = taskHarness()
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    await writeFile(path.join(h.dir('P'), 'scheduled-tasks.json'), JSON.stringify({ scheduledTasks: [{ id: 'task', notifySessionId: `local_${SOURCE}`, enabled: false }] }))
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    let delayed = false, cloudReads = 0
+    const cloud = delay === 'cloud' ? cloudFixture(h, { list: async () => { cloudReads++; mock.time += 60000; return [] } }) : null
+    const planned = await executeMove([from], to, h.paths, { io: mock.io, cloud, report: (stage, text, progress) => {
+      if (delay === 'cold' && !delayed && stage === 'scan' && progress?.completed === 1) { delayed = true; mock.time += 60000 }
+    } })
+    assert.equal(mock.time, 60000)
+    assert.equal(planned.ok, true)
+    assert.equal(planned.plan.capacity.preparationMs, null)
+    assert.equal(planned.plan.capacity.estimatedMs, null)
+    assert.equal(planned.plan.capacity.fits, null)
+    assert.equal(planned.plan.capacity.code, null)
+    assert.deepEqual(mock.calls, [])
+    const result = await executeMove([from], to, h.paths, { io: mock.io, cloud, approve: planned.plan.token })
+    assert.equal(result.ok, true, result.reason)
+    assert.equal(result.capacity.preparationMs, 0)
+    assert.equal(result.receipt.sessions.length, 1)
+    assert.equal(result.receipt.superseded.length, 1)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.equal(cloudReads, delay === 'cloud' ? 1 : 0)
+  }
+})
+
+test('a measured capacity refusal agrees across CLI plans and approval and leaves other errors distinct', async () => {
+  const h = await taskCheckpointFixture(), raw = '500 1 Tue Sep  1 00:00:00 2026 /Applications/Claude.app/Contents/MacOS/Claude'
+  const mock = taskHarness(parseProcesses(raw, raw)), all = await accounts(h.paths, [])
+  const from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  await executeMove([from], to, h.paths, { io: mock.io })
+  const setup = `
+    import fs from 'node:fs/promises'
+    const read = fs.readFile, native = childProcess.spawnSync
+    let time = 0
+    performance.now = () => time
+    childProcess.spawnSync = (file, ...args) => file === '/bin/ps' ? { status: 0, stdout: ${JSON.stringify(raw)}, stderr: '' } : native(file, ...args)
+    fs.readFile = async (...args) => { const result = await read(...args); if (args[0] === ${JSON.stringify(path.join(h.paths.state, 'cache.json'))}) time += 25000; return result }
+  `
+  const args = ['--from', 'p@example.com', '--to', 't@example.com']
+  const json = await cli(h.root, [...args, '--json'], setup)
+  assert.equal(json.code, 1, json.stderr)
+  const plan = lines(json.stdout).find(row => row.plan)
+  assert.equal(plan.code, 'RESTART_CAPACITY')
+  assert.equal(plan.ok, false)
+  assert.equal(plan.capacity.code, plan.code)
+  assert.equal(plan.capacity.preparationMs, 25000)
+  assert.equal(plan.capacity.fits, false)
+  const text = await cli(h.root, args, setup)
+  assert.equal(text.code, 1, text.stderr)
+  assert.match(text.stdout, /not expected to fit/)
+  assert.doesNotMatch(text.stdout, /--restart-approved/)
+  const saved = JSON.parse(await readFile(path.join(h.paths.state, 'restart-plan.json')))
+  const refused = await executeMove([from], to, h.paths, { io: mock.io, approve: saved.token })
+  assert.equal(refused.ok, false)
+  assert.equal(refused.code, 'RESTART_CAPACITY')
+  assert.deepEqual(refused.capacity, saved.capacity)
+  const output = await cli(h.root, [...args, '--restart-approved', saved.token, '--json'], setup.replace('time += 25000', 'time += 0'))
+  assert.equal(output.code, 1, output.stderr)
+  assert.equal(lines(output.stdout).at(-1).code, 'RESTART_CAPACITY')
+  const beforeInvalid = await fixtureSnapshot(h, [h.root])
+  const invalid = await executeMove([from], to, h.paths, { io: mock.io, approve: '0'.repeat(64) })
+  assert.match(invalid.reason, /approval/)
+  assert.equal(invalid.code, 'RESTART_APPROVAL_CHANGED')
+  assert.notEqual(invalid.code, 'RESTART_CAPACITY')
+  assert.deepEqual(await fixtureSnapshot(h, [h.root]), beforeInvalid)
+  assert.deepEqual(mock.calls, [])
+  assert.equal((await readdir(h.paths.state)).some(name => /^\d.*\.json$/.test(name)), false)
+})
+
+test('CLI pre-quit expiry preserves committed counts and exposes unfinished recovery without quitting', async () => {
+  for (const stage of ['completed', 'placement']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection()
+    const raw = '500 1 Tue Sep 1 00:00:00 2026 /Applications/Claude.app/Contents/MacOS/Claude'
+    const planned = await executeMove([from], to, h.paths, { io: taskHarness(parseProcesses(raw, raw)).io })
+    const setup = `
+      import fs from 'node:fs/promises'
+      const rename = fs.rename, link = fs.link
+      let time = 0
+      performance.now = () => time
+      ${processSetup({ list: raw, commands: raw })}
+      fs.rename = async (...args) => {
+        const result = await rename(...args)
+        if (${JSON.stringify(stage)} === 'completed' && args[1].startsWith(${JSON.stringify(h.paths.state + '/')}) && /\\/\\d[^/]*\\.json$/.test(args[1])) {
+          const receipt = JSON.parse(await fs.readFile(args[1]))
+          if (receipt.finalizing === false && receipt.sessions.length === 1) time = 23000
+        }
+        return result
+      }
+      fs.link = async (...args) => {
+        const result = await link(...args)
+        if (${JSON.stringify(stage)} === 'placement' && args[1] === ${JSON.stringify(path.join(h.dir('T'), `local_${h.cold}.json`))}) time = 23000
+        return result
+      }
+    `
+    const output = await cli(h.root, ['--from', 'p@example.com', '--to', 't@example.com', '--restart-approved', planned.plan.token, '--json'], setup)
+    assert.equal(output.code, 1, output.stderr)
+    const result = lines(output.stdout).at(-1)
+    assert.equal(result.code, 'RESTART_CAPACITY', output.stdout)
+    assert.equal(result.complete, false)
+    assert.equal(result.capacity.fits, false)
+    assert.equal(result.capacity.availableMs, 0)
+    assert.equal(result.moved, stage === 'completed' ? 1 : 0)
+    assert.equal(result.summary.moved, result.moved)
+    assert.equal(result.recoveryRequired, stage === 'placement')
+    assert.equal(result.heldCount, 3)
+    assert.equal(result.retryable, false)
+    assert.ok(result.receipt)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.equal(await stat(path.join(h.paths.state, 'restart-events.jsonl')).catch(() => null), null)
+  }
 })
 
 test('restart diagnostics never recreate a refused receipt or displace the previous move for Undo', async () => {
@@ -7557,7 +7827,7 @@ test('a thousand source records finish one restart with bounded polling and a li
   } }
   const planned = await executeMove([from], to, h.paths, { io })
   const result = await executeMove([from], to, h.paths, { io, approve: planned.plan.token, report: (stage, _text, progress) => {
-    if (stage !== 'move' || progress?.completed !== amount) return
+    if (stage !== 'move' || !progress?.live || progress.total < amount - 1 || progress.completed !== progress.total) return
     const log = readdirSync(h.paths.state).find(name => name.endsWith('.journal'))
     journalBytes = readFileSync(path.join(h.paths.state, log)).length
     checkpointBytes = readFileSync(path.join(h.paths.state, log.slice(0, -8))).length
@@ -7569,6 +7839,7 @@ test('a thousand source records finish one restart with bounded polling and a li
   assert.equal((await readdir(h.dir('T'))).length, amount)
   assert.ok(inspections < 150, `Unexpected process scans: ${inspections}`)
   assert.ok(checkpointBytes < 5000, `Receipt was rewritten during placement: ${checkpointBytes}`)
+  assert.ok(journalBytes > 0)
   assert.ok(journalBytes < 12_000 * amount, `Journal grew beyond its per-record bound: ${journalBytes}`)
   assert.equal((await readdir(h.paths.state)).some(name => name.endsWith('.journal')), false)
   assert.ok((await undo(h.paths)).dest)
@@ -7634,6 +7905,347 @@ test('a thousand records in one task family finish the real restart budget with 
   assert.deepEqual(JSON.parse(await readFile(sourceFile)), registry)
   assert.equal((await readdir(h.dir('P'))).filter(name => name.startsWith('local_')).length, amount)
   assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('one restart batches the 361 record seven family shape and multiple registry pairs', async t => {
+  for (const [ordinary, sizes, pairs, padding] of [[243, [11, 1, 1, 3, 96, 2, 4], 1, 30000], [3, [2, 1, 3, 2], 2, 0]]) {
+    const h = await home(), sources = ['P', 'Q'].slice(0, pairs), registries = Object.fromEntries(sources.map(key => [key, { scheduledTasks: [], recordedSkips: {}, runRetries: {} }]))
+    let index = 0
+    const add = async (key, extra = {}) => {
+      const sid = id(10000 + index++)
+      await h.write(sid, [entry('user', 20000 + index, null, sid)])
+      await h.record(key, sid, rehomeRecord({ fixturePadding: 'x'.repeat(padding), ...extra }))
+      return sid
+    }
+    for (let n = 0; n < ordinary; n++) await add('P')
+    for (const [n, size] of sizes.entries()) {
+      const key = sources[n % pairs], anchor = id(10000 + index), taskId = `fixture_task_${n}`, registry = registries[key]
+      registry.scheduledTasks.push({ id: taskId, notifySessionId: `local_${anchor}`, enabled: false, fireAt: 123456 + n })
+      registry.recordedSkips[taskId] = [{ reason: 'closed', at: n }]
+      registry.runRetries[taskId] = { attempts: n }
+      for (let j = 0; j < size; j++) await add(key, j ? { scheduledTaskId: taskId, notifySessionId: `local_${anchor}` } : {})
+    }
+    for (const key of sources) await writeFile(path.join(h.dir(key), 'scheduled-tasks.json'), JSON.stringify(registries[key]))
+    const all = await accounts(h.paths, []), from = sources.map(key => all.find(row => row.account === h.acct[key])), to = all.find(row => row.account === h.acct.T)
+    const mock = taskHarness()
+    delete mock.io.now
+    let quitAt, reopenAt, beforeReceipt
+    mock.beforeQuit = async () => {
+      quitAt = performance.now()
+      assert.equal((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')).length, ordinary)
+      const names = (await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name))
+      assert.equal(names.length, 1)
+      beforeReceipt = path.join(h.paths.state, names[0])
+      const receipt = JSON.parse(await readFile(beforeReceipt))
+      assert.equal(receipt.finalizing, false)
+      assert.equal(receipt.sessions.length, ordinary)
+      assert.equal(receipt.held.length, sizes.reduce((sum, n) => sum + n, 0))
+    }
+    const command = mock.io.command
+    mock.io.command = async file => { if (file.endsWith('/open')) reopenAt = performance.now(); return command(file) }
+    const planned = await executeMove(from, to, h.paths, { io: mock.io })
+    assert.equal(planned.plan.capacity.records, sizes.reduce((sum, n) => sum + n, 0))
+    let recordReads = 0, readBytes = 0, receiptWrites = 0, writeBytes = 0, namespaceScans = 0
+    const read = fs.readFile, write = fs.writeFile, list = fs.readdir
+    fs.readFile = async (...args) => {
+      const result = await read(...args)
+      if (String(args[0]).startsWith(h.paths.records) && /^local_.*\.json$/.test(path.basename(String(args[0])))) { recordReads++; readBytes += Buffer.byteLength(result) }
+      return result
+    }
+    fs.writeFile = async (...args) => {
+      if (String(args[0]).startsWith(h.paths.state) && !String(args[0]).includes('cache.json')) { receiptWrites++; writeBytes += Buffer.byteLength(args[1]) }
+      return write(...args)
+    }
+    fs.readdir = async (...args) => { if (String(args[0]).startsWith(h.paths.records)) namespaceScans++; return list(...args) }
+    syncBuiltinESMExports()
+    const began = performance.now()
+    let result
+    try { result = await executeMove(from, to, h.paths, { io: mock.io, approve: planned.plan.token }) }
+    finally { fs.readFile = read; fs.writeFile = write; fs.readdir = list; syncBuiltinESMExports() }
+    t.diagnostic(JSON.stringify({ benchmark: 'restart-batches', records: index, families: sizes, pairs, seconds: (performance.now() - began) / 1000,
+      closedSeconds: (reopenAt - quitAt) / 1000, recordReads, readBytes, receiptWrites, writeBytes, namespaceScans }))
+    assert.equal(result.ok, true, result.reason)
+    assert.equal(result.receipt.sessions.length, index)
+    assert.equal(result.receipt.superseded.length, index)
+    assert.equal(result.receipt.taskTransfers.length, pairs)
+    assert.equal(result.file, beforeReceipt)
+    assert.equal(result.added, index)
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.ok(recordReads < 25 * index)
+    assert.ok(receiptWrites < 12 + 10 * pairs)
+    assert.ok(namespaceScans < 40 + 10 * pairs)
+    const events = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8'))
+    assert.deepEqual(events.map(row => row.event), ['start', 'exited', 'outcome'])
+    assert.equal(new Set(events.map(row => row.attemptId)).size, 1)
+    assert.ok(events.every(row => row.receiptId === path.basename(result.file)))
+    assert.equal(events.at(-1).stopCode, 'COMPLETE')
+    const targetFile = path.join(h.dir('T'), 'scheduled-tasks.json'), target = JSON.parse(await readFile(targetFile))
+    assert.deepEqual(target.scheduledTasks.map(task => task.id).sort(), Object.values(registries).flatMap(registry => registry.scheduledTasks.map(task => task.id)).sort())
+    target.later = 'unrelated edit'
+    target.scheduledTasks.push({ id: 'later_task', enabled: false })
+    await writeFile(targetFile, JSON.stringify(target))
+    const later = id(99000)
+    await h.record('T', later, rehomeRecord())
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(targetFile)), { scheduledTasks: [{ id: 'later_task', enabled: false }], later: 'unrelated edit' })
+    assert.ok(await readFile(path.join(h.dir('T'), `local_${later}.json`)))
+    for (const key of sources) assert.deepEqual(JSON.parse(await readFile(path.join(h.dir(key), 'scheduled-tasks.json'))), registries[key])
+  }
+})
+
+test('restart batches restore task twins at every existing checkpoint', async () => {
+  for (const stage of ['receipt', 'source', 'record', 'retiring', 'target']) {
+    const h = await taskCheckpointFixture()
+    h.restart = true
+    h.targetRegistry = { scheduledTasks: [{ id: 'before', enabled: false }, ...h.tasks.map(task => ({ ...task, enabled: false, notifySessionId: null })), { id: 'after', enabled: false }],
+      recordedSkips: { task_1: h.sourceRegistry.recordedSkips.task_1 }, future: 'preserved' }
+    await writeFile(h.targetFile, JSON.stringify(h.targetRegistry))
+    h.notificationId = h.sessions[0]
+    await interruptTaskFamily(h, 'move', stage)
+    const file = path.join(h.paths.state, (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)))
+    const interrupted = JSON.parse(await readFile(file))
+    assert.equal(interrupted.taskTransfers.length, 1)
+    assert.equal(interrupted.taskTransfers[0].ids.length, 2)
+    assert.deepEqual(interrupted.taskTransfers[0].replaced.map(row => row.index), [1, 2])
+    const mock = taskHarness([])
+    const recovered = await finishWorkflow(h.paths, { io: mock.io, processes: [] })
+    assert.equal(recovered.recoveryRequired, true, stage)
+    assert.deepEqual(mock.calls, ['/usr/bin/open'])
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+    for (const [n, sid] of h.sessions.entries()) {
+      assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${sid}.json`)), h.originalRecords[n])
+      assert.equal(await stat(path.join(h.dir('T'), `local_${sid}.json`)).catch(() => null), null)
+    }
+  }
+})
+
+test('restart replans scheduler closure after quit without widening the approved files', async () => {
+  for (const change of ['new task', 'new run', 'new run with another family', 'unrelated record']) {
+    const h = await taskFamilyFixture(), mixed = change === 'new run with another family'
+    if (mixed) {
+      h.sourceRegistry.scheduledTasks[1].notifySessionId = `local_${h.second}`
+      await h.record('P', h.second, rehomeRecord({ scheduledTaskId: h.tasks[1].id, notifySessionId: `local_${h.second}` }))
+      await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+    }
+    const { from, to } = await h.selection(), mock = taskHarness()
+    const plan = await executeMove([from], to, h.paths, { io: mock.io })
+    const later = id(798)
+    mock.beforeQuit = async () => {
+      assert.ok(await readFile(path.join(h.dir('T'), `local_${h.cold}.json`)))
+      if (change === 'new task') {
+        h.sourceRegistry.scheduledTasks.push({ id: 'new_task', notifySessionId: `local_${SOURCE}`, enabled: true })
+        await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+      } else {
+        await h.write(later, [entry('user', 798, null, later)])
+        await h.record('P', later, rehomeRecord(change.startsWith('new run') ? { scheduledTaskId: h.tasks[0].id, notifySessionId: `local_${SOURCE}` } : {}))
+      }
+    }
+    const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token })
+    assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.equal(result.restarted, true)
+    if (change.startsWith('new run')) {
+      assert.equal(result.ok, false)
+      assert.equal(result.receipt.sessions.length, mixed ? 2 : 1)
+      assert.equal(result.receipt.held.length, mixed ? 2 : 3)
+      assert.equal(result.receipt.startedAt, plan.plan.requestedAt)
+      assert.ok(result.receipt.failed.some(row => /family member missing/.test(row.error)))
+      if (!mixed) assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    } else {
+      assert.equal(result.ok, true, result.reason)
+      assert.equal(result.receipt.sessions.length, 4)
+      if (change === 'new task') assert.deepEqual(JSON.parse(await readFile(h.targetFile)).scheduledTasks.slice(1), h.sourceRegistry.scheduledTasks)
+    }
+    if (change !== 'new task') {
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${later}.json`)))
+      assert.equal(await stat(path.join(h.dir('T'), `local_${later}.json`)).catch(() => null), null)
+    }
+  }
+})
+
+test('restart batches keep their receipt on native quit veto and reopen failure without retrying', async () => {
+  for (const failure of ['quit', 'reopen']) {
+    const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness(), command = mock.io.command
+    mock.io.wait = async ms => { mock.time += ms }
+    mock.io.command = async file => {
+      if (failure === 'quit' && file.endsWith('osascript') || failure === 'reopen' && file.endsWith('/open')) {
+        mock.calls.push(file)
+        return { status: 1 }
+      }
+      return command(file)
+    }
+    const plan = await executeMove([from], to, h.paths, { io: mock.io })
+    const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token })
+    assert.equal(result.ok, false)
+    assert.equal(result.restarted, false)
+    assert.equal(result.restartOutcome.outcome, failure === 'quit' ? 'quit-not-confirmed' : 'reopen-failed')
+    assert.deepEqual(mock.calls, failure === 'quit' ? ['/usr/bin/osascript'] : ['/usr/bin/osascript', '/usr/bin/open'])
+    assert.ok(mock.time <= 30000)
+    const receipt = JSON.parse(await readFile(result.file))
+    assert.equal(receipt.finalizing, false)
+    assert.equal(receipt.sessions.length, failure === 'quit' ? 1 : 4)
+    assert.equal(receipt.held.length, failure === 'quit' ? 3 : 0)
+    const events = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8'))
+    assert.equal(new Set(events.map(row => row.attemptId)).size, 1)
+    assert.equal(events.at(-1).stopCode, failure === 'quit' ? 'QUIT_UNCONFIRMED' : 'REOPEN_FAILED')
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+    assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
+  }
+})
+
+test('a worker appearing during an approved warm scan returns a typed plan change without moving or quitting', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  const file = path.join(h.paths.state, 'restart-plan.json'), planBytes = await readFile(file), before = await fixtureSnapshot(h)
+  let changed = false
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, report: stage => {
+    if (stage !== 'scan' || changed) return
+    changed = true
+    mock.rows = [...mock.rows, { ...desktopFixture(h.run)[1], pid: 701 }]
+  } })
+  assert.equal(changed, true)
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'RESTART_PLAN_CHANGED')
+  assert.match(result.reason, /Open Claude sessions changed/)
+  assert.equal(result.receipt, undefined)
+  assert.deepEqual(mock.calls, [])
+  assert.deepEqual(await fixtureSnapshot(h), before)
+  assert.deepEqual(await readFile(file), planBytes)
+})
+
+test('a changed pre-quit inventory preserves completed ordinary work and the held selection', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  let changed = false
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token, report: (stage, text, progress) => {
+    if (changed || stage !== 'move' || progress?.completed !== 1) return
+    changed = true
+    mock.rows = [...mock.rows, { ...desktopFixture(h.run)[1], pid: 701 }]
+  } })
+  assert.equal(changed, true)
+  assert.equal(result.ok, false)
+  assert.match(result.reason, /sessions changed/)
+  assert.deepEqual(mock.calls, [])
+  assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
+  assert.equal(result.receipt.held.length, 3)
+  assert.equal(JSON.parse(await readFile(path.join(h.paths.state, 'restart-plan.json'))).token, plan.plan.token)
+  const next = await finishHeld(h.paths, { io: mock.io })
+  assert.ok(next.plan)
+  assert.equal(next.plan.receiptFile, result.file)
+  assert.equal(next.plan.requestedAt, plan.plan.requestedAt)
+  assert.deepEqual(next.plan.selection.from[0].files.sort(), result.receipt.held.flatMap(row => row.sources.map(source => source.file)).sort())
+  assert.notEqual(next.plan.token, plan.plan.token)
+  assert.deepEqual(mock.calls, [])
+})
+
+test('scheduler changes before approval move into the fresh restart batch', async () => {
+  const h = await taskFamilyFixture(), { from, to } = await h.selection(), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  h.sourceRegistry.scheduledTasks.push({ id: 'new_task', notifySessionId: `local_${h.cold}`, enabled: true })
+  await writeFile(h.sourceFile, JSON.stringify(h.sourceRegistry))
+  mock.beforeQuit = async () => assert.deepEqual(await readdir(h.dir('T')), ['scheduled-tasks.json'])
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token })
+  assert.equal(result.ok, true, result.reason)
+  assert.equal(result.receipt.sessions.length, 4)
+  assert.equal(result.receipt.taskTransfers.length, 1)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)).scheduledTasks.slice(1), h.sourceRegistry.scheduledTasks)
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+})
+
+test('a partial restart batch publication rolls back every family and preserves task twins', async () => {
+  const h = await taskCheckpointFixture()
+  const target = { scheduledTasks: h.tasks.map(task => ({ ...task, enabled: false, notifySessionId: null })) }
+  await writeFile(h.targetFile, JSON.stringify(target))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io }), link = fs.link
+  fs.link = async (...args) => { if (args[1] === path.join(h.dir('T'), `local_${h.sessions[1]}.json`)) throw new Error('fixture second placement failed'); return link(...args) }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token }) }
+  finally { fs.link = link; syncBuiltinESMExports() }
+  assert.equal(result.ok, false)
+  assert.equal(result.receipt.sessions.length, 0)
+  assert.equal(result.receipt.finalizing, false)
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
+  assert.deepEqual(JSON.parse(await readFile(h.targetFile)), target)
+  assert.deepEqual((await readdir(h.dir('T'))).filter(name => name.startsWith('local_')), [])
+  assert.deepEqual(await Promise.all(h.sessions.map(sid => readFile(path.join(h.dir('P'), `local_${sid}.json`)))), h.originalRecords)
+})
+
+test('cold moves tolerate unrelated runtime writes while still catching new parent dependencies', async () => {
+  for (const change of ['runtime', 'parent']) {
+    const h = await home(), other = id(2)
+    for (const sid of [SOURCE, other]) {
+      await h.write(sid, [entry('user', sid === SOURCE ? 101 : 102, null, sid)])
+      await h.record('P', sid, rehomeRecord())
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+    from.sessions = from.sessions.filter(row => row.id === SOURCE)
+    const read = fs.readFile, file = path.join(h.dir('P'), `local_${other}.json`)
+    let armed = false, changed = false
+    fs.readFile = async (...args) => {
+      const result = await read(...args)
+      if (armed && !changed && args[0] === file) {
+        changed = true
+        const record = JSON.parse(result)
+        if (change === 'runtime') record.completedTurns = 7
+        else record.forkedFromSessionId = `local_${SOURCE}`
+        await writeFile(file, JSON.stringify(record))
+      }
+      return result
+    }
+    syncBuiltinESMExports()
+    let result
+    try { result = await executeMove([from], to, h.paths, { processes: [], report: stage => { if (stage === 'retire') armed = true } }) }
+    finally { fs.readFile = read; syncBuiltinESMExports() }
+    assert.equal(changed, true)
+    assert.equal(result.receipt.sessions.length, 1)
+    if (change === 'runtime') {
+      assert.equal(result.ok, true)
+      assert.equal(result.receipt.superseded.length, 1)
+      assert.deepEqual(result.receipt.failed, [])
+      assert.equal(JSON.parse(await readFile(file)).completedTurns, 7)
+    } else {
+      assert.equal(result.ok, false)
+      assert.equal(result.code, undefined)
+      assert.equal(result.receipt.superseded.length, 0)
+      assert.ok(result.receipt.failed.some(row => /parent reference changed/.test(row.error)))
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    }
+  }
+})
+
+test('restart snapshots notice in-place external dependencies before registry publication', async () => {
+  const h = await taskCheckpointFixture(), foreign = id(799)
+  await h.record('T', foreign, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T), mock = taskHarness()
+  const plan = await executeMove([from], to, h.paths, { io: mock.io })
+  const write = fs.writeFile
+  let edited = false
+  fs.writeFile = async (...args) => {
+    const result = await write(...args)
+    if (!edited && String(args[0]).startsWith(h.targetFile + '.')) {
+      edited = true
+      const file = path.join(h.dir('T'), `local_${foreign}.json`), record = JSON.parse(await readFile(file))
+      record.forkedFromSessionId = `local_${h.sessions[0]}`
+      await write(file, JSON.stringify(record))
+    }
+    return result
+  }
+  syncBuiltinESMExports()
+  let result
+  try { result = await executeMove([from], to, h.paths, { io: mock.io, approve: plan.plan.token }) }
+  finally { fs.writeFile = write; syncBuiltinESMExports() }
+  assert.equal(edited, true)
+  assert.equal(result.ok, false)
+  assert.equal(result.recoveryRequired, true)
+  assert.equal(await stat(h.targetFile).catch(() => null), null)
+  assert.equal(JSON.parse(await readFile(path.join(h.dir('T'), `local_${foreign}.json`))).forkedFromSessionId, `local_${h.sessions[0]}`)
+  await h.record('T', foreign, rehomeRecord())
+  mock.rows = []
+  await finishWorkflow(h.paths, { io: mock.io, processes: [] })
+  assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
 })
 
 test('interrupted placement replays complete journal entries and ignores only a torn final append', async () => {
@@ -8086,6 +8698,8 @@ function wordingFixtures() {
   }
   const plan = { plan: true, kind: 'move', token: 'a'.repeat(64), heldCount: 102, remainingCount: 102, moved: 259,
     sourceLabels: [base[1].label], affected: [{ pid: 501, started: 'synthetic', recordId: 'local_one', title: 'Research notes' }, { pid: 502, started: 'synthetic', recordId: 'local_two', title: 'Daily brief' }] }
+  const capacityPlan = { ...plan, ok: false, code: 'RESTART_CAPACITY', capacity: { records: 102, estimatedMs: 26000, availableMs: 22000, fits: false } }
+  const expired = { done: true, ok: false, complete: false, moved: 259, heldCount: 102, code: 'RESTART_CAPACITY', capacity: { fits: false, availableMs: 0 } }
   const held = pending(1, 'local', 102, null, 'scheduler')
   held[1].receiptMoved = 259
   const mixed = pending(2, 'cloud', 3)
@@ -8137,7 +8751,12 @@ function wordingFixtures() {
     { name: '35-local-undo-recovery', accounts: localUndo, contains: ['Press Finish undo.'], primary: 'Finish undo' },
     { name: '36-background-companion', accounts: twoSources, event: { swept: true, ok: true, complete: false, moved: 1, rescuedTitles: ['Research conversation · from Remote Control'] }, contains: ['Brought over 1 conversation.', 'Brought over: Research conversation · from Remote Control'], primary: null },
     { name: '37-reopen-failed', accounts: pending(1, 'undo', 1), event: { swept: true, ok: false, code: 'REOPEN_FAILED', error: 'Synthetic reopen failure' }, contains: ['Claude could not be confirmed open.', 'Open Claude, then press Try again.'], primary: 'Try again' },
-    { name: '38-same-login-uncertain', accounts: pending(1, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['The check will retry automatically.'], primary: null }
+    { name: '38-same-login-uncertain', accounts: pending(1, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['The check will retry automatically.'], primary: null },
+    { name: '39-capacity-dialog', dialog: true, plan: capacityPlan, event: capacityPlan, contains: ['not expected to fit the restart time limit', 'Claude will stay running.'], primary: null },
+    { name: '40-capacity-suppressed-warning', dialog: true, suppressed: true, plan: capacityPlan, event: capacityPlan, contains: ['not expected to fit the restart time limit', 'Claude will stay running.'], primary: null },
+    { name: '41-pre-quit-expiry', accounts: held, event: expired, contains: ['259 moved.', 'Claude stayed running.', 'restart time limit was reached before shutdown.', '102 sessions remain pending.'], primary: null },
+    { name: '42-pre-quit-recovery', accounts: held, event: { ...expired, recoveryRequired: true }, contains: ['259 moved.', 'Claude stayed running.', 'Unfinished work needs recovery.'], primary: 'Finish the move' },
+    { name: '43-partial-quit-veto', accounts: held, event: { done: true, ok: false, complete: false, receipt: 'synthetic-receipt', moved: 259, heldCount: 102, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['259 moved. Move stopped:', 'Claude did not confirm it had closed.'], primary: 'Try again' }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
@@ -8152,10 +8771,21 @@ async function swiftFixtureSource() {
     }
 }
 ` + source.slice(end)
+  const promptStart = source.indexOf('    private func restartResponse(_ prompt: RestartPrompt)')
+  const promptEnd = source.indexOf('    private func cancelRestart', promptStart)
+  assert.ok(promptStart > 0 && promptEnd > promptStart)
+  source = source.slice(0, promptStart) + `    private func restartResponse(_ prompt: RestartPrompt) -> (NSApplication.ModalResponse, Bool) {
+        restartDialogs.append(prompt)
+        return restartDialogResponse
+    }
+
+` + source.slice(promptEnd)
   return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
     .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)') + String.raw`
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 @MainActor var automaticRefreshFixture = false
+@MainActor var restartDialogs: [RestartPrompt] = []
+@MainActor var restartDialogResponse: (NSApplication.ModalResponse, Bool) = (.alertThirdButtonReturn, false)
 extension Model {
     func checkSweep() { sweep() }
     func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
@@ -8181,6 +8811,7 @@ struct WordingFixture: Decodable {
     let cancel: Bool?
     let expanded: Bool?
     let background: Bool?
+    let suppressed: Bool?
     let contains: [String]
     let primary: String?
     let stop: String?
@@ -8194,6 +8825,7 @@ struct WordingChecks {
         var manifest: [[String: Any]] = []
         for fixture in fixtures {
             requests = []
+            restartDialogs = []
             let model = Model(demo: fixture.accounts)
             if model.pendingAccounts.isEmpty, let target = fixture.operation.firstIndex(of: "--to"), target + 1 < fixture.operation.count {
                 model.selectTarget(fixture.operation[target + 1].replacingOccurrences(of: " ", with: "/"))
@@ -8207,8 +8839,20 @@ struct WordingChecks {
             if fixture.dialog == true {
                 let prompt = RestartPrompt(plan: fixture.plan!)
                 text = prompt.title + "\n" + prompt.body
-                primary = prompt.confirm
+                primary = prompt.canRestart ? prompt.confirm : nil
                 let alert = prompt.alert()
+                precondition(alert.buttons[0].isEnabled == prompt.canRestart)
+                if !prompt.canRestart {
+                    precondition(!alert.showsSuppressionButton)
+                    precondition(alert.buttons.map(\.title) == [prompt.confirm, "Move the others only", "Cancel"])
+                    model.skipRestartWarning = fixture.suppressed == true
+                    model.begin()
+                    model.handle(fixture.event!)
+                    model.checkFinish(1)
+                    precondition(restartDialogs.count == 1 && !restartDialogs[0].canRestart)
+                    precondition(!model.running && model.primaryTitle == nil)
+                    precondition(requests.allSatisfy { !$0.0.contains("--restart-approved") })
+                }
                 precondition(alert.buttons.map(\.title) == ["Restart and move", "Move the others only", "Cancel"])
                 precondition(alert.suppressionButton?.title == "Don't ask again")
                 png = Snapshot.dialogData(fixture.plan!)
@@ -8303,12 +8947,32 @@ test('Swift preserves command, progress, metadata, and completion states', async
   await interruptTaskFamily(h, 'move', 'target')
   const recoveryAccounts = await cli(h.root, ['accounts', '--json'])
   assert.equal(recoveryAccounts.code, 0)
+  const transfer = await taskFamilyFixture(), selected = await transfer.selection(), mock = taskHarness(), captured = []
+  const planned = await executeMove([selected.from], selected.to, transfer.paths, { io: mock.io })
+  let closing = false
+  const moved = await executeMove([selected.from], selected.to, transfer.paths, { io: mock.io, approve: planned.plan.token, report: (stage, text, extra = {}) => {
+    if (stage === 'desktop') closing = true
+    captured.push({ preQuit: !closing, line: JSON.stringify({ stage, text, ...extra }) })
+  } })
+  assert.equal(moved.ok, true, moved.reason)
+  assert.ok(captured.some(row => row.preQuit && JSON.parse(row.line).stage === 'move' && JSON.parse(row.line).completed > 0))
   let source = await swiftFixtureSource()
   source += String.raw`
 @main
 struct StateChecks {
     @MainActor
     static func main() {
+        let captured = try! JSONSerialization.jsonObject(with: Data(base64Encoded: "CAPTURED_RESTART_PROGRESS")!) as! [[String: Any]]
+        let replay = Model(demo: Demo.accounts)
+        replay.begin()
+        for row in captured {
+            replay.handle(row["line"] as! String)
+            if row["preQuit"] as! Bool {
+                precondition(replay.moveProgress.percent < 99)
+                precondition(!replay.moveProgress.restarting && !replay.moveProgress.skipped.contains("close") && !replay.moveProgress.skipped.contains("reopen"))
+            }
+        }
+        precondition(replay.moveProgress.restarting)
         let menuSize = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: nil)!.size
         var textHeight: Int?
         for badge in ["", "0%", "9%", "10%", "47%", "99%", "100%"] {
@@ -8749,6 +9413,40 @@ struct StateChecks {
         precondition(queuedLeave.primaryTitle == "Restart Claude and move 102")
         precondition(queuedLeave.displaySummary == "259 moved. 102 more need Claude to restart.")
         automaticRefreshFixture = false
+        for fits in [false, true, nil] as [Bool?] {
+            for response in [NSApplication.ModalResponse.alertFirstButtonReturn, .alertSecondButtonReturn, .alertThirdButtonReturn] {
+                requests = []
+                restartDialogs = []
+                restartDialogResponse = (response, false)
+                let item = Model(demo: Demo.accounts)
+                item.skipRestartWarning = true
+                item.move()
+                let args = requests[0].0
+                requests[0].1(#"{"plan":true,"kind":"move","token":"capacity-token","capacity":{"fits":"# + (fits.map { $0 ? "true" : "false" } ?? "null") + #"},"heldCount":3}"#)
+                requests[0].2(fits == false ? 1 : 0, "")
+                if fits == false {
+                    precondition(restartDialogs.count == 1 && !restartDialogs[0].canRestart)
+                    precondition(requests.allSatisfy { !$0.0.contains("--restart-approved") })
+                    if response == .alertSecondButtonReturn { precondition(requests.last!.0 == args + ["--move-only"]) }
+                    else { precondition(!item.running && item.primaryTitle == nil && item.note.contains("Claude stayed running.")) }
+                } else {
+                    precondition(restartDialogs.isEmpty)
+                    precondition(requests.last!.0 == args + ["--restart-approved", "capacity-token"])
+                }
+            }
+        }
+        restartDialogResponse = (.alertThirdButtonReturn, false)
+        requests = []
+        let veto = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("02-held").utf8)))
+        veto.checkOperation(["--from", "work personal", "--to", "work company", "--json"])
+        veto.begin()
+        veto.handle(#"{"done":true,"ok":false,"complete":false,"receipt":"synthetic-receipt","moved":259,"heldCount":102,"code":"QUIT_UNCONFIRMED","retryable":true}"#)
+        veto.checkFinish(1)
+        requests[0].1(wordingAccounts("02-held"))
+        requests[0].2(0, "")
+        precondition(veto.note == "259 moved. Move stopped: Claude did not confirm it had closed.")
+        veto.primary()
+        precondition(requests.last!.0 == ["finish", "--json"])
         for fixture in ["34-same-login-undo", "35-local-undo-recovery"] {
             requests = []
             let undo = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(fixture).utf8)))
@@ -8794,6 +9492,7 @@ struct StateChecks {
   source = source.replace('CORRUPTED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.corrupted).toString('base64'))
   source = source.replace('REPAIRED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.repaired).toString('base64'))
   source = source.replace('WORDING_FIXTURES', Buffer.from(JSON.stringify(wordingFixtures())).toString('base64'))
+  source = source.replace('CAPTURED_RESTART_PROGRESS', Buffer.from(JSON.stringify(captured)).toString('base64'))
   const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
   await writeFile(file, source)
   await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })

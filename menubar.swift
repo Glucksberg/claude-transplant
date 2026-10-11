@@ -98,6 +98,13 @@ struct MetadataChange: Decodable {
 }
 
 
+struct RestartCapacity: Decodable {
+    let fits: Bool?
+    let records: Int?
+    let estimatedMs: Double?
+    let availableMs: Double?
+}
+
 struct Event: Decodable {
     let receipt: String?
     let summary: ReceiptSummary?
@@ -160,14 +167,17 @@ struct Event: Decodable {
     let undoRecovery: Bool?
     let rescuedTitles: [String]?
     let activity: String?
+    let capacity: RestartCapacity?
     var issues: Int { (summary?.attention.count ?? failed?.count ?? 0) + (problems?.count ?? 0) }
 }
 
 @MainActor
 struct RestartPrompt {
     let plan: Event
+    var canRestart: Bool { plan.capacity?.fits != false }
     var isUndo: Bool { plan.kind == "undo" || plan.undoRecovery == true }
     var title: String {
+        if !canRestart { return "This move is not expected to fit the restart time limit." }
         if isUndo { return "Restart Claude to finish Undo?" }
         if plan.kind == "refresh" { return "Restart Claude?" }
         if let count = plan.heldCount, count > 0 {
@@ -177,6 +187,11 @@ struct RestartPrompt {
     }
     var confirm: String { isUndo ? "Restart and undo" : plan.kind == "refresh" ? "Restart Claude" : plan.kind == "recover" ? "Restart and finish" : "Restart and move" }
     var body: String {
+        if !canRestart {
+            let count = plan.heldCount ?? plan.capacity?.records
+            let remaining = count.map { " \($0) \($0 == 1 ? "session still needs" : "sessions still need") moving." } ?? ""
+            return "Claude will stay running." + remaining + " The remaining work needs more time than is available for this restart."
+        }
         var seen = Set<String>()
         let names = (plan.affected ?? []).filter { seen.insert($0.recordId ?? "pid/\($0.pid)").inserted }.map { $0.title ?? "An open Claude chat" }
         let work = isUndo ? "finish Undo" : plan.kind == "refresh" ? "refresh the sidebar" : "continue the move"
@@ -189,9 +204,10 @@ struct RestartPrompt {
         alert.messageText = title
         alert.informativeText = body
         alert.addButton(withTitle: confirm)
+        alert.buttons[0].isEnabled = canRestart
         if plan.kind == "move" { alert.addButton(withTitle: "Move the others only") }
         alert.addButton(withTitle: "Cancel")
-        alert.showsSuppressionButton = true
+        alert.showsSuppressionButton = canRestart
         alert.suppressionButton?.title = "Don't ask again"
         return alert
     }
@@ -342,6 +358,8 @@ final class Model: ObservableObject {
     private var reviewRestart = false
     private var forceRestartWarning = false
     private var preserveNotice = false
+    private var capacityBlocked = false
+    private var capacityRecovery = false
 
     init(snapshot: Bool = false, config supplied: Config? = nil) {
         self.snapshot = snapshot
@@ -389,11 +407,11 @@ final class Model: ObservableObject {
     var recoveryProblem: RecoveryProblem? { accounts.compactMap(\.recoveryProblem).first }
     var canMutate: Bool { !running && recoveryProblem == nil }
     var undoPending: Bool { pendingAccounts.contains { $0.pending == "undo" } }
-    var canKeepLocal: Bool { canMutate && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
-    var pendingReady: Bool { canMutate && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.pending == "recovery" || $0.pending == "undo" && $0.signedIn == true ? "finish" : "wait")) } && (config != nil || demo) }
+    var canKeepLocal: Bool { canMutate && !capacityRecovery && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
+    var pendingReady: Bool { canMutate && pendingAccounts.contains { (capacityBlocked ? ["finish"] : ["finish", "restart"]).contains($0.pendingAction ?? ($0.pending == "local" || $0.pending == "recovery" || $0.pending == "undo" && $0.signedIn == true ? "finish" : "wait")) } && (config != nil || demo) }
     var pendingButtonTitle: String {
         if reviewRestart { return restartReviewTitle }
-        if pendingAccounts.contains(where: { $0.pendingAction == "restart" }) {
+        if !capacityBlocked && pendingAccounts.contains(where: { $0.pendingAction == "restart" }) {
             let count = pendingAccounts.filter { $0.pending == "local" }.compactMap(\.pendingCount).reduce(0, +)
             return count > 0 ? "Restart Claude and move \(count)" : pendingAccounts.contains(where: { $0.pending == "local" }) ? "Restart Claude and move" : "Restart Claude and finish cleanup"
         }
@@ -443,13 +461,15 @@ final class Model: ObservableObject {
     }
     var primaryTitle: String? {
         guard canMutate else { return nil }
+        if capacityRecovery { return "Finish the move" }
         if reviewRestart && !operationArgs.isEmpty { return restartReviewTitle }
         if retryable && !operationArgs.isEmpty { return "Try again" }
         if !pendingAccounts.isEmpty { return pendingReady ? pendingButtonTitle : nil }
         return !pendingResult && !stopped && ready ? "Move" : nil
     }
     func primary() {
-        if reviewRestart || retryable { guard canMutate, !operationArgs.isEmpty else { return }; start(operationArgs) }
+        if capacityRecovery { guard canMutate else { return }; start(["finish", "--json"]) }
+        else if reviewRestart || retryable { guard canMutate, !operationArgs.isEmpty else { return }; start(operationArgs) }
         else if !pendingAccounts.isEmpty { finishPending() }
         else { move() }
     }
@@ -568,6 +588,8 @@ final class Model: ObservableObject {
         reviewRestart = false
         forceRestartWarning = false
         preserveNotice = false
+        capacityBlocked = false
+        capacityRecovery = false
     }
 
     func refresh() {
@@ -624,6 +646,8 @@ final class Model: ObservableObject {
         forceRestartWarning = forceRestartWarning || reviewRestart
         reviewRestart = false
         preserveNotice = false
+        capacityBlocked = false
+        capacityRecovery = false
         symbol = "arrow.triangle.2.circlepath"
         progressLabel = "Preparing sessions"
         if resetProgress {
@@ -645,7 +669,7 @@ final class Model: ObservableObject {
             if event.live == true {
                 updateSourceActivity(event)
                 moveProgress.update(stage, completed: event.completed, total: event.total, preparatory: event.preparatory == true)
-                progressLabel = event.preparatory == true ? "Checking remaining sessions" : ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : ["desktop", "reopen"].contains(stage) ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
+                progressLabel = event.preparatory == true ? (["move", "retire", "finalize"].contains(stage) ? "Moving eligible sessions" : stage == "verify" ? "Checking moved sessions" : "Checking remaining sessions") : ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : ["desktop", "reopen"].contains(stage) ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
                 if event.preparatory != true, let text = sourceProgressText(event) { progressLabel = text }
                 badge = "\(moveProgress.percent)%"
             } else {
@@ -669,10 +693,16 @@ final class Model: ObservableObject {
             let issues = event.issues
             retryable = event.retryable == true
             stopped = event.ok == false
-            if ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED"].contains(event.code ?? "") {
+            if event.code == "RESTART_CAPACITY" || capacityBlocked && (event.heldCount ?? 0) > 0 {
+                capacityFailure(event)
+            } else if ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED"].contains(event.code ?? "") {
                 changedApproval()
             } else if event.code == "REOPEN_FAILED" {
                 reopenFailure()
+            } else if ["QUIT_UNCONFIRMED", "RESTART_DEADLINE"].contains(event.code ?? "") {
+                note = prefix + "\(operationName) stopped: \(plainReason(event.code))."
+                preserveNotice = true
+                if event.receipt != nil && (event.heldCount ?? 0) > 0 && !["undo", "restart"].contains(operationArgs.first ?? "") { operationArgs = ["finish", "--json"] }
             } else if event.recoveryRequired == true {
                 note = "The last move was interrupted."
             } else if !(event.pendingUndo ?? []).isEmpty {
@@ -745,6 +775,19 @@ final class Model: ObservableObject {
         preserveNotice = true
         restartAvailable = false
         note = "\(operationName) stopped: Claude could not be confirmed open. Open Claude, then press Try again."
+    }
+
+    private func capacityFailure(_ event: Event) {
+        capacityBlocked = true
+        capacityRecovery = event.recoveryRequired == true
+        stopped = true
+        retryable = false
+        preserveNotice = true
+        restartAvailable = false
+        let moved = event.summary?.moved ?? event.moved ?? 0
+        let budget = event.capacity?.availableMs == 0 ? "The restart time limit was reached before shutdown." : "The remaining work is not expected to fit the restart time limit."
+        let remaining = event.heldCount.map { $0 > 0 ? " \(quantity($0, "session remains pending.", "sessions remain pending."))" : "" } ?? ""
+        note = (moved > 0 ? "\(moved) moved. " : "") + "Claude stayed running. " + budget + (capacityRecovery ? " Unfinished work needs recovery." : remaining)
     }
 
     private func updateSourceActivity(_ event: Event) {
@@ -823,27 +866,36 @@ final class Model: ObservableObject {
         moveProgress.paused = ProcessInfo.processInfo.systemUptime
         var response = NSApplication.ModalResponse.alertFirstButtonReturn
         var suppress = false
-        if !skipRestartWarning || forceRestartWarning {
-            let alert = RestartPrompt(plan: plan).alert()
-            NSApp.activate(ignoringOtherApps: true)
-            response = alert.runModal()
-            suppress = alert.suppressionButton?.state == .on
-        }
+        let prompt = RestartPrompt(plan: plan)
+        if !skipRestartWarning || forceRestartWarning || !prompt.canRestart { (response, suppress) = restartResponse(prompt) }
         pendingPlan = nil
         forceRestartWarning = false
         if let paused = moveProgress.paused, let started = operationStarted { operationStarted = started + ProcessInfo.processInfo.systemUptime - paused }
         moveProgress.resume()
-        if response == .alertFirstButtonReturn {
+        if response == .alertFirstButtonReturn && prompt.canRestart {
             if suppress { skipRestartWarning = true; UserDefaults.standard.set(true, forKey: "skipRestartWarning") }
             begin(resetProgress: false)
             approvalAttempted = true
             runOperation(operationArgs + ["--restart-approved", token], remember: false)
         } else if plan.kind == "move", response == .alertSecondButtonReturn {
             begin(resetProgress: false)
+            capacityBlocked = !prompt.canRestart
             runOperation(operationArgs + ["--move-only"], remember: false)
+        } else if !prompt.canRestart {
+            running = false
+            badge = ""
+            capacityFailure(plan)
+            refresh()
         } else {
             cancelRestart(plan)
         }
+    }
+
+    private func restartResponse(_ prompt: RestartPrompt) -> (NSApplication.ModalResponse, Bool) {
+        let alert = prompt.alert()
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        return (response, alert.suppressionButton?.state == .on)
     }
 
     private func cancelRestart(_ plan: Event) {
@@ -950,7 +1002,7 @@ final class Model: ObservableObject {
     }
 
     private func finish(_ status: Int32, _ error: String) {
-        if let plan = pendingPlan, status == 0 {
+        if let plan = pendingPlan, status == 0 || plan.capacity?.fits == false {
             if approvalAttempted {
                 pendingPlan = nil
                 running = false
