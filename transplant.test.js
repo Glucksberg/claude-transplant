@@ -10,7 +10,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, inventory, keepLocal, layout, move, normalize, parseProcesses, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, move, normalize, parseProcesses, pendingPresentation, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -69,11 +69,16 @@ async function moveWithPending(h, from, to, cloud = null) {
   return result
 }
 const branchEntries = (count, session, start) => Array.from({ length: count }, (_, index) => entry(index % 2 ? 'assistant' : 'user', start + index, index ? start + index - 1 : null, session))
-const cli = (home, args) => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+const processSetup = processes => `
+  const processes = ${JSON.stringify(processes)}, run = childProcess.spawnSync
+  childProcess.spawnSync = (file, args, ...rest) => file === '/bin/ps' ? { status: 0, stdout: processes[args[1].endsWith('command=') ? 'commands' : 'list'], stderr: '' } : run(file, args, ...rest)
+`
+const cli = (home, args, setup = '') => promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
   import childProcess from 'node:child_process'
   import { syncBuiltinESMExports } from 'node:module'
   childProcess.spawnSync = (${fixtureCommand.toString()})(childProcess.spawnSync)
   childProcess.spawn = (${fixtureCommand.toString()})(childProcess.spawn)
+  ${setup}
   syncBuiltinESMExports()
   process.argv.splice(1, 0, ${JSON.stringify(path.join(here, 'transplant.js'))})
   await import(${JSON.stringify(path.join(here, 'transplant.js'))})
@@ -3956,12 +3961,14 @@ test('an unsupported remote content block is never rescued or archived', async (
   const inv = await inventory([from], to, h.paths, () => {}, { cloud })
   assert.equal(inv.cloud.matches.length, 0)
   assert.match(inv.cloud.blocked[0].error, /unsupported content block/)
+  assert.equal(inv.cloud.blocked[0].code, 'CLOUD_CONTENT_UNSUPPORTED')
   const result = await move(inv, to, h.paths)
   assert.equal(result.ok, false)
   assert.equal(result.pendingCloud, 1)
   assert.equal(result.receipt.cloudChecks[0].status, 'failed')
   assert.equal(archived, false)
   assert.match(result.receipt.failed[0].error, /unsupported content block/)
+  assert.equal(result.receipt.failed[0].code, 'CLOUD_CONTENT_UNSUPPORTED')
   assert.deepEqual((await readdir(h.dir('Z'))).filter((name) => name.endsWith('.json')), [`local_${SOURCE}.json`])
 })
 
@@ -4531,11 +4538,12 @@ test('task approval tokens reject empty and malformed values without file mutati
     for (const approve of ['', 'invalid']) {
       const options = { io, processes: [], approve }
       const result = await (operation.endsWith('finish') ? finishWorkflow(h.paths, options) : operation === 'undo' ? undo(h.paths, options) : executeMove(operation === 'move' ? [from] : null, operation === 'move' ? to : null, h.paths, options))
-      assert.deepEqual(result, { ok: false, reason: 'Restart approval is missing or does not match the saved plan' }, operation)
+      assert.deepEqual(result, { ok: false, code: 'RESTART_APPROVAL_CHANGED', reason: 'Restart approval is missing or does not match the saved plan' }, operation)
       assert.deepEqual(await fixtureSnapshot(h, [h.root]), before, operation)
       const rejected = await cli(h.root, [...command, '--restart-approved', approve, '--json'])
       assert.equal(rejected.code, 1, operation)
       assert.match(rejected.stderr, /restart approval token must be the one displayed by the engine/, operation)
+      assert.equal(lines(rejected.stdout).find(row => row.done)?.code, 'COMMAND_FAILED', operation)
       assert.deepEqual(await fixtureSnapshot(h, [h.root]), before, operation)
       assert.deepEqual(calls, [], operation)
     }
@@ -5387,6 +5395,9 @@ test('task registry and record interruptions recover moves and Undo in the exist
 
 test('CLI accounts exposes task recovery through Finish without selecting historical refusals', async () => {
   const h = await taskFamilyFixture(true, 1)
+  const desktop = { ...desktopFixture()[0], started: 'Fri Sep 4 18:00:00 2026' }
+  const running = processSetup({ list: `${desktop.pid} 1 ${desktop.started} ${desktop.executable}`, commands: `${desktop.pid} 1 ${desktop.started} Claude` })
+  const stopped = processSetup({ list: '', commands: '' })
   await interruptTaskFamily(h, 'move', 'target')
   const name = (await readdir(h.paths.state)).find(name => /^\d.*\.json$/.test(name)), file = path.join(h.paths.state, name)
   const receipt = JSON.parse(await readFile(file))
@@ -5397,8 +5408,8 @@ test('CLI accounts exposes task recovery through Finish without selecting histor
   receipt.failed.push({ id: id(799), title: 'Historical refusal', error: 'scheduled task family member missing' })
   await writeFile(file, JSON.stringify(receipt))
   const before = await readFile(file)
-  const listed = await cli(h.root, ['accounts', '--json'])
-  assert.equal(listed.code, 0)
+  const listed = await cli(h.root, ['accounts', '--json'], running)
+  assert.equal(listed.code, 0, listed.stderr)
   const pending = lines(listed.stdout)[0].filter(row => row.pending)
   assert.equal(pending.length, 1)
   assert.equal(pending[0].account, h.acct.P)
@@ -5420,15 +5431,21 @@ test('CLI accounts exposes task recovery through Finish without selecting histor
   assert.deepEqual(calls, ['/usr/bin/osascript', '/usr/bin/open'])
   assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
   assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetRegistry)
-  const again = lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].filter(row => row.pending)
-  assert.deepEqual(again.map(row => [row.account, row.pending, row.pendingAction]), [[h.acct.P, 'local', 'finish']])
+  const recoveredBytes = await readFile(file)
+  for (const [setup, action] of [[stopped, 'finish'], [running, 'restart']]) {
+    const result = await cli(h.root, ['accounts', '--json'], setup)
+    assert.equal(result.code, 0, result.stderr)
+    const again = lines(result.stdout)[0].filter(row => row.pending)
+    assert.deepEqual(again.map(row => [row.account, row.pending, row.pendingAction]), [[h.acct.P, 'local', action]])
+    assert.deepEqual(await readFile(file), recoveredBytes)
+  }
   const finished = await finishWorkflow(h.paths, { processes: [] })
   assert.equal(finished.file, file)
   assert.equal(finished.ok, true)
   assert.equal(finished.complete, true)
   assert.equal(finished.receipt.sessions.length, 3)
   assert.ok(finished.notMoved.some(row => row.title === 'Historical refusal'))
-  assert.ok(lines((await cli(h.root, ['accounts', '--json'])).stdout)[0].every(row => row.pending === null))
+  assert.ok(lines((await cli(h.root, ['accounts', '--json'], stopped)).stdout)[0].every(row => row.pending === null))
 })
 
 test('task edits and dependencies block Undo and interrupted recovery without overwriting registries', async () => {
@@ -7433,13 +7450,214 @@ test('process registry identifies a new worker without argv ids and rejects stal
   assert.deepEqual(foreign.find(row => row.pid === 502).ids, [])
 })
 
-test('Swift preserves command, progress, metadata, and completion states', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
-  const checkpointAccounts = await checkpointAccountsFixture()
-  const h = await taskFamilyFixture(true, 1)
-  await interruptTaskFamily(h, 'move', 'target')
-  const recoveryAccounts = await cli(h.root, ['accounts', '--json'])
-  assert.equal(recoveryAccounts.code, 0)
+test('panel idle timing joins distinct record and CLI IDs without timing stopped, unrelated or scheduler-held workers', async () => {
+  const h = await home(), f = await identityFixture(h), second = id(2), cold = id(3)
+  const recordIds = new Map([[SOURCE, id(101)], [second, id(102)], [cold, id(103)]])
+  const started = new Date(f.started).toString().replace(/^(\w+ \w+ \d+) (\d+) ([\d:]+).*$/, '$1 $3 $2')
+  const processes = {
+    list: `500 1 ${started} /Applications/Claude.app/Contents/MacOS/Claude\n501 500 ${started} /tmp/claude\n502 500 ${started} /tmp/claude`,
+    commands: `500 1 ${started} Claude\n501 500 ${started} claude --resume ${SOURCE}\n502 500 ${started} claude --resume ${second}`
+  }
+  const table = parseProcesses(processes.list, processes.commands)
+  for (const session of [SOURCE, second, cold]) {
+    await h.write(session, [entry('user', Number(session.slice(-3)), null, session)])
+    await h.record('P', recordIds.get(session), rehomeRecord({ cliSessionId: session }))
+  }
+  const all = await accounts(h.paths, table), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await executeMove([from], to, h.paths, { processes: table, moveOnly: true })
+  assert.equal(moved.receipt.held.length, 2)
+  for (const held of moved.receipt.held) {
+    assert.equal(held.recordId, `local_${recordIds.get(held.id)}`)
+    assert.notEqual(held.recordId, `local_${held.id}`)
+  }
+  const idle = (session = SOURCE, seconds = 900, offset = 1) => f.event(offset, `[WarmLifecycle:session] Starting idle timeout for local_${recordIds.get(session) ?? session}: ${seconds}s`)
+  for (const [name, text, expected] of [
+    ['matching', idle() + idle(second), 900],
+    ['different duration', idle(SOURCE, 120) + idle(second, 120), 120],
+    ['stale launch', idle(SOURCE, 900, -1) + idle(second), null],
+    ['other worker', idle(id(99)) + idle(second), null],
+    ['unknown shape', f.event(1, '[WarmLifecycle:session] Idle timeout: 900s'), null],
+    ['mixed duration', idle() + idle(second, 600), null],
+    ['ambiguous duration', idle() + idle(second) + idle(SOURCE, 600), null],
+    ['partial line', idle() + idle(second).trimEnd(), null],
+    ['future line', idle(SOURCE, 900, 172800) + idle(second), null],
+    ['outside bounded tail', idle() + 'x'.repeat(4 * 1024 * 1024) + '\n' + idle(second), null]
+  ]) {
+    await f.write(f.init() + text)
+    const result = pendingPresentation(moved.receipt, from, from, 'local', table, false, await idleTimeouts(h.paths, table))
+    assert.equal(result.pendingIdleSeconds, expected, name)
+    assert.equal(result.pendingAutomatic, true, name)
+    if (name === 'matching') {
+      const listed = await cli(h.root, ['accounts', '--json'], processSetup(processes))
+      assert.equal(listed.code, 0, listed.stderr)
+      assert.equal(lines(listed.stdout)[0].find(row => row.account === from.account).pendingIdleSeconds, 900)
+      for (const [name, workers] of [
+        ['stopped', table.slice(0, 1)],
+        ['unrelated', table.map(row => ({ ...row, ids: [id(99)] }))],
+        ['external', table.map(row => row.pid === 501 ? { ...row, desktopPid: null } : row)]
+      ]) {
+        const timeouts = await idleTimeouts(h.paths, workers)
+        assert.equal(timeouts.get(`local_${recordIds.get(SOURCE)}`), 900, name)
+        assert.equal(pendingPresentation(moved.receipt, from, from, 'local', workers, false, timeouts).pendingIdleSeconds, null, name)
+      }
+      for (const scheduler of [false, true]) {
+        const receipt = structuredClone(moved.receipt)
+        if (!scheduler) receipt.held[0].release = 'scheduler'
+        const protectedState = pendingPresentation(receipt, from, from, 'local', table, scheduler, await idleTimeouts(h.paths, table))
+        assert.equal(protectedState.pendingAutomatic, false)
+        assert.equal(protectedState.pendingIdleSeconds, null)
+      }
+      assert.equal((await idleTimeouts(h.paths, [])).size, 0)
+      assert.equal((await idleTimeouts(h.paths, [...table, { ...table[0], pid: 999 }])).size, 0)
+    }
+  }
+  await unlink(path.join(h.paths.logs, 'main.log'))
+  assert.equal((await idleTimeouts(h.paths, table)).size, 0)
+  assert.deepEqual(JSON.parse(await readFile(moved.file)).held, moved.receipt.held)
+})
+
+test('panel states distinguish typed waiting, unsupported, ownership and login scopes', () => {
+  const source = { account: id(901), org: id(911), sessionIds: ['session_one'] }, receipt = { remote: [] }
+  for (const [code, state, action] of [
+    ['CLOUD_CONTENT_UNSUPPORTED', 'unsupported', 'blocked'], ['CLOUD_HISTORY_UNREADABLE', 'waiting', 'wait'],
+    ['CLOUD_ARTIFACT_UNCERTAIN', 'waiting', 'wait'], ['CLOUD_ARTIFACT_BUDGET', 'waiting', 'wait'],
+    ['CLOUD_RESCUE_TASK', 'protected', 'wait'], ['CLOUD_RESCUE_NOTIFICATION', 'protected', 'wait'], ['CLOUD_RESCUE_WORKER', 'worker', 'wait'],
+    [undefined, 'waiting', 'wait']
+  ]) {
+    const current = pendingPresentation(receipt, { ...source, failures: [{ id: 'cse_one', code, error: 'attachments cannot be copied' }] }, { active: true, signedIn: true }, 'cloud')
+    assert.equal(current.pendingState, state)
+    assert.equal(current.pendingAction, action)
+  }
+  assert.equal(pendingPresentation(receipt, source, { active: false, signedIn: true }, 'cloud').pendingAction, 'switch-org')
+  assert.equal(pendingPresentation(receipt, source, { active: false, signedIn: false }, 'cloud').pendingAction, 'sign-in')
+  for (const release of ['worker', 'scheduler', undefined]) {
+    const held = { id: SOURCE, recordId: `local_${SOURCE}`, release, sources: [{ ...source, id: SOURCE, file: '/synthetic/held.json' }] }
+    const current = pendingPresentation({ held: [held] }, source, {}, 'local', desktopFixture(), release === 'scheduler')
+    assert.equal(current.pendingAutomatic, release === 'worker')
+    assert.equal(current.pendingState, release === 'worker' ? 'open' : 'held')
+    assert.equal(current.pendingAction, 'restart')
+    const external = pendingPresentation({ held: [held] }, source, {}, 'local', [{ ...desktopFixture()[1], desktopPid: null }])
+    assert.equal(external.pendingAction, 'wait')
+    assert.equal(external.pendingAutomatic, false)
+  }
+})
+
+test('panel unsupported state comes only from unsupported payloads, not unreadable known blocks', async () => {
+  for (const [content, code] of [[[{ type: 'future_attachment' }], 'CLOUD_CONTENT_UNSUPPORTED'], [[{ type: 'text' }], 'CLOUD_HISTORY_UNREADABLE']]) {
+    const h = await home(), main = branchEntries(8, SOURCE, 1)
+    await h.write(SOURCE, main)
+    await h.record('Z', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_payload'] }))
+    const cloud = cloudFixture(h, { list: async () => [remoteSession({ id: 'cse_payload', title: 'Synthetic source' })], eventRows: async () => remoteRows([...main, entry('assistant', 100, 8, SOURCE, { message: { role: 'assistant', content } })]) })
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloud, processes: [] })
+    assert.deepEqual(inv.cloud.matches, [])
+    assert.equal(inv.cloud.blocked[0].code, code)
+  }
+})
+
+test('panel leave tokens survive sweep bookkeeping and reject changed receipt or selection while preserving other work', async () => {
+  for (const change of ['none', 'retry', 'selection', 'receipt', 'source']) {
+    const h = await home()
+    await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+    await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_scope'] }))
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, processes: [] }), to, h.paths)
+    if (change === 'retry') {
+      const initial = JSON.parse(await readFile(moved.file))
+      Object.assign(initial.cloudChecks[0], { checkedAt: '2026-10-10T00:00:00.000Z', status: 'failed', failures: [{ id: 'cse_scope', code: 'CLOUD_ARTIFACT_UNCERTAIN', error: 'Waiting for a complete check' }] })
+      await writeFile(moved.file, JSON.stringify(initial))
+    }
+    const listed = await cli(h.root, ['accounts', '--json'])
+    assert.equal(listed.code, 0, listed.stderr)
+    const selected = lines(listed.stdout)[0].find(row => row.account === from.account)
+    assert.match(selected.pendingCancel, /^[a-f0-9]{64}$/)
+    const receipt = JSON.parse(await readFile(moved.file)), other = { account: h.acct.Q, org: h.org.Q, label: 'Other source', status: 'pending', sessionIds: ['session_other'] }
+    receipt.cloudChecks.push(other)
+    receipt.held = [{ id: id(998), title: 'Unrelated held work', sources: [{ account: h.acct.T, org: h.org.T, id: id(998), file: '/synthetic/held.json' }], workers: [] }]
+    if (change === 'retry') {
+      receipt.cloudChecks[0].checkedAt = new Date().toISOString()
+      receipt.cloudChecks[0].status = 'failed'
+      receipt.cloudChecks[0].failures = [{ id: 'cse_scope', code: 'CLOUD_ARTIFACT_UNCERTAIN', error: 'Waiting for a complete check' }]
+    }
+    if (change === 'selection') receipt.cloudChecks[0].sessionIds.push('session_later')
+    if (change === 'source') receipt.cloudChecks[0].org = h.org.T
+    await writeFile(moved.file, JSON.stringify(receipt))
+    if (change === 'receipt') await writeFile(path.join(h.paths.state, '2099-01-01T00-00-00-000.json'), JSON.stringify(receipt))
+    const before = await readFile(moved.file), result = await keepLocal(h.paths, { checks: [selected.pendingCancel] })
+    if (['selection', 'receipt', 'source'].includes(change)) {
+      assert.equal(result.code, 'PENDING_CHANGED')
+      assert.deepEqual(await readFile(moved.file), before)
+    } else {
+      assert.equal(result.cancelled, 1)
+      assert.equal(result.complete, false)
+      assert.equal(result.heldCancelled, 0)
+      assert.deepEqual(result.receipt.held, receipt.held)
+      assert.deepEqual(result.receipt.cloudChecks[1], other)
+      assert.equal(result.receipt.localCancelledAt, undefined)
+    }
+  }
+})
+
+function wordingFixtures() {
+  const base = [
+    { account: 'work', org: 'company', email: 'work@example.test', orgName: 'Nomad Inc.', label: 'work@example.test · Nomad Inc.', active: true, signedIn: true },
+    { account: 'work', org: 'personal', email: 'work@example.test', orgName: 'Personal', label: 'work@example.test · Personal', active: false, signedIn: true },
+    { account: 'home', org: 'personal', email: 'home@example.test', orgName: 'Personal', label: 'home@example.test · Personal', active: false, signedIn: false }
+  ].map((row, index) => ({ ...row, activeAt: 3 - index, pending: null, pendingFailures: [], identityState: 'known' }))
+  const pending = (index, mode, count, code = null, release = null, activeIndex = 0, seconds = null) => {
+    const rows = structuredClone(base).map((row, index) => ({ ...row, active: index === activeIndex, signedIn: row.account === base[activeIndex].account })), account = rows[index], source = { account: account.account, org: account.org, sessionIds: Array.from({ length: count }, (_, i) => `session_${i}`) }
+    if (code) source.failures = source.sessionIds.map(id => ({ id, title: 'Research conversation', code, error: code }))
+    const held = mode === 'local' ? Array.from({ length: count }, (_, i) => ({ id: id(i + 1), recordId: `local_${id(i + 1)}`, release, title: `Open chat ${i + 1}`, sources: [{ ...source, file: `/synthetic/${i}.json` }] })) : []
+    const receipt = { held, remote: mode === 'undo' ? [{ id: 'cse_0' }, { id: 'cse_1' }] : [], remoteUndoing: mode === 'undo' ? [{ ...source, id: 'cse_1' }] : [] }
+    const table = release === 'worker' ? [desktopFixture()[0], ...held.map((row, index) => ({ ...desktopFixture()[1], pid: 501 + index, ids: [row.id] }))] : desktopFixture()
+    Object.assign(account, { pending: mode, pendingFailures: source.failures ?? [], receipt: 'synthetic-receipt', receiptMoved: mode === 'local' ? 359 : 361,
+      receiptDestination: index === 0 ? 'work/personal' : 'work/company', pendingCancel: mode === 'cloud' ? String(index + 1).repeat(64) : null,
+      ...pendingPresentation(receipt, source, account, mode, table, release === 'scheduler', new Map(held.map(row => [row.recordId, seconds]))) })
+    return rows
+  }
+  const plan = { plan: true, kind: 'move', token: 'a'.repeat(64), heldCount: 102, remainingCount: 102, moved: 259,
+    sourceLabels: [base[1].label], affected: [{ pid: 501, started: 'synthetic', recordId: 'local_one', title: 'Research notes' }, { pid: 502, started: 'synthetic', recordId: 'local_two', title: 'Daily brief' }] }
+  const held = pending(1, 'local', 102, null, 'scheduler')
+  held[1].receiptMoved = 259
+  const mixed = pending(2, 'cloud', 3)
+  mixed[1] = held[1]
+  mixed[2].receiptMoved = 259
+  const rows = [
+    { name: '01-done', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label }, contains: ['Done. 361 sessions are now in', base[0].label], primary: null },
+    { name: '02-held', accounts: held, contains: ['259 moved.', '102 more need Claude to restart.'], primary: 'Restart Claude and move 102' },
+    { name: '03-restart-dialog', plan, dialog: true, contains: ['Restart Claude to move 102 more sessions?', 'These open chats will stop:'], primary: 'Restart and move' },
+    { name: '04-same-login', accounts: pending(1, 'cloud', 1), contains: ['1 old copy needs checking', 'Switch Claude to Personal'], primary: null },
+    { name: '05-other-login', accounts: pending(2, 'cloud', 3), contains: ['3 old copies need checking', 'Sign Claude in as home@example.test'], primary: null, stop: 'Leave them' },
+    { name: '06-clearing', accounts: pending(1, 'cloud', 1, null, null, 1), operation: ['finish', '--json'], event: { stage: 'cloud', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceLabel: base[1].label }, contains: ['361 moved. Clearing 1 old copy from', base[1].label], primary: null },
+    { name: '07-bringing-over', accounts: base.map((row, index) => ({ ...row, active: index === 1 })), event: { stage: 'rescue', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceLabel: base[1].label }, contains: ['Bringing over 1 conversation from', base[1].label], primary: null },
+    { name: '08-unsupported', accounts: pending(1, 'cloud', 1, 'CLOUD_CONTENT_UNSUPPORTED'), contains: ["attachments that can't be copied", base[1].label], primary: null, stop: 'Got it', expanded: true },
+    { name: '09-open-chats', accounts: pending(1, 'local', 2, null, 'worker'), contains: ['359 moved.', '2 open chats move after they go idle'], primary: 'Restart Claude and move 2' },
+    { name: '10-interrupted', accounts: pending(1, 'recovery', 0), contains: ['The last move was interrupted.'], primary: 'Finish the move' },
+    { name: '11-repair', accounts: base.map(row => ({ ...row, recoveryProblem: { receipt: '/synthetic/move.json', error: 'Synthetic invalid checkpoint' } })), contains: ["Paused: the last move's record needs repair."], primary: null },
+    { name: '12-undo-pending', accounts: pending(2, 'undo', 1), contains: ['Undo is partly done.', 'then press Finish undo'], primary: null },
+    { name: '13-move-stopped', event: { done: true, ok: false, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['Move stopped: Claude did not confirm it had closed.'], primary: 'Try again' },
+    { name: '14-background-complete', event: { swept: true, ok: true, complete: true, moved: 12, restart: true }, contains: ['Moved 12 more sessions. Restart Claude to see them.'], primary: null },
+    { name: '15-restart-cancelled', accounts: held, plan, cancel: true, contains: ['Restart cancelled.', '102 sessions', base[1].label], primary: 'Restart Claude and move 102' },
+    { name: '16-approval-changed', event: { done: true, ok: false, code: 'RESTART_PLAN_CHANGED', retryable: true }, contains: ['Different chats are open now.', 'review again.'], primary: 'Restart Claude and move' },
+    { name: '17-uncertain', accounts: pending(0, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['Waiting to verify 1 conversation', 'The check will retry automatically.'], primary: null },
+    { name: '18-task-protected', accounts: pending(0, 'cloud', 1, 'CLOUD_RESCUE_TASK'), contains: ['1 conversation remains', 'additional messages'], primary: null },
+    { name: '19-undo-complete', event: { undone: 'synthetic-receipt', restored: 3, sessions: 3, restart: true }, operation: ['undo', '--json'], contains: ['Undo complete. 3 source entries restored.'], primary: null },
+    { name: '20-stopped-here', event: { done: true, ok: true, complete: true, moved: 259, keptLocal: 1, heldCancelled: 102 }, operation: ['keep-local', '--json'], contains: ['259 moved. Stopped here.', 'Remaining work cancelled.'], primary: null },
+    { name: '21-partial', event: { done: true, ok: false, complete: true, summary: { moved: 233, notMoved: Array.from({ length: 10 }, (_, i) => ({ id: id(i), error: 'MOVE_BLOCKED' })), groups: [], attention: [] } }, contains: ['233 moved.', '10 sessions were not moved.'], primary: null },
+    { name: '22-notification-protected', accounts: pending(0, 'cloud', 1, 'CLOUD_RESCUE_NOTIFICATION'), contains: ['1 conversation remains', 'additional messages'], primary: null },
+    { name: '23-worker-waiting', accounts: pending(0, 'cloud', 1, 'CLOUD_RESCUE_WORKER'), contains: ['Waiting for local Claude work to stop', 'bringing over 1 conversation'], primary: null },
+    { name: '24-companion-complete', event: { done: true, ok: true, complete: true, moved: 362, destinationLabel: base[0].label, rescuedTitles: ['Research conversation'] }, contains: ['Done. 362 sessions', 'Brought over: Research conversation'], primary: null },
+    { name: '25-completion-pending', event: { done: true, ok: true, complete: false, moved: 12 }, contains: ['12 moved. Remaining work is waiting.'], primary: null },
+    { name: '26-undo-ready', accounts: pending(2, 'undo', 1, null, null, 2), contains: ['Undo is partly done.', 'Press Finish undo.'], primary: 'Finish undo' },
+    { name: '27-timed-open-chats', accounts: pending(1, 'local', 2, null, 'worker', 0, 900), contains: ['after about 15 idle minutes'], primary: 'Restart Claude and move 2' },
+    { name: '28-mixed-held-and-cloud', accounts: mixed, contains: ['259 moved.', '102 more need Claude to restart.', '3 old copies need checking'], primary: 'Restart Claude and move 102', stop: 'Leave them' },
+    { name: '29-unreadable', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_UNREADABLE'), contains: ['Waiting to verify 1 conversation', 'The check will retry automatically.'], primary: null },
+    { name: '30-unsupported-dismissed', operation: ['keep-local', '--json', '--leave-check', 'a'.repeat(64)], event: { done: true, ok: true, complete: true, moved: 0, keptLocal: 1, heldCancelled: 0 }, contains: ['Stopped here. Remaining source checks cancelled.'], primary: null }
+  ]
+  return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
+}
+
+async function swiftFixtureSource() {
   let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct TransplantApp: App {')[0]
   const start = source.indexOf('    private func run(_ args: [String]')
   const end = source.indexOf('\nstruct RowKey: PreferenceKey', start)
@@ -7449,14 +7667,146 @@ test('Swift preserves command, progress, metadata, and completion states', async
     }
 }
 ` + source.slice(end)
-  source = source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
-  source += String.raw`
+  return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
+    .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)') + String.raw`
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
+@MainActor var automaticRefreshFixture = false
 extension Model {
     func checkSweep() { sweep() }
     func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
     func checkStarted(_ secondsAgo: TimeInterval) { operationStarted = ProcessInfo.processInfo.systemUptime - secondsAgo }
+    func checkOperation(_ args: [String]) { operationArgs = args }
+    func checkCancel(_ plan: Event) { cancelRestart(plan) }
 }
+`
+}
+
+test('Swift section 1 wording states render the production panel and restart prompt', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-section1-panels-'))
+  const fixtures = wordingFixtures(), file = path.join(root, 'wording.swift'), binary = path.join(root, 'wording')
+  await writeFile(path.join(root, 'fixtures.json'), JSON.stringify(fixtures))
+  const source = await swiftFixtureSource() + String.raw`
+struct WordingFixture: Decodable {
+    let name: String
+    let accounts: [Account]
+    let operation: [String]
+    let event: String?
+    let plan: Event?
+    let dialog: Bool?
+    let cancel: Bool?
+    let expanded: Bool?
+    let contains: [String]
+    let primary: String?
+    let stop: String?
+}
+@main
+struct WordingChecks {
+    @MainActor static func main() throws {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let root = URL(fileURLWithPath: CommandLine.arguments[1])
+        let fixtures = try JSONDecoder().decode([WordingFixture].self, from: Data(contentsOf: root.appendingPathComponent("fixtures.json")))
+        var manifest: [[String: Any]] = []
+        for fixture in fixtures {
+            requests = []
+            let model = Model(demo: fixture.accounts)
+            if model.pendingAccounts.isEmpty, let target = fixture.operation.firstIndex(of: "--to"), target + 1 < fixture.operation.count {
+                model.selectTarget(fixture.operation[target + 1].replacingOccurrences(of: " ", with: "/"))
+                let selected = Set(fixture.operation.indices.filter { fixture.operation[$0] == "--from" && $0 + 1 < fixture.operation.count }.map { fixture.operation[$0 + 1].replacingOccurrences(of: " ", with: "/") })
+                for id in model.from.subtracting(selected) { model.toggle(id) }
+            }
+            model.checkOperation(fixture.operation)
+            var text: String
+            var primary: String?
+            var png: Data?
+            if fixture.dialog == true {
+                let prompt = RestartPrompt(plan: fixture.plan!)
+                text = prompt.title + "\n" + prompt.body
+                primary = prompt.confirm
+                let alert = prompt.alert()
+                precondition(alert.buttons.map(\.title) == ["Restart and move", "Move the others only", "Cancel"])
+                precondition(alert.suppressionButton?.title == "Don't ask again")
+                png = Snapshot.dialogData(fixture.plan!)
+            } else {
+                if fixture.cancel == true { model.checkCancel(fixture.plan!) }
+                if let line = fixture.event {
+                    let event = try JSONDecoder().decode(Event.self, from: Data(line.utf8))
+                    if event.swept == true {
+                        model.checkSweep()
+                        requests.last!.1(line)
+                        requests.last!.2(0, "")
+                    } else {
+                        model.begin()
+                        model.checkStarted(8.1)
+                        model.handle(line)
+                        if event.live != true { model.checkFinish(event.ok == false ? 1 : 0) }
+                    }
+                }
+                model.detailsExpanded = fixture.expanded == true
+                text = model.displaySummary
+                if let companion = model.companionText { text += "\n" + companion }
+                primary = model.primaryTitle
+                if let expected = fixture.stop { precondition(model.stopTitle == expected, fixture.name) }
+                for account in model.accounts {
+                    let from = Row(account: account, radio: false, selected: false, muted: false, tag: model.sourceTag(account), action: {})
+                    let to = Row(account: account, radio: true, selected: false, muted: false, tag: model.sourceTag(account), action: {})
+                    precondition(to.tagLabels.isEmpty)
+                    precondition(from.tagLabels.contains("active") == (account.active == true))
+                }
+                if fixture.name == "01-done" { precondition(model.visibleCompletion?.detail == "History verified · 8.1 seconds") }
+                if fixture.name == "08-unsupported" { precondition(model.detailLines.contains { $0.1.contains("Research conversation") }) }
+                if fixture.name == "12-undo-pending" || fixture.name == "26-undo-ready" {
+                    precondition(model.undoPending && !text.contains("361 moved"))
+                    let count = requests.count
+                    model.undo()
+                    precondition(requests.count == count)
+                }
+                if fixture.name == "09-open-chats" || fixture.name == "27-timed-open-chats" { precondition(model.sourceTag(model.pendingAccounts[0]) == "waiting") }
+                if fixture.name == "06-clearing" || fixture.name == "07-bringing-over" {
+                    precondition(model.to == "work/company" && model.from == ["work/personal"])
+                }
+                if fixture.name == "30-unsupported-dismissed" { precondition(model.visibleCompletion == nil) }
+                if fixture.name == "05-other-login" || fixture.name == "08-unsupported" {
+                    let tokens = model.scopedChecks
+                    precondition(!tokens.isEmpty)
+                    model.stopHere()
+                    precondition(requests.last!.0 == ["keep-local", "--json"] + tokens.flatMap { ["--leave-check", $0] })
+                    model.running = false
+                    model.note = ""
+                    model.detailsExpanded = fixture.expanded == true
+                }
+                png = Snapshot.data(model)
+            }
+            precondition(primary == fixture.primary, fixture.name + ": " + (primary ?? "none"))
+            for fragment in fixture.contains { precondition(text.contains(fragment), fixture.name + ": " + text) }
+            precondition((!text.contains("15 idle minutes") || fixture.name == "27-timed-open-chats") && !text.contains("Nothing was lost"))
+            let output = root.appendingPathComponent(fixture.name + ".png")
+            guard let png, let bitmap = NSBitmapImageRep(data: png), bitmap.pixelsWide > 200, bitmap.pixelsHigh > 100 else { fatalError("No production snapshot for " + fixture.name) }
+            try png.write(to: output)
+            manifest.append(["name": fixture.name, "path": output.path, "text": text, "primary": primary ?? NSNull(), "width": bitmap.pixelsWide, "height": bitmap.pixelsHigh])
+        }
+        try JSONSerialization.data(withJSONObject: manifest, options: [.prettyPrinted, .sortedKeys]).write(to: root.appendingPathComponent("manifest.json"))
+        print("Rendered \(fixtures.count) production wording states at \(root.path)")
+    }
+}
+`
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [root], { timeout: 90_000 })
+  t.diagnostic(stdout.trim())
+  const manifest = JSON.parse(await readFile(path.join(root, 'manifest.json')))
+  assert.equal(manifest.length, fixtures.length)
+  for (const row of manifest) assert.deepEqual((await readFile(row.path)).subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+})
+
+test('Swift preserves command, progress, metadata, and completion states', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-state-'))
+  const checkpointAccounts = await checkpointAccountsFixture()
+  const h = await taskFamilyFixture(true, 1)
+  await interruptTaskFamily(h, 'move', 'target')
+  const recoveryAccounts = await cli(h.root, ['accounts', '--json'])
+  assert.equal(recoveryAccounts.code, 0)
+  let source = await swiftFixtureSource()
+  source += String.raw`
 @main
 struct StateChecks {
     @MainActor
@@ -7551,7 +7901,7 @@ struct StateChecks {
         completed.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":167}")
         precondition(completed.visibleCompletion == nil)
         completed.checkFinish(0)
-        precondition(completed.visibleCompletion?.summary == "167 sessions moved to Personal")
+        precondition(completed.visibleCompletion?.summary == "Done. 167 sessions are now in you@home.com · Personal.")
         precondition(completed.visibleCompletion?.detail == "History verified · 8.1 seconds")
         completed.note = "A moved session has a newer title"
         precondition(completed.visibleCompletion == nil)
@@ -7667,7 +8017,7 @@ struct StateChecks {
                 requests[index].2(0, "")
                 precondition(inventory.accounts.map(\.id) == discoveredAccounts.map(\.id))
                 precondition(inventory.accounts.map(\.stats) == discoveredAccounts.map(\.stats))
-                precondition(inventory.displaySummary == "The move receipt needs repair")
+                precondition(inventory.displaySummary == "Paused: the last move's record needs repair.")
                 precondition(inventory.visibleCompletion == nil)
                 precondition(!inventory.canMutate && !inventory.ready && !inventory.pendingReady && !inventory.canKeepLocal)
                 precondition(inventory.recoveryProblem?.receipt == discoveredAccounts[0].recoveryProblem?.receipt)
@@ -7688,19 +8038,19 @@ struct StateChecks {
             requests[index].2(0, "")
             precondition(inventory.recoveryProblem == nil && inventory.canMutate)
             precondition(inventory.pendingReady && !inventory.ready && !inventory.canKeepLocal)
-            precondition(inventory.note == previousNote && inventory.lines.elementsEqual(previousLines, by: ==))
-            precondition(inventory.symbol == previousSymbol && inventory.badge == previousBadge)
+            precondition(inventory.note.isEmpty && inventory.lines.elementsEqual(previousLines, by: ==))
+            precondition(inventory.symbol == "clock.arrow.circlepath" && inventory.badge.isEmpty)
             precondition(inventory.restartAvailable == populated)
             precondition(inventory.detailLines.elementsEqual(previousLines, by: ==))
-            precondition(inventory.displaySummary == (populated ? previousNote : "Finish the interrupted move"))
+            precondition(inventory.displaySummary == "The last move was interrupted.")
             inventory.finishPending()
             precondition(requests.last!.0 == ["finish", "--json"] && inventory.running)
         }
         requests = []
         let taskRecovery = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(base64Encoded: "TASK_RECOVERY_ACCOUNTS")!))
         precondition(taskRecovery.pendingReady && !taskRecovery.ready && !taskRecovery.canKeepLocal)
-        precondition(taskRecovery.pendingButtonTitle == "Finish move")
-        precondition(taskRecovery.pendingPrompt == "Finish the interrupted move")
+        precondition(taskRecovery.pendingButtonTitle == "Finish the move")
+        precondition(taskRecovery.pendingPrompt == "The last move was interrupted.")
         taskRecovery.skipRestartWarning = true
         taskRecovery.finishPending()
         precondition(requests[0].0 == ["finish", "--json"])
@@ -7714,11 +8064,11 @@ struct StateChecks {
         requests[0].2(1, "Sign Claude Desktop into Personal")
         requests[1].1(accountResponse(true))
         requests[1].2(0, "")
-        precondition(recovering.note == "The move needs attention" && recovering.pendingReady)
+        precondition(recovering.note == "Move stopped: the operation did not complete." && recovering.pendingReady)
         recovering.refresh()
         requests[2].1(accountResponse(false))
         requests[2].2(0, "")
-        precondition(recovering.note == "The move needs attention")
+        precondition(recovering.note == "Move stopped: the operation did not complete.")
         func sweepReply(_ model: Model, _ event: String) {
             let index = requests.count
             model.checkSweep()
@@ -7739,36 +8089,45 @@ struct StateChecks {
         sweepReply(recovering, cleanSweep)
         precondition(recovering.note == "No remaining work" && !recovering.pendingReady)
         precondition(recovering.lines.isEmpty && recovering.to == nil && recovering.from.isEmpty)
-        func failedFinishModel() -> Model {
+        func failedFinishModel(_ typed: Bool = false) -> Model {
             requests = []
             let model = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
             model.finishPending()
+            if typed { requests[0].1(#"{"done":true,"ok":false,"code":"COMMAND_FAILED","reason":"Synthetic command failure"}"#) }
             requests[0].2(1, "Sign Claude Desktop into Personal")
             requests[1].1(accountResponse(false))
             requests[1].2(0, "")
             return model
         }
-        for event in [
-            #"{"swept":true,"ok":false,"receipt":"receipt-one"}"#,
-            #"{"swept":true,"ok":true,"complete":true,"receipt":"another-receipt"}"#,
-            #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[{"id":"fixture","error":"Unmoved history"}]}"#,
-            #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","changed":[{"id":"fixture","fields":["record unavailable"]}]}"#
-        ] {
-            let guarded = failedFinishModel()
-            sweepReply(guarded, event)
-            precondition(guarded.note != "No remaining work")
-            sweepReply(guarded, cleanSweep)
-            precondition(guarded.note == "No remaining work")
+        for typed in [false, true] {
+            let completed = failedFinishModel(typed)
+            precondition(completed.note == "Move stopped: the operation did not complete.")
+            sweepReply(completed, cleanSweep)
+            precondition(completed.note == "No remaining work" && completed.lines.isEmpty)
+            for event in [
+                #"{"swept":true,"ok":false,"receipt":"receipt-one"}"#,
+                #"{"swept":true,"ok":true,"complete":false,"receipt":"receipt-one"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"another-receipt"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[{"id":"fixture","error":"Unmoved history"}]}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","problems":[{"id":"fixture","check":"transcript"}]}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","changed":[{"id":"fixture","fields":["record unavailable"]}]}"#
+            ] {
+                let guarded = failedFinishModel(typed)
+                sweepReply(guarded, event)
+                precondition(guarded.note != "No remaining work")
+                sweepReply(guarded, cleanSweep)
+                precondition(guarded.note == "No remaining work")
+            }
+            let corrupt = failedFinishModel(typed)
+            sweepReply(corrupt, #"{"swept":true,"ok":false,"error":"Corrupt receipt set aside"}"#)
+            sweepReply(corrupt, #"{"swept":true,"ok":true,"complete":true,"receipt":"older-receipt"}"#)
+            precondition(corrupt.note == "The remaining work needs attention")
+            let restart = failedFinishModel(typed)
+            sweepReply(restart, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","restart":true}"#)
+            let hint = restart.note
+            sweepReply(restart, cleanSweep)
+            precondition(restart.restartAvailable && restart.note == hint)
         }
-        let corrupt = failedFinishModel()
-        sweepReply(corrupt, #"{"swept":true,"ok":false,"error":"Corrupt receipt set aside"}"#)
-        sweepReply(corrupt, #"{"swept":true,"ok":true,"complete":true,"receipt":"older-receipt"}"#)
-        precondition(corrupt.note == "The remaining work needs attention")
-        let restart = failedFinishModel()
-        sweepReply(restart, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","restart":true}"#)
-        let hint = restart.note
-        sweepReply(restart, cleanSweep)
-        precondition(restart.restartAvailable && restart.note == hint)
         for errors in ["[]", #"[{"id":"fixture","title":"Unmoved session","error":"conflicting history"}]"#] {
             requests = []
             let idle = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
@@ -7789,7 +8148,7 @@ struct StateChecks {
         requests[0].2(1, "")
         requests[1].1(accountResponse(false))
         requests[1].2(0, "")
-        precondition(failed.note == "1 need attention")
+        precondition(failed.note == "Move stopped: the operation did not complete.")
         precondition(failed.lines.contains { $0.1.contains("conflicting history") })
         requests = []
         let completedCloud = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(accountResponse(true).utf8)))
@@ -7803,7 +8162,7 @@ struct StateChecks {
         let summary = #"{"moved":233,"notMoved":["# + Array(repeating: #"{"id":"fixture","error":"history refused"}"#, count: 10).joined(separator: ",") + #"],"groups":[{"cause":"history check","records":[{"id":"fixture","error":"history refused"}]},{"cause":"waiting on parent","records":[]},{"cause":"task collision","records":[]}],"attention":[]}"#
         let refusals = Model(demo: Demo.accounts)
         refusals.handle(#"{"done":true,"ok":false,"complete":true,"summary":"# + summary + "}")
-        precondition(refusals.note == "233 sessions moved, 10 not moved")
+        precondition(refusals.note == "233 moved. 10 sessions were not moved.")
         precondition(refusals.lines.map(\.0) == ["history check", "waiting on parent", "task collision"])
         var receiptAccounts = Demo.accounts
         for at in receiptAccounts.indices {
@@ -7812,13 +8171,86 @@ struct StateChecks {
         }
         let refreshedRefusals = Model(demo: receiptAccounts)
         precondition(refreshedRefusals.receiptSummaries.count == 1)
-        precondition(refreshedRefusals.pendingPrompt == "233 sessions moved, 10 not moved")
+        precondition(refreshedRefusals.pendingPrompt == "233 moved. 10 sessions were not moved.")
         precondition(!refreshedRefusals.pendingReady)
         sweepReply(refreshedRefusals, #"{"swept":true,"ok":true,"complete":true,"summary":"# + summary + "}")
-        precondition(refreshedRefusals.note == "233 sessions moved, 10 not moved")
+        precondition(refreshedRefusals.note == "233 moved. 10 sessions were not moved.")
         let recoveredCloud = failedFinishModel()
         sweepReply(recoveredCloud, #"{"swept":true,"ok":true,"complete":true,"receipt":"receipt-one","failed":[],"notMoved":[{"id":"fixture","error":"task family missing"}]}"#)
         precondition(recoveredCloud.note == "No remaining work")
+        let wording = try! JSONSerialization.jsonObject(with: Data(base64Encoded: "WORDING_FIXTURES")!) as! [[String: Any]]
+        func wordingAccounts(_ name: String) -> String {
+            String(data: try! JSONSerialization.data(withJSONObject: wording.first { $0["name"] as? String == name }!["accounts"]!), encoding: .utf8)!
+        }
+        func refreshReply(_ model: Model, _ accounts: String) {
+            let index = requests.count
+            model.refresh()
+            precondition(requests[index].0 == ["accounts", "--json"])
+            requests[index].1(accounts)
+            requests[index].2(0, "")
+        }
+        automaticRefreshFixture = true
+        for outcome in [
+            #"{"swept":true,"ok":true,"complete":false}"#,
+            #"{"swept":true,"ok":false,"error":"Incomplete bounded check","failed":[{"code":"CLOUD_ARTIFACT_BUDGET","error":"Incomplete bounded check"}]}"#,
+            #"{"swept":true,"ok":true,"complete":true,"moved":12,"restart":true}"#
+        ] {
+            requests = []
+            let item = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8)))
+            item.begin()
+            item.handle(#"{"done":true,"ok":true,"complete":false,"moved":361,"pendingCloud":1}"#)
+            item.checkFinish(0)
+            precondition(requests[0].0 == ["accounts", "--json"])
+            requests[0].1(wordingAccounts("17-uncertain"))
+            requests[0].2(0, "")
+            precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
+            precondition(requests[1].0 == ["sweep", "--json"])
+            requests[1].1(outcome)
+            requests[1].2(0, "")
+            if outcome.contains("\"restart\":true") {
+                precondition(item.restartAvailable && item.note == "Moved 12 more sessions. Restart Claude to see them.")
+                refreshReply(item, wordingAccounts("01-done"))
+                precondition(item.restartAvailable && item.note.contains("Moved 12 more sessions"))
+                item.selectTarget("work/personal")
+                precondition(item.primaryTitle == "Move")
+            } else {
+                precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
+                if outcome.contains("Incomplete bounded check") { precondition(item.detailLines.contains { $0.1.contains("Incomplete bounded check") }) }
+            }
+        }
+        requests = []
+        let login = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("12-undo-pending").utf8)))
+        precondition(login.undoPending && !login.pendingReady && login.primaryTitle == nil)
+        precondition(login.pendingPrompt.contains("Sign Claude in as home@example.test and select Personal"))
+        login.finishPending()
+        login.undo()
+        precondition(requests.isEmpty)
+        refreshReply(login, wordingAccounts("26-undo-ready"))
+        precondition(login.pendingReady && login.primaryTitle == "Finish undo" && !login.pendingPrompt.contains("Sign Claude"))
+        precondition(requests[1].0 == ["sweep", "--json"])
+        requests[1].1(#"{"swept":true,"ok":true,"complete":false}"#)
+        requests[1].2(0, "")
+        precondition(login.primaryTitle == "Finish undo")
+        login.primary()
+        precondition(requests.last!.0 == ["finish", "--json"])
+        requests = []
+        let queuedLeave = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("28-mixed-held-and-cloud").utf8)))
+        queuedLeave.checkSweep()
+        let tokens = queuedLeave.scopedChecks
+        precondition(tokens.count == 1 && queuedLeave.stopTitle == "Leave them")
+        queuedLeave.stopHere()
+        precondition(requests.count == 1 && queuedLeave.running)
+        requests[0].1(#"{"swept":true,"ok":true,"complete":false}"#)
+        requests[0].2(0, "")
+        precondition(requests[1].0 == ["keep-local", "--json"] + tokens.flatMap { ["--leave-check", $0] })
+        requests[1].1(#"{"done":true,"ok":true,"complete":false,"moved":259,"keptLocal":1,"heldCancelled":0}"#)
+        requests[1].2(0, "")
+        precondition(queuedLeave.visibleCompletion == nil)
+        requests[2].1(wordingAccounts("02-held"))
+        requests[2].2(0, "")
+        precondition(queuedLeave.primaryTitle == "Restart Claude and move 102")
+        precondition(queuedLeave.displaySummary == "259 moved. 102 more need Claude to restart.")
+        automaticRefreshFixture = false
         print("Swift queue and metadata states passed")
     }
 }
@@ -7826,6 +8258,7 @@ struct StateChecks {
   source = source.replace('TASK_RECOVERY_ACCOUNTS', Buffer.from(recoveryAccounts.stdout.trim()).toString('base64'))
   source = source.replace('CORRUPTED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.corrupted).toString('base64'))
   source = source.replace('REPAIRED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.repaired).toString('base64'))
+  source = source.replace('WORDING_FIXTURES', Buffer.from(JSON.stringify(wordingFixtures())).toString('base64'))
   const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
   await writeFile(file, source)
   await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
