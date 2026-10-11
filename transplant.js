@@ -98,17 +98,17 @@ export function pendingPresentation(receipt, source, account, mode, table = [], 
       pendingAction: external ? 'wait' : owned.length || scheduler ? 'restart' : 'finish' }
   }
   const failures = source.failures ?? [], waiting = source.waiting ?? []
-  const ids = [...new Set([...failures, ...waiting].map(row => row.id).filter(Boolean))]
+  const pending = [...failures, ...waiting]
+  const ids = [...new Set(pending.map(row => row.id).filter(Boolean))]
   const archived = new Set((receipt.remote ?? []).filter(row => sameAccount(row, source)).map(row => remoteId(row.id)))
   const count = failures.some(row => !row.id) ? null : ids.length || (source.sessionIds ? source.sessionIds.filter(id => !archived.has(remoteId(id))).length : null)
-  const state = failures.length && failures.every(row => row.code === 'CLOUD_CONTENT_UNSUPPORTED') ? 'unsupported'
-    : failures.some(row => ['CLOUD_RESCUE_TASK', 'CLOUD_RESCUE_NOTIFICATION'].includes(row.code)) ? 'protected'
-      : failures.some(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'worker'
-        : failures.length ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
-  const action = state === 'unsupported' ? 'blocked' : state === 'protected' || state === 'worker' ? 'wait'
+  const state = failures.length && !waiting.length && failures.every(row => row.code === 'CLOUD_CONTENT_UNSUPPORTED') ? 'unsupported'
+    : pending.length && pending.every(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'worker'
+      : failures.length || waiting.some(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
+  const action = state === 'unsupported' ? 'blocked' : state === 'worker' ? 'wait'
     : !account.active ? account.signedIn ? 'switch-org' : 'sign-in'
       : waiting.length ? canRestartWaiting({ cloudChecks: [source] }, table) ? 'restart' : 'wait' : state === 'waiting' ? 'wait' : 'finish'
-  return { pendingState: state, pendingAction: action, pendingCount: count, pendingAutomatic: !['unsupported', 'protected'].includes(state) }
+  return { pendingState: state, pendingAction: action, pendingCount: count, pendingAutomatic: state !== 'unsupported' }
 }
 const legacyLocalFailures = (receipt) => receipt.localCancelledAt ? [] : (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
 const needsRecovery = (receipt) => Boolean(receipt.pending || receipt.retiring || receipt.finalizing || receipt.undoing || receipt.remotePending || receipt.remoteUndoing?.length)
@@ -1296,6 +1296,7 @@ const lineageEvent = (entry) => {
 const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && detailIncluded(a.detail, b.detail)
 
 const messageHash = (type, value) => sha(stable({ type, message: without(value, MESSAGE_RUNTIME_KEYS) }))
+const rescueTitle = (title) => `${(title || 'Untitled session').replace(/(?: · from Remote Control)+$/, '')} · from Remote Control`
 
 const conversation = (entries) => entries.flatMap((entry) => {
   if (entry && ['user', 'assistant'].includes(entry.type) && entry.message) return [messageHash(entry.type, entry.message)]
@@ -1700,7 +1701,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
     artifactTurn = preceding.then(() => done)
     try {
       const sessionId = wireRemoteId(session.id)
-      const named = candidates.filter((candidate) => candidate.title === session.title)
+      const named = candidates.filter((candidate) => candidate.title === session.title || candidate.title === rescueTitle(session.title))
       const linked = candidates.filter((candidate) => candidate.remoteIds.has(sessionId))
       const detail = await cloud.session(session.id)
       if (REMOTE_OPEN.has(detail?.status) && remoteOpen(detail)) {
@@ -1735,10 +1736,17 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       const verified = linkedCovered.length === 1 ? linkedCovered : covered
       if (verified.length > 1) return { blocked: { id: session.id, title: session.title, account, error: 'multiple verified local target histories' } }
       if (verified.length === 1) return { match: { session, target: verified[0], conversationSha: sha(stable(remoteConversation)), account } }
-      if (linked.length === 1 && (linked[0].row.artifactBridgeIds ?? remoteIdsOf({ ...linked[0].row, members: [] })).includes(sessionId)) {
-        const selected = linked[0]
+      const anchors = linked.length ? linked : named
+      const base = anchors.length === 1 ? anchors[0] : null
+      const record = base && desktopRecordOf(base.row)
+      const anchored = base && (linked.length || conversationAnchored(remoteConversation, base.conversation, 8))
+      if (anchored && base.row.worker) return { waiting: { id: session.id, title: session.title || 'Untitled session', code: 'CLOUD_RESCUE_WORKER', localId: base.id, recordId: record.sessionId } }
+      const artifactLinked = base && linked.length && (base.row.artifactBridgeIds ?? remoteIdsOf({ ...base.row, members: [] })).includes(sessionId)
+      if (artifactLinked || anchored && (base.row.taskOwned || record.scheduledTaskId || record.notifySessionId)) {
+        const selected = base
         let retrySignature, fullBudget = false, checked = false, deferredAt
         try {
+          if (linked.length && !artifactLinked) throw artifactError('the retained parent history cannot be verified')
           if (!Array.isArray(remote.events)) await refresh()
           await preceding
           fullBudget = artifacts.used === 0
@@ -1762,20 +1770,13 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
         } finally { if (checked) cacheStore(cache, 'remote', session.id, signature, remote); release() }
       }
       if (remoteConversation.length < 4 && findCovered(candidates.filter((candidate) => !eligible.includes(candidate))).length) return { blocked: { id: session.id, title: session.title, account, error: 'remote history is too short to match a renamed local target' } }
-      const anchors = linked.length ? linked : named
       if (anchors.length !== 1) return { blocked: { id: session.id, title: session.title, account, error: anchors.length ? 'multiple divergent local targets' : 'no linked or same-title local target' } }
-      const base = anchors[0]
-      const minimumAnchor = 8
-      if (!linked.length && !conversationAnchored(remoteConversation, base.conversation, minimumAnchor)) return { blocked: { id: session.id, title: session.title, account, error: 'same-title local target does not share a branch segment' } }
-      const record = desktopRecordOf(base.row)
-      const ownership = base.row.taskOwned || record.scheduledTaskId ? ['CLOUD_RESCUE_TASK', 'is scheduled']
-        : record.notifySessionId ? ['CLOUD_RESCUE_NOTIFICATION', 'handles notifications'] : base.row.worker ? ['CLOUD_RESCUE_WORKER', 'is still running'] : null
-      if (ownership) return { blocked: { id: session.id, title: session.title, account, code: ownership[0], error: `The cloud copy was kept because its full history could not be matched and the local conversation ${ownership[1]}.${ownership[0] === 'CLOUD_RESCUE_WORKER' ? ' Try again after it stops.' : ''}` } }
+      if (!anchored) return { blocked: { id: session.id, title: session.title, account, error: 'same-title local target does not share a branch segment' } }
       if (!rows) {
         await refresh()
       }
       rescuePayloads(rows)
-      return { match: { session, target: { kind: 'rescue', base, id: null, title: session.title, matchMode: 'rescue' }, conversationSha: sha(stable(remoteConversation)), account } }
+      return { match: { session, target: { kind: 'rescue', base, id: null, title: rescueTitle(session.title), matchMode: 'rescue' }, conversationSha: sha(stable(remoteConversation)), account } }
     } catch (error) {
       return { blocked: { id: session.id, title: session.title, account, code: error.code, error: `Remote Control history unreadable: ${error.message}` } }
     } finally {
@@ -3148,10 +3149,15 @@ function rescuePayloads(rows) {
 }
 
 async function rescueRemote(match, to, cloud, journal) {
-  const base = match.target.base.row
-  if (!(await untouched(base, workers()))) throw new Error('local rescue anchor changed since inventory')
+  const base = match.target.base.row, title = match.target.title
+  const checkAnchor = async (when) => {
+    const live = workers(), recordId = desktopRecordOf(base).sessionId
+    if (ownsWorker(live, base.id, recordId)) throw Object.assign(new Error('Local rescue anchor is still running'), { code: 'CLOUD_RESCUE_WORKER', localId: base.id, recordId })
+    if (!(await untouched(base, live))) throw new Error(`local rescue anchor changed ${when}`)
+  }
+  await checkAnchor('since inventory')
   const { rows, session: after } = await stableRemoteRows(cloud, match.session.id)
-  if (!(await untouched(base, workers()))) throw new Error('local rescue anchor changed while reading remote history')
+  await checkAnchor('while reading remote history')
   const messages = rescuePayloads(rows)
   const remoteHistory = conversationFromRows(messages)
   const remoteMessageSha = sha(stable(messages.map((row) => row.payload.message)))
@@ -3197,12 +3203,12 @@ async function rescueRemote(match, to, cloud, journal) {
   if (sha(stable(entries.filter((entry) => ['user', 'assistant'].includes(entry.type)).map((entry) => entry.message))) !== remoteMessageSha) throw new Error('rescued transcript does not preserve exact remote message payloads')
   if (sha(stable(conversation(entries))) !== match.conversationSha) throw new Error('rescued transcript does not contain the remote message history')
   const now = new Date().toISOString()
-  entries.push({ type: 'custom-title', customTitle: match.session.title, sessionId: targetId, uuid: randomUUID(), timestamp: now })
+  entries.push({ type: 'custom-title', customTitle: title, sessionId: targetId, uuid: randomUUID(), timestamp: now })
   const transcriptText = `${entries.map(jsonLine).join('\n')}\n`
   const createdAt = milliseconds(match.session.created_at)
   const lastActivityAt = milliseconds(after.last_event_at)
   const settings = Object.fromEntries(RESCUE_RECORD_KEYS.filter((key) => baseRecord[key] !== undefined).map((key) => [key, structuredClone(baseRecord[key])]))
-  const placed = { ...settings, sessionId: `local_${targetId}`, cliSessionId: targetId, cwd: baseRecord.cwd, title: match.session.title, titleSource: 'user', permissionMode: 'default', alwaysAllowedReasons: [], sessionPermissionUpdates: [], isArchived: false, bridgeSessionIds: [], createdAt: createdAt >= 0 ? createdAt : Date.now(), lastActivityAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), lastFocusedAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), completedTurns: rows.reduce((turns, row) => Math.max(turns, Number(row.payload?.num_turns) || 0), 0) }
+  const placed = { ...settings, sessionId: `local_${targetId}`, cliSessionId: targetId, cwd: baseRecord.cwd, title, titleSource: 'user', permissionMode: 'default', alwaysAllowedReasons: [], sessionPermissionUpdates: [], isArchived: false, bridgeSessionIds: [], createdAt: createdAt >= 0 ? createdAt : Date.now(), lastActivityAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), lastFocusedAt: lastActivityAt >= 0 ? lastActivityAt : Date.now(), completedTurns: rows.reduce((turns, row) => Math.max(turns, Number(row.payload?.num_turns) || 0), 0) }
   const recordText = jsonText(placed)
   const made = [targetTranscript, record]
   const targetSemantic = semantic(entries, targetId)
@@ -3219,7 +3225,7 @@ async function rescueRemote(match, to, cloud, journal) {
     rescueAnchorId: base.id,
     remoteMessageSha,
     targetId,
-    title: match.session.title,
+    title,
     archived: false,
     transcript: targetTranscript,
     targetTranscript,
@@ -3367,8 +3373,9 @@ function clearCloudAttempt(receipt, cloud) {
 
 function addCloudFailure(receipt, cloud, failure) {
   const check = receiptCloudCheck(receipt, cloud)
-  if (failure.code === 'REMOTE_OPEN' && check) {
-    check.waiting = [...(check.waiting ?? []), { id: failure.id, title: failure.title, localId: failure.localId ?? null }]
+  if (['REMOTE_OPEN', 'CLOUD_RESCUE_WORKER'].includes(failure.code) && check) {
+    check.waiting = [...(check.waiting ?? []), { id: failure.id, title: failure.title, localId: failure.localId ?? null,
+      ...(failure.code === 'CLOUD_RESCUE_WORKER' ? { code: failure.code, recordId: failure.recordId ?? null } : {}) }]
   } else receipt.failed.push(taggedCloudFailure(cloud, failure))
 }
 
@@ -3491,7 +3498,8 @@ async function rescueCloud(inv, receipt, to, paths, save, report = () => {}) {
   let events = 0
   progress(report, 'rescue', 0, rescues.length, { moved: receipt.sessions.length, sourceLabel: inv.cloud?.source?.label })
   for (const [i, match] of rescues.entries()) {
-    receipt.pending = { strategy: 'remote', id: match.session.id, title: match.session.title, targetId: null, made: [] }
+    report('rescue', `Bringing over ${match.session.title || 'Untitled session'}`, { live: true, completed: i, total: rescues.length, title: match.target.title, moved: receipt.sessions.length, sourceLabel: inv.cloud?.source?.label })
+    receipt.pending = { strategy: 'remote', id: match.session.id, title: match.target.title, targetId: null, made: [] }
     await save()
     try {
       const row = await rescueRemote(match, to, inv.cloud.client, async (journal) => { Object.assign(receipt.pending, journal); await save() })
@@ -3501,7 +3509,7 @@ async function rescueCloud(inv, receipt, to, paths, save, report = () => {}) {
       events += row.events
     } catch (error) {
       await quarantine(receipt.pending.made ?? [], path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code })
+      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code, localId: error.localId, recordId: error.recordId })
       match.target.failed = true
     }
     receipt.pending = null
