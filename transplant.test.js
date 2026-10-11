@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import childProcess, { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import fsSync, { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import fs, { appendFile, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
@@ -3468,6 +3468,26 @@ test('artifact legacy cache upgrades preserve warm history and manifest hits', a
   assert.deepEqual(JSON.parse(await readFile(file)).histories, cache.histories)
 })
 
+test('artifact engine hashing is lazy for local analysis and memoized for cloud checks', async () => {
+  const f = await artifactFixture(), original = fsSync.readFileSync
+  let reads = 0
+  fsSync.readFileSync = (file, ...args) => {
+    if (String(file) === path.join(here, 'transplant.js')) reads++
+    return original(file, ...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    const engine = await import(`./transplant.js?artifact-engine=${randomUUID()}`)
+    await engine.inventory([f.from], f.to, f.h.paths, () => {}, { processes: [] })
+    assert.equal(reads, 0)
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const inv = await engine.inventory([f.from], f.to, f.h.paths, () => {}, { processes: [], cloud: f.cloud })
+      assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+      assert.equal(reads, 1)
+    }
+  } finally { fsSync.readFileSync = original; syncBuiltinESMExports() }
+})
+
 test('artifact limits count probes, skip unrelated large lines and suppress unchanged automatic failures', async () => {
   const f = await artifactFixture()
   const prefix = Buffer.byteLength(f.main.map(row => JSON.stringify(row)).join('\n') + '\n' + JSON.stringify({ type: 'progress', data: '' }) + '\n')
@@ -3554,24 +3574,82 @@ test('artifact search stops after complete proof but still reads required files 
 })
 
 test('artifact budget reservations are shared across eight concurrent cloud analyses', async () => {
-  const h = await home(), sources = Array.from({ length: 8 }, (_, index) => id(9000 + index)), histories = new Map()
-  for (const [index, sid] of sources.entries()) {
-    const main = branchEntries(4, sid, 10000 + index * 10), agent = entry('assistant', 11000 + index, null, sid, { agentId: 'fixture', isSidechain: true })
-    histories.set(`cse_parallel${index}`, [...main, agent])
-    await h.write(sid, main)
-    await h.record('Z', sid, rehomeRecord({ bridgeSessionIds: [`session_parallel${index}`] }))
-    const directory = path.join(h.project, sid, 'subagents')
-    await mkdir(directory, { recursive: true })
-    await writeFile(path.join(directory, 'agent-fixture.jsonl'), JSON.stringify(agent) + '\n')
+  for (const scenario of ['together', 'alone', 'refused first']) {
+    const h = await home(), sources = Array.from({ length: 8 }, (_, index) => id(9000 + index)), histories = new Map(), costs = []
+    for (const [index, sid] of sources.entries()) {
+      const main = branchEntries(4, sid, 10000 + index * 10), agent = entry('assistant', 11000 + index, null, sid, { agentId: 'fixture', isSidechain: true })
+      histories.set(`cse_parallel${index}`, [...main, agent])
+      await h.write(sid, main)
+      await h.record('Z', sid, rehomeRecord({ bridgeSessionIds: [`session_parallel${index}`] }))
+      const directory = path.join(h.project, sid, 'subagents')
+      await mkdir(directory, { recursive: true })
+      const text = JSON.stringify({ ...agent, sessionId: scenario === 'refused first' && index === 0 ? id(9999) : sid }) + '\n'
+      await writeFile(path.join(directory, 'agent-fixture.jsonl'), text)
+      costs.push((await stat(path.join(h.project, `${sid}.jsonl`))).size + 2 * Buffer.byteLength(text))
+    }
+    let selected = [...histories.keys()], fetching = 0, peak = 0
+    const cloud = cloudFixture(h, {
+      list: async () => selected.map(id => remoteSession({ id, title: id })),
+      eventRows: async id => {
+        peak = Math.max(peak, ++fetching)
+        await new Promise(resolve => setImmediate(resolve))
+        fetching--
+        return remoteRows(histories.get(id))
+      }
+    })
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const artifactLimit = scenario === 'refused first' ? Math.max(...costs) : 4000
+    assert.ok(costs.every(cost => cost <= artifactLimit))
+    assert.ok(costs.reduce((sum, cost) => sum + cost, 0) > artifactLimit)
+    const run = automatic => inventory([from], to, h.paths, () => {}, { cloud, processes: [], artifactLimit, automatic, writeCache: true })
+    const before = await fixtureSnapshot(h, [h.paths.pool]), first = await run(false)
+    assert.equal(peak, 8)
+    assert.ok(first.cloud.artifacts.used <= artifactLimit)
+    assert.ok(first.cloud.artifacts.used > 0)
+    if (scenario === 'refused first') {
+      assert.equal(first.cloud.matches.length, 0)
+      assert.equal(first.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    } else assert.ok(first.cloud.matches.length > 0 && first.cloud.matches.length < 8)
+    const deferred = first.cloud.blocked.filter(row => row.code === 'CLOUD_ARTIFACT_BUDGET')
+    assert.ok(deferred.length)
+    const cache = JSON.parse(await readFile(path.join(h.paths.state, 'cache.json')))
+    for (const row of deferred) {
+      assert.equal(cache.remote[row.id].value.artifactFailure, undefined)
+      assert.ok(Number.isSafeInteger(cache.remote[row.id].value.artifactDeferred) && cache.remote[row.id].value.artifactDeferred > 0)
+    }
+    const completed = new Set(first.cloud.matches.map(row => row.session.id)), refused = scenario === 'refused first' ? 'cse_parallel0' : null
+    selected = scenario === 'alone' ? [deferred[0].id] : selected.filter(id => !completed.has(id))
+    for (let pass = 0; selected.some(id => id !== refused) && pass < 8; pass++) {
+      const next = await run(true)
+      assert.ok(next.cloud.artifacts.used <= artifactLimit)
+      assert.ok(next.cloud.matches.length > 0, `${scenario}: ${JSON.stringify(next.cloud.blocked)}`)
+      assert.ok(next.cloud.matches.every(row => row.target.matchMode === 'artifacts'))
+      for (const row of next.cloud.matches) completed.add(row.session.id)
+      selected = selected.filter(id => !completed.has(id))
+    }
+    assert.ok(selected.every(id => id === refused), scenario)
+    if (scenario !== 'alone') assert.equal(completed.size, refused ? 7 : 8)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.pool]), before)
   }
-  const cloud = cloudFixture(h, { list: async () => [...histories.keys()].map(id => remoteSession({ id, title: id })), eventRows: async id => remoteRows(histories.get(id)) })
-  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
-  const inv = await inventory([from], to, h.paths, () => {}, { cloud, processes: [], artifactLimit: 4000 })
-  assert.ok(inv.cloud.artifacts.used <= 4000)
-  assert.ok(inv.cloud.artifacts.used > 0)
-  assert.ok(inv.cloud.blocked.some(row => row.code === 'CLOUD_ARTIFACT_BUDGET'))
-  assert.ok(inv.cloud.matches.length < 8)
-  assert.ok(inv.cloud.matches.every(row => row.target.matchMode === 'artifacts'))
+})
+
+test('artifact checks that establish missing history retain the guarded no-task rescue path', async () => {
+  const f = await artifactFixture(), { h } = f
+  await unlink(f.taskFile)
+  await h.record('Z', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_artifacts'] }))
+  f.to = (await accounts(h.paths, [])).find(row => row.account === h.acct.Z)
+  f.agents[0].shift()
+  await f.write()
+  const before = await fixtureSnapshot(h, [h.paths.pool]), inv = await f.inventory()
+  assert.deepEqual(inv.cloud.blocked, [])
+  assert.equal(inv.cloud.matches[0].target.kind, 'rescue')
+  const result = await move(inv, f.to, h.paths)
+  assert.equal(result.ok, true)
+  assert.equal(f.calls, 1)
+  assert.deepEqual(result.receipt.sessions.map(row => row.strategy), ['remote'])
+  assert.equal(result.receipt.sessions[0].events, 470)
+  assert.equal(result.receipt.remote[0].matchMode, 'rescue')
+  for (const [file, hash] of Object.entries(before)) assert.equal(createHash('sha256').update(await readFile(file)).digest('hex'), hash)
 })
 
 test('artifact final proof rejects changed UUIDs, roles and fresh file fingerprints', async () => {
@@ -5501,6 +5579,69 @@ test('task restart deadline preserves held families after completed ordinary wor
   const finished = await finishHeld(h.paths, { processes: [] })
   assert.equal(finished.ok, true)
   assert.equal(finished.receipt.sessions.length, 4)
+})
+
+test('restart diagnostics never recreate a refused receipt or displace the previous move for Undo', async () => {
+  const h = await home(), refused = id(710)
+  await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+  await h.record('P', SOURCE, rehomeRecord())
+  let all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.T)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
+  assert.equal(moved.ok, true)
+  await h.write(refused, branchEntries(4, refused, 20))
+  await h.record('P', refused, rehomeRecord())
+  all = await accounts(h.paths, [])
+  from = all.find(row => row.account === h.acct.P)
+  to = all.find(row => row.account === h.acct.T)
+  const mock = taskHarness(desktopFixture(refused)), planned = await executeMove([from], to, h.paths, { io: mock.io })
+  const prior = await readFile(moved.file)
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token, summary: () => {
+    assert.equal(mock.rows.length, 0)
+    appendFileSync(path.join(h.project, `${refused}.jsonl`), JSON.stringify(entry('user', 30, 23, refused)) + '\n')
+  } })
+  assert.equal(result.validationOnly, true)
+  assert.equal(result.file, null)
+  assert.equal(result.restarted, true)
+  assert.deepEqual((await readdir(h.paths.state)).filter(name => /^\d.*\.json$/.test(name)), [path.basename(moved.file)])
+  assert.deepEqual(await readFile(moved.file), prior)
+  const outcome = lines(await readFile(path.join(h.paths.state, 'restart-events.jsonl'), 'utf8')).at(-1)
+  assert.equal(outcome.stopCode, 'WORK_REFUSED')
+  assert.notEqual(outcome.receiptId, path.basename(moved.file))
+  assert.equal(await stat(path.join(h.paths.state, outcome.receiptId)).catch(() => null), null)
+  const undone = await undo(h.paths, { processes: [] })
+  assert.ok(undone.dest)
+  assert.equal(undone.receipt.at, moved.receipt.at)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.equal(await stat(path.join(h.dir('T'), `local_${SOURCE}.json`)).catch(() => null), null)
+})
+
+test('restart diagnostic updates read existing receipts and journals instead of detached results', async () => {
+  for (const scenario of ['missing', 'pending journal', 'complete journal', 'invalid name']) {
+    const h = await home(), mock = taskHarness(), plan = await restartPlan(null, h.paths, mock.rows)
+    await mkdir(h.paths.state, { recursive: true })
+    const file = path.join(h.paths.state, scenario === 'invalid name' ? '2026-10-10T12-00.json' : '2026-10-10T12-00-00-000.json')
+    const original = { sessions: [], failed: [], remote: [], finalizing: false }
+    if (scenario !== 'missing') await writeFile(file, JSON.stringify(original))
+    if (scenario.endsWith('journal')) await writeFile(`${file}.journal`, JSON.stringify({ sequence: 1,
+      pending: scenario === 'pending journal' ? { id: SOURCE } : null, sessions: [{ id: SOURCE }], failed: [], retained: [] }) + '\n')
+    const before = await readFile(file).catch(() => null), journal = await readFile(`${file}.journal`).catch(() => null)
+    const detached = { ...original, detached: true }
+    const result = await withDesktopRestart({ ...plan, receiptFile: file }, h.paths, async () => ({ file, receipt: detached, ok: true }), () => {}, mock.io)
+    assert.equal(result.ok, true)
+    assert.deepEqual(await readFile(`${file}.journal`).catch(() => null), journal)
+    if (scenario === 'complete journal') {
+      const saved = JSON.parse(await readFile(file))
+      assert.deepEqual(saved.sessions, [{ id: SOURCE }])
+      assert.equal(saved.journalSequence, 1)
+      assert.equal(saved.detached, undefined)
+      assert.equal(saved.restartHistory.length, 1)
+      assert.deepEqual(result.result.receipt.restartHistory, saved.restartHistory)
+      assert.deepEqual(result.result.receipt.sessions, saved.sessions)
+    } else {
+      assert.deepEqual(await readFile(file).catch(() => null), before)
+      assert.equal(detached.restartHistory, undefined)
+    }
+  }
 })
 
 test('restart diagnostics never rewrite a failed family receipt or journal and fold outcomes once after recovery', async () => {

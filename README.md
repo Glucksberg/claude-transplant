@@ -114,7 +114,7 @@ To    ↑↓ move · enter confirm
 
 ## What each command touches
 
-Every command may write the tool's own files under `~/Library/Application Support/claude-transplant`: cache, lock, restart plan, receipts, quarantine, and drift evidence. A move, `finish`, `sweep`, `undo`, and `restart` first finish any interrupted move, retirement, undo, or restart, which can move records, rewrite the receipt and quarantine, and reopen Claude Desktop. `--dry-run` and `keep-local` refuse in that state instead.
+Every command may write the tool's own files under `~/Library/Application Support/claude-transplant`: cache, lock, restart plan, restart diagnostics, receipts, quarantine, and drift evidence. A move, `finish`, `sweep`, `undo`, and `restart` first finish any interrupted move, retirement, undo, or restart, which can move records, rewrite the receipt and quarantine, and reopen Claude Desktop. `--dry-run` and `keep-local` refuse in that state instead.
 
 | Command | Beyond the tool's own folder |
 |---|---|
@@ -193,7 +193,7 @@ Restarts:
 - Stop and restart approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or both source and target account/organization pairs to be known inactive. An active or unknown scheduler requires this plan even without a worker. Other cold moves show no dialog.
 - An approved restart sends a graceful quit, waits for Desktop and its descendants to exit, moves the held records, and reopens Desktop. 30 second budget, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
 - Background retries never start a new shutdown.
-- Private, bounded `restart-events.jsonl` logs retain attempt outcomes without prompts or raw errors. Failed work never rewrites its receipt or journal for diagnostics. Completed recovery folds matching outcomes into `restartHistory` once, preserving `receipt.restart`.
+- Private, bounded `restart-events.jsonl` logs retain attempt outcomes without prompts or raw errors. Diagnostics never rewrite unfinished receipts or their journals, or recreate discarded receipts. Completed recovery folds matching outcomes into an existing receipt's `restartHistory` once, preserving `receipt.restart`.
 
 Remote Control (`--cloud`):
 
@@ -201,7 +201,8 @@ Remote Control (`--cloud`):
 - After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. Otherwise a same-title target must share eight consecutive exact remote messages to anchor a separate companion whose supported payloads are copied exactly into a new local transcript.
 - The source mirror is archived only after the remote worker is disconnected and unchanged and the local target verifies.
 - A unique bridge-linked parent can also prove owned subagent messages and absorbed queued prompts, including images. UUID, role, payload, delivery evidence and per-stream order must agree. The receipt records main, subagent and queued event counts. Final archival repeats the proof against fresh files and remote rows.
-- Supplemental reads share 512 MiB per operation, with a 16 MiB relevant-line parse limit. Time hints only prioritize files. Incomplete coverage stays uncertain and cannot authorize rescue. Unchanged automatic limit failures wait for changed inputs or engine code. Existing main-only matching and warm history caches remain usable.
+- Supplemental reads share 512 MiB per operation, with a 16 MiB relevant-line parse limit. Time hints only prioritize files. Incomplete, unreadable or budget-limited checks remain uncertain and cannot authorize rescue. A complete check that establishes missing history can use the existing guarded rescue path.
+- Supplemental reads run one candidate at a time while remote fetching stays concurrent. Candidates deferred by earlier reads receive priority on a later pass. Only failures measured against the full byte allowance, and per-session line limits, suppress unchanged automatic retries. Existing main-only matching and warm history caches remain usable.
 - Known source mirrors stay pending after local records move, until that source is signed in. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
 
 Safety:
@@ -262,9 +263,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Merge sidecars across versions | Requires writing a new generation |
 | Extend per-field replay omission lists | Claude Code changes which fields it blanks. A complete existing copy must cover every filled tool-result value instead |
 | Treat replay bookkeeping as changed content | Claude Code 2.1.286 replayed identical content with zeroed token usage and missing producer markers, blocking a notification conversation and its task family. Verified with Desktop 2.26454.0 on 2026-10-07 |
-| Look for queue removal evidence after normalization | UUID-less queue operations disappear from typed history. Supplemental checks read raw rows and require `absorbed_mid_turn`, `commandUuid` and `deliveryId` |
-| Run the tests with process inspection denied | Focused fixtures can preload an empty `/bin/ps` result and a not-running `/usr/bin/pgrep` result. Tests that enumerate real processes need `ps` access. Use a synthetic HOME. App-control commands and cloud operations are mocked. Set `npm_config_offline=true npm_config_update_notifier=false` to prevent npm's update check |
-| `swiftc -typecheck menubar.swift` | The `@main` app needs library parsing. Use `swiftc -typecheck -parse-as-library menubar.swift` |
+| Rely only on cached conversation hashes | They omit subagent files and queued-prompt delivery evidence. Supplemental checks read the linked session's artifacts |
 | Move a record while its Desktop worker runs | Desktop rewrites the record from cache, title and turn count roll back |
 | Infer a restart-safe moment from activity logs | Cold records need no restart, held records get an explicit graceful shutdown |
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
