@@ -342,6 +342,7 @@ final class Model: ObservableObject {
     private var pendingResult = false
     private var pendingPlan: Event?
     private var operationArgs: [String] = []
+    private var retryReceipt: String?
     private var operationStarted: TimeInterval?
     private var operationDestination: String?
     private var failedFinish: String?
@@ -441,7 +442,6 @@ final class Model: ObservableObject {
         }
         switch account.pendingState {
         case "unsupported": return "\(conversations) \(count == 1 ? "stays" : "stay") in \(account.label) because \(count == 1 ? "it has" : "they have") attachments that can't be copied to this Mac."
-        case "protected": return "\(conversations) \(count == 1 ? "remains" : "remain") in \(account.label)".punctuated + " Check Details before bringing over the additional messages."
         case "worker": return "Waiting for local Claude work to stop before checking \(copies.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? "" : " \(signInText) to continue.")
         case "external": return "Waiting for external Claude sessions to stop before moving \(amount.lowercased()) remaining sessions."
         case "waiting": return "Waiting to verify \(conversations.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? " The check will retry automatically." : " \(signInText) and the check will retry automatically.")
@@ -461,6 +461,7 @@ final class Model: ObservableObject {
     }
     var primaryTitle: String? {
         guard canMutate else { return nil }
+        if stopped && !operationArgs.isEmpty && continuationArgs.isEmpty { return nil }
         if capacityRecovery { return "Finish the move" }
         if reviewRestart && !operationArgs.isEmpty { return restartReviewTitle }
         if retryable && !operationArgs.isEmpty { return "Try again" }
@@ -468,8 +469,9 @@ final class Model: ObservableObject {
         return !pendingResult && !stopped && ready ? "Move" : nil
     }
     func primary() {
+        if stopped && !operationArgs.isEmpty && continuationArgs.isEmpty { return }
         if capacityRecovery { guard canMutate else { return }; start(["finish", "--json"]) }
-        else if reviewRestart || retryable { guard canMutate, !operationArgs.isEmpty else { return }; start(operationArgs) }
+        else if reviewRestart || retryable { guard canMutate, !continuationArgs.isEmpty else { return }; start(continuationArgs) }
         else if !pendingAccounts.isEmpty { finishPending() }
         else { move() }
     }
@@ -487,7 +489,7 @@ final class Model: ObservableObject {
         if let event = sourceActivity, event.sourceId == account.id { return (event.activity ?? event.stage) == "cloud" ? "clearing" : (event.activity ?? event.stage) == "rescue" ? "bringing over" : "checking" }
         if account.kept == true { return "kept" }
         guard account.pending != nil else { return nil }
-        if account.pendingState == "unsupported" || account.pendingState == "protected" { return "kept" }
+        if account.pendingState == "unsupported" { return "kept" }
         if account.pendingState == "open" && account.pendingAutomatic == true { return "waiting" }
         if account.pendingAction == "restart" { return "restart needed" }
         if account.pendingAction == "sign-in" { return "sign in needed" }
@@ -574,6 +576,7 @@ final class Model: ObservableObject {
 
     private func clearResult() {
         failedFinish = nil
+        retryReceipt = nil
         pendingResult = false
         sourceActivity = nil
         selectionComplete = false
@@ -633,6 +636,7 @@ final class Model: ObservableObject {
 
     func begin(resetProgress: Bool = true) {
         failedFinish = nil
+        retryReceipt = nil
         sourceActivity = nil
         lines = []
         detailsExpanded = false
@@ -681,9 +685,10 @@ final class Model: ObservableObject {
             note = "The interrupted operation was checked. " + (event.retry == true ? "Press Undo this move to continue." : "Press Finish the move to continue.")
             restartAvailable = false
         } else if event.done == true {
+            retryReceipt = event.receipt
             let waiting = event.waiting ?? event.held ?? []
             let pendingCloud = event.pendingCloud ?? 0
-            pendingResult = event.complete == false || pendingCloud > 0 || !(event.pendingUndo ?? []).isEmpty || !waiting.isEmpty
+            pendingResult = event.complete == false || event.recoveryRequired == true || (event.heldCount ?? 0) > 0 || pendingCloud > 0 || !(event.pendingUndo ?? []).isEmpty || !waiting.isEmpty
             recordIssues(event)
             if !waiting.isEmpty { lines.append(("open", waiting.map(\.title).joined(separator: "\n"))) }
             if let reason = event.reason ?? (event.ok == false ? event.note : nil) { lines.append(("reason", reason)) }
@@ -702,7 +707,6 @@ final class Model: ObservableObject {
             } else if ["QUIT_UNCONFIRMED", "RESTART_DEADLINE"].contains(event.code ?? "") {
                 note = prefix + "\(operationName) stopped: \(plainReason(event.code))."
                 preserveNotice = true
-                if event.receipt != nil && (event.heldCount ?? 0) > 0 && !["undo", "restart"].contains(operationArgs.first ?? "") { operationArgs = ["finish", "--json"] }
             } else if event.recoveryRequired == true {
                 note = "The last move was interrupted."
             } else if !(event.pendingUndo ?? []).isEmpty {
@@ -768,6 +772,15 @@ final class Model: ObservableObject {
     }
     private var operationName: String { operationArgs.first == "undo" || pendingAccounts.contains(where: { $0.pending == "undo" }) ? "Undo" : operationArgs.first == "restart" ? "Restart" : operationArgs.first == "keep-local" ? "Stopping here" : "Move" }
     private var restartReviewTitle: String { operationName == "Undo" ? "Restart Claude and finish Undo" : operationName == "Restart" ? "Restart Claude" : "Restart Claude and move" }
+
+    private var continuationArgs: [String] {
+        let args = operationArgs.indices.filter { operationArgs[$0] != "--restart-approved" && ($0 == 0 || operationArgs[$0 - 1] != "--restart-approved") }.map { operationArgs[$0] }
+        let pending = Set(pendingAccounts.compactMap(\.receipt))
+        guard let receipt = retryReceipt ?? (pending.count == 1 ? pending.first : nil) else { return args }
+        let current = Set(accounts.compactMap(\.receipt))
+        guard current.isEmpty || current == [receipt] else { return [] }
+        return args.contains("--from") ? ["finish", "--json"] : args
+    }
 
     private func reopenFailure() {
         retryable = true
@@ -947,6 +960,7 @@ final class Model: ObservableObject {
                 symbol = "exclamationmark.triangle"
                 if result?.code == "REOPEN_FAILED" {
                     failedFinish = result?.receipt ?? failedFinish ?? pendingAccounts.first?.receipt
+                    retryReceipt = failedFinish
                     operationArgs = ["finish", "--json"]
                     reopenFailure()
                 }
@@ -1014,7 +1028,7 @@ final class Model: ObservableObject {
             confirmRestart(plan)
             return
         }
-        failedFinish = status != 0 && operationArgs.first == "finish" ? pendingAccounts.first?.receipt : nil
+        failedFinish = status != 0 && (retryReceipt != nil && operationArgs.contains("--from") || continuationArgs.first == "finish") ? retryReceipt ?? pendingAccounts.first?.receipt : nil
         if status != 0 { completion = nil; companionTitles = [] }
         if status == 0, let result = completion, let started = operationStarted {
             completion = (result.summary, "History verified · " + String(format: "%.1f seconds", max(0.1, ProcessInfo.processInfo.systemUptime - started)))

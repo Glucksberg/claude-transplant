@@ -8956,6 +8956,23 @@ test('Swift preserves command, progress, metadata, and completion states', async
   } })
   assert.equal(moved.ok, true, moved.reason)
   assert.ok(captured.some(row => row.preQuit && JSON.parse(row.line).stage === 'move' && JSON.parse(row.line).completed > 0))
+  const retryHome = await taskFamilyFixture(), retrySelection = await retryHome.selection()
+  const desktop = '500 1 Tue Sep 1 00:00:00 2026 /Applications/Claude.app/Contents/MacOS/Claude'
+  const listing = `${desktop}\n701 500 Tue Sep 1 00:00:00 2026 /tmp/claude`, commands = `${listing} --resume ${retryHome.run}`
+  const retryMock = taskHarness(parseProcesses(desktop, desktop))
+  const retryPlan = await executeMove([retrySelection.from], retrySelection.to, retryHome.paths, { io: retryMock.io })
+  let changed = false
+  const interrupted = await executeMove([retrySelection.from], retrySelection.to, retryHome.paths, { io: retryMock.io, approve: retryPlan.plan.token, report: (stage, text, extra) => {
+    if (!changed && stage === 'move' && extra?.completed === 1) { changed = true; retryMock.rows = parseProcesses(listing, commands) }
+  } })
+  assert.equal(changed, true)
+  assert.equal(interrupted.code, 'RESTART_PLAN_CHANGED')
+  assert.equal(interrupted.receipt.sessions.length, 1)
+  assert.deepEqual(retryMock.calls, [])
+  const retryAccounts = await cli(retryHome.root, ['accounts', '--json'], processSetup({ list: listing, commands }))
+  assert.equal(retryAccounts.code, 0, retryAccounts.stderr)
+  const continuation = { accounts: JSON.parse(retryAccounts.stdout), args: ['--from', retrySelection.from.label, '--to', retrySelection.to.label, '--json'],
+    event: JSON.stringify({ ...interrupted, done: true, receipt: interrupted.file, moved: interrupted.receipt.sessions.length, heldCount: interrupted.receipt.held.length, held: interrupted.receipt.held }) }
   let source = await swiftFixtureSource()
   source += String.raw`
 @main
@@ -9436,6 +9453,94 @@ struct StateChecks {
             }
         }
         restartDialogResponse = (.alertThirdButtonReturn, false)
+        let moveArgs = ["--from", "work personal", "--to", "work company", "--cloud", "--json"]
+        let emptyAccounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("01-done").utf8))
+        let heldAccounts = try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("02-held").utf8))
+        func completedAccountResponse(_ receipt: String) -> String {
+            let rows = try! JSONSerialization.jsonObject(with: Data(wordingAccounts("01-done").utf8)) as! [[String: Any]]
+            return String(data: try! JSONSerialization.data(withJSONObject: rows.map { $0.merging(["receipt": receipt]) { _, new in new } }), encoding: .utf8)!
+        }
+        let completedAccounts = try! JSONDecoder().decode([Account].self, from: Data(completedAccountResponse("synthetic-receipt").utf8))
+        var changedAccounts = heldAccounts
+        for index in changedAccounts.indices { changedAccounts[index].receipt = "different-receipt" }
+        let routes: [(String, [String], [Account], String?, [String]?)] = [
+            ("receipt", moveArgs, heldAccounts, "synthetic-receipt", ["finish", "--json"]),
+            ("pending", moveArgs, heldAccounts, nil, ["finish", "--json"]),
+            ("fresh", moveArgs, emptyAccounts, nil, moveArgs),
+            ("completed", moveArgs, completedAccounts, "synthetic-receipt", ["finish", "--json"]),
+            ("undo", ["undo", "--json"], emptyAccounts, "synthetic-receipt", ["undo", "--json"]),
+            ("restart", ["restart", "--json"], emptyAccounts, "synthetic-receipt", ["restart", "--json"]),
+            ("changed receipt", moveArgs, changedAccounts, "synthetic-receipt", nil)
+        ]
+        for code in ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED", "REOPEN_FAILED", "QUIT_UNCONFIRMED", "RESTART_DEADLINE"] {
+            for (name, args, accounts, receipt, expected) in routes {
+                requests = []
+                restartDialogs = []
+                let item = Model(demo: accounts)
+                item.skipRestartWarning = true
+                item.checkOperation(args + ["--restart-approved", "obsolete-token"])
+                item.begin()
+                var event: [String: Any] = ["done": true, "ok": false, "complete": name == "completed", "code": code, "heldCount": ["fresh", "completed"].contains(name) ? 0 : 3, "retryable": code != "RESTART_DEADLINE"]
+                if let receipt { event["receipt"] = receipt }
+                item.handle(String(data: try! JSONSerialization.data(withJSONObject: event), encoding: .utf8)!)
+                item.checkFinish(1)
+                let count = requests.count
+                if expected == nil {
+                    precondition(item.primaryTitle == nil, code + name)
+                    item.primary()
+                    precondition(requests.count == count)
+                } else if code == "RESTART_DEADLINE" && accounts.allSatisfy({ $0.pending == nil }) {
+                    precondition(item.primaryTitle == nil && requests.count == count)
+                } else {
+                    precondition(item.primaryTitle != nil, code + name)
+                    item.primary()
+                    precondition(requests.last!.0 == expected!, code + name)
+                    precondition(!requests.last!.0.contains("--restart-approved"))
+                    if code == "RESTART_PLAN_CHANGED" || code == "RESTART_APPROVAL_CHANGED" {
+                        let kind = args.first == "undo" ? "undo" : args.first == "restart" ? "refresh" : "move"
+                        requests.last!.1(#"{"plan":true,"kind":"# + "\"" + kind + #"","token":"fresh-token"}"#)
+                        requests.last!.2(0, "")
+                        precondition(restartDialogs.count == 1, code + name)
+                        precondition(!requests.contains { $0.0.contains("--restart-approved") })
+                    }
+                }
+            }
+        }
+        requests = []
+        let staleAccounts = try! JSONDecoder().decode([Account].self, from: Data(completedAccountResponse("old.json").utf8))
+        let refreshed = Model(demo: staleAccounts)
+        refreshed.checkOperation(moveArgs)
+        refreshed.begin()
+        refreshed.handle(#"{"done":true,"ok":false,"complete":false,"receipt":"new.json","heldCount":3,"code":"RESTART_PLAN_CHANGED"}"#)
+        refreshed.checkFinish(1)
+        precondition(refreshed.primaryTitle == nil)
+        let count = requests.count
+        refreshed.primary()
+        precondition(requests.count == count)
+        requests[0].1(completedAccountResponse("new.json"))
+        requests[0].2(0, "")
+        for event in [
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"old.json"}"#,
+            #"{"swept":true,"ok":true,"complete":false,"receipt":"new.json"}"#,
+            #"{"swept":true,"ok":true,"complete":true,"receipt":"new.json","problems":[{"check":"transcript"}]}"#
+        ] {
+            sweepReply(refreshed, event)
+            precondition(refreshed.note.contains("Different chats are open now."))
+        }
+        sweepReply(refreshed, #"{"swept":true,"ok":true,"complete":true,"receipt":"new.json"}"#)
+        precondition(refreshed.note == "No remaining work" && refreshed.primaryTitle == nil)
+        requests = []
+        let actual = try! JSONSerialization.jsonObject(with: Data(base64Encoded: "ACTUAL_CONTINUATION")!) as! [String: Any]
+        let actualAccounts = try! JSONDecoder().decode([Account].self, from: JSONSerialization.data(withJSONObject: actual["accounts"]!))
+        let actualModel = Model(demo: actualAccounts)
+        actualModel.checkOperation(actual["args"] as! [String])
+        actualModel.begin()
+        actualModel.handle(actual["event"] as! String)
+        actualModel.checkFinish(1)
+        precondition(actualModel.primaryTitle == "Restart Claude and move")
+        actualModel.primary()
+        precondition(requests.last!.0 == ["finish", "--json"])
+        print("CONTINUATION_COMMAND " + String(data: try! JSONSerialization.data(withJSONObject: requests.last!.0), encoding: .utf8)!)
         requests = []
         let veto = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("02-held").utf8)))
         veto.checkOperation(["--from", "work personal", "--to", "work company", "--json"])
@@ -9493,11 +9598,27 @@ struct StateChecks {
   source = source.replace('REPAIRED_CHECKPOINT_ACCOUNTS', Buffer.from(checkpointAccounts.repaired).toString('base64'))
   source = source.replace('WORDING_FIXTURES', Buffer.from(JSON.stringify(wordingFixtures())).toString('base64'))
   source = source.replace('CAPTURED_RESTART_PROGRESS', Buffer.from(JSON.stringify(captured)).toString('base64'))
+  source = source.replace('ACTUAL_CONTINUATION', Buffer.from(JSON.stringify(continuation)).toString('base64'))
   const file = path.join(root, 'checks.swift'), binary = path.join(root, 'checks')
   await writeFile(file, source)
   await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
   const { stdout } = await promisify(execFile)(binary, [], { timeout: 15_000 })
   assert.match(stdout, /Swift queue and metadata states passed/)
+  const command = JSON.parse(stdout.split('\n').find(line => line.startsWith('CONTINUATION_COMMAND ')).slice('CONTINUATION_COMMAND '.length))
+  const receiptBytes = await readFile(interrupted.file)
+  const next = await cli(retryHome.root, command, processSetup({ list: listing, commands }))
+  assert.equal(next.code, 0, next.stderr)
+  const continuationPlan = lines(next.stdout).find(row => row.plan)
+  assert.ok(continuationPlan, next.stdout)
+  assert.equal(continuationPlan.receiptFile, interrupted.file)
+  assert.equal(continuationPlan.resume, true)
+  assert.notEqual(continuationPlan.token, retryPlan.plan.token)
+  assert.deepEqual(await readFile(interrupted.file), receiptBytes)
+  const finished = await finishWorkflow(retryHome.paths, { io: retryMock.io, approve: continuationPlan.token })
+  assert.equal(finished.ok, true, finished.reason)
+  assert.equal(finished.complete, true)
+  assert.equal(finished.file, interrupted.file)
+  assert.equal(finished.receipt.sessions.length, 4)
 })
 
 test('missing and unreadable moved records remain distinct from informational field changes', async () => {
