@@ -1020,7 +1020,7 @@ test('human CLI names staged Undo instead of printing false success', async () =
   const result = await cli(h.root, ['undo'])
 
   assert.equal(result.code, 1)
-  assert.match(result.stdout, /pending.*t@example.com · Team T/i)
+  assert.match(result.stdout, /pending.*t@example.com/i)
   assert.doesNotMatch(result.stdout, /quarantine\s+undefined/)
   assert.doesNotMatch(result.stdout, /shared transcripts unchanged/)
   const continued = await cli(h.root, ['finish', '--json'])
@@ -2006,6 +2006,307 @@ async function home() {
   return { root, paths, project, acct, org, dir, record, write }
 }
 
+async function pendingOrganizations({ orgs = ['P', 'T'], to: targetOrg = null } = {}) {
+  const h = await home(), identity = await identityFixture(h), rows = []
+  for (const [index, name] of orgs.entries()) {
+    const sid = id(9200 + index), org = h.org[name], directory = path.join(h.paths.records, h.acct.P, org)
+    const entries = branchEntries(4, sid, 9300 + index * 10), remote = `cse_org${index}`
+    await mkdir(directory, { recursive: true })
+    await h.write(sid, entries)
+    await h.record('P', sid, rehomeRecord({ title: `Organization ${index}`, bridgeSessionIds: [`session_org${index}`] }))
+    if (directory !== h.dir('P')) await rename(path.join(h.dir('P'), `local_${sid}.json`), path.join(directory, `local_${sid}.json`))
+    rows.push({ sid, org, entries, remote, status: 'active', mode: 'ready' })
+  }
+  if (targetOrg) await mkdir(path.join(h.paths.records, h.acct.P, h.org[targetOrg]), { recursive: true })
+  const all = await accounts(h.paths, identity.processes), from = rows.map(row => all.find(account => account.account === h.acct.P && account.org === row.org))
+  const to = all.find(account => account.account === (targetOrg ? h.acct.P : h.acct.Z) && account.org === (targetOrg ? h.org[targetOrg] : h.org.Z))
+  const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  const moved = await move(await inventory(from, to, h.paths, () => {}, { cloudRequested: true, processes: [] }), to, h.paths)
+  const calls = [], requested = []
+  const client = source => {
+    assert.equal(source.account, h.acct.P)
+    const row = rows.find(row => row.org === source.org)
+    assert.ok(row)
+    calls.push(source.org)
+    if (row.mode === 'transient') throw Object.assign(new Error('Fixture source unavailable'), { code: 'FIXTURE_UNAVAILABLE' })
+    const check = id => { assert.equal(id, row.remote); requested.push([source.org, id]) }
+    return cloudFixture(h, { org: row.org,
+      list: async () => [remoteSession({ id: row.remote, title: `Organization ${rows.indexOf(row)}`, status: row.status, updated_at: row.updated }), remoteSession({ id: 'cse_unselected', title: 'Unselected source' })],
+      session: async id => { check(id); return remoteState(row.status, row.mode === 'waiting' ? { connection_status: 'connected' } : {}) },
+      eventRows: async id => { check(id); return remoteRows([...row.entries, ...(['unsupported', 'worker'].includes(row.mode) ? [entry('assistant', 9999, null, row.sid, { message: { role: 'assistant', content: row.mode === 'unsupported' ? [{ type: 'fixture-unsupported' }] : 'Remote-only message' } })] : [])]) },
+      archive: async id => { check(id); row.status = 'archived' },
+      unarchive: async id => { check(id); row.status = 'active' }
+    })
+  }
+  return { h, identity, rows, from, to, before, moved, calls, requested, client, options: { cloud: client, processes: identity.processes } }
+}
+
+test('same-login cleanup addresses the recorded source organization in either direction without switching Desktop', async t => {
+  for (const [sourceOrg, activeOrg] of [['P', 'T'], ['T', 'P']]) {
+    const f = await pendingOrganizations({ orgs: [sourceOrg], to: activeOrg }), { h, identity } = f, row = f.rows[0]
+    await identity.write(identity.init(1, h.acct.P, h.org[activeOrg]))
+    const desktop = await readFile(h.paths.desktop), logs = await readFile(path.join(h.paths.logs, 'main.log')), requests = []
+    const mocked = t.mock.method(globalThis, 'fetch', async (url, options) => {
+      const endpoint = new URL(url).pathname
+      requests.push([endpoint, options.method ?? 'GET', options.headers['x-organization-uuid']])
+      if (endpoint === '/api/account') return Response.json({ uuid: h.acct.P })
+      if (endpoint === '/api/organizations') return Response.json([{ uuid: h.org.P }, { uuid: h.org.T }])
+      assert.equal(options.headers['x-organization-uuid'], row.org)
+      const headers = { 'anthropic-organization-id': row.org }
+      if (endpoint === '/v1/code/sessions') return Response.json({ data: [remoteSession({ id: row.remote, title: 'Organization 0', status: row.status }), remoteSession({ id: 'cse_unselected' })] }, { headers })
+      assert.ok(endpoint.startsWith('/v1/code/sessions/session_org0'))
+      if (endpoint.endsWith('/events')) return Response.json({ data: remoteRows(row.entries) }, { headers })
+      if (options.method === 'POST') { assert.ok(endpoint.endsWith('/archive') || endpoint.endsWith('/unarchive')); row.status = endpoint.endsWith('/unarchive') ? 'active' : 'archived' }
+      return Response.json(remoteState(row.status), { headers })
+    })
+    try {
+      const cloud = async expected => {
+        assert.deepEqual(expected, { account: h.acct.P, org: row.org, label: f.from[0].label })
+        return cloudClient(h.paths, expected, { active: await signedIn(h.paths, identity.processes), cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org[activeOrg]]]), userAgent: 'fixture' })
+      }
+      const listing = `500 1 ${new Date(identity.started).toString().replace(/^(\w+ \w+ \d+) (\d+) ([\d:]+).*$/, '$1 $3 $2')} /Applications/Claude.app/Contents/MacOS/Claude\n`
+      const shown = await cli(h.root, ['accounts', '--json'], processSetup({ list: listing, commands: listing }))
+      assert.equal(shown.code, 0, shown.stderr)
+      const pending = JSON.parse(shown.stdout).find(account => account.account === h.acct.P && account.org === row.org)
+      assert.equal(pending.signedIn, true)
+      assert.equal(pending.active, false)
+      assert.equal(pending.pendingAction, 'wait')
+      const finished = await sweep(h.paths, { cloud, processes: identity.processes })
+      assert.equal(finished.result.file, f.moved.file)
+      assert.equal(finished.result.complete, true)
+      assert.equal(row.status, 'archived')
+      assert.ok((await undo(h.paths, { cloud, processes: identity.processes })).dest)
+      assert.equal(row.status, 'active')
+      assert.deepEqual(requests.filter(([, method]) => method === 'POST').map(([endpoint]) => endpoint.split('/').at(-1)), ['archive', 'unarchive'])
+      assert.deepEqual(await readFile(h.paths.desktop), desktop)
+      assert.deepEqual(await readFile(path.join(h.paths.logs, 'main.log')), logs)
+      assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), f.before)
+    } finally { mocked.mock.restore() }
+  }
+})
+
+test('pending same-login sources progress fairly past waits, unsupported history and transient failures', async t => {
+  for (const mode of ['waiting', 'worker', 'unsupported', 'transient']) {
+    const f = await pendingOrganizations({ orgs: ['P', 'T', 'Q'] }), { h } = f
+    f.rows[0].mode = mode
+    if (mode === 'worker') f.identity.processes.push({ pid: 501, ppid: 500, started: 'fixture', executable: '/tmp/claude', worker: true, desktopPid: 500, ids: [f.rows[0].sid] })
+    let now = Date.now()
+    const clock = t.mock.method(Date, 'now', () => now)
+    try {
+      const progress = []
+      const first = await sweep(h.paths, { ...f.options, report: (stage, text, extra) => progress.push({ stage, text, ...extra }) })
+      assert.equal(progress.length > 0, mode !== 'transient')
+      assert.ok(progress.every(row => row.sourceId === `${h.acct.P}/${f.rows[0].org}`))
+      assert.equal(first.result.complete, false)
+      assert.equal(f.rows[0].status, 'active')
+      if (mode === 'transient') assert.equal(first.result.failed[0].code, 'FIXTURE_UNAVAILABLE')
+      if (mode === 'worker') assert.equal(first.result.receipt.cloudChecks[0].waiting[0].code, 'CLOUD_RESCUE_WORKER')
+      await f.identity.write(f.identity.init(2, h.acct.P, h.org.Q))
+      for (const row of f.rows.slice(1)) {
+        const progress = []
+        const next = await sweep(h.paths, { ...f.options, report: (stage, text, extra) => progress.push({ stage, text, ...extra }) })
+        assert.ok(progress.some(event => event.stage === 'cloud' && event.completed === 0 && event.total > 0))
+        assert.ok(progress.every(event => event.sourceId === `${h.acct.P}/${row.org}`))
+        assert.equal(next.result.file, f.moved.file)
+        assert.equal(next.result.complete, false)
+        assert.equal(row.status, 'archived')
+      }
+      assert.deepEqual(f.calls, f.rows.map(row => row.org))
+      await sweep(h.paths, f.options)
+      assert.equal(f.calls.length, 3)
+      const receipt = JSON.parse(await readFile(f.moved.file))
+      assert.equal(Object.keys(receipt.cloudAttempts).length, 3)
+      assert.deepEqual(receipt.cloudChecks.map(check => check.sessionIds), f.moved.receipt.cloudChecks.map(check => check.sessionIds))
+      assert.equal(receipt.startedAt, f.moved.receipt.startedAt)
+      f.rows[0].mode = 'ready'
+      f.rows[0].updated = '2026-09-02T00:00:00.000Z'
+      if (mode === 'worker') f.identity.processes.pop()
+      now += 60_001
+      const completed = await sweep(h.paths, f.options)
+      assert.equal(completed.result.complete, true)
+      assert.equal(completed.result.ok, true)
+      assert.equal(completed.result.receipt.failed.length, 0)
+      assert.equal(completed.result.receipt.remote.length, 3)
+      assert.deepEqual(f.calls, [...f.rows.map(row => row.org), f.rows[0].org])
+    } finally { clock.mock.restore() }
+  }
+})
+
+test('source cooldowns retain legacy backoff without starving another organization or reopening cancelled checks', async () => {
+  const f = await pendingOrganizations({ orgs: ['P', 'T', 'Q'] }), receipt = JSON.parse(await readFile(f.moved.file))
+  receipt.automaticCloudAttempt = { key: `${f.h.acct.P}/${f.rows[0].org}`, at: Date.now() }
+  receipt.cloudChecks[2].status = 'cancelled'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const completed = await sweep(f.h.paths, f.options)
+  assert.equal(completed.result.complete, false)
+  assert.deepEqual(f.calls, [f.rows[1].org])
+  await sweep(f.h.paths, f.options)
+  assert.deepEqual(f.calls, [f.rows[1].org])
+  assert.equal(JSON.parse(await readFile(f.moved.file)).cloudChecks[2].status, 'cancelled')
+  const manual = await finishPending(f.h.paths, f.options)
+  assert.equal(manual.complete, true)
+  assert.equal(f.rows[0].status, 'archived')
+  assert.equal(f.rows[2].status, 'active')
+})
+
+test('pending cleanup refuses wrong scoped clients and defers cross-login sources without calls', async () => {
+  const f = await pendingOrganizations(), before = await readFile(f.moved.file)
+  for (const active of [{ account: f.h.acct.T, state: 'known' }, { account: null, state: 'unknown' }, { account: f.h.acct.P, state: 'unknown' }, { account: f.h.acct.P, state: 'logged-out' }]) {
+    const deferred = await sweep(f.h.paths, { ...f.options, active: { ...active, org: f.h.org.T } })
+    assert.equal(deferred.pending, true)
+    assert.equal(f.calls.length, 0)
+    assert.deepEqual(await readFile(f.moved.file), before)
+  }
+  const stale = await finishPending(f.h.paths, { processes: f.identity.processes, cloud: cloudFixture(f.h, { account: f.h.acct.T, list: async () => assert.fail('stale client must not run') }) })
+  assert.equal(stale.pending, true)
+  assert.deepEqual(await readFile(f.moved.file), before)
+  for (const patch of [{ account: f.h.acct.T }, { org: f.h.org.Q }]) {
+    const result = await finishPending(f.h.paths, { ...f.options, cloud: expected => ({ ...f.client(expected), ...patch }) })
+    assert.equal(result.ok, false)
+    assert.equal(result.complete, false)
+    assert.match(result.failed.map(row => row.error).join(' '), /does not match the recorded source/)
+    assert.ok(f.rows.every(row => row.status === 'active'))
+    assert.equal(f.requested.length, 0)
+  }
+})
+
+test('explicit Undo restores all available organizations and sweep never advances a staged Undo', async () => {
+  const f = await pendingOrganizations()
+  for (const row of f.rows) await sweep(f.h.paths, f.options)
+  assert.ok(f.rows.every(row => row.status === 'archived'))
+  const wrong = { ...f.options, active: { account: f.h.acct.T, org: f.h.org.T, state: 'known' } }
+  const pending = await undo(f.h.paths, wrong)
+  assert.deepEqual(pending.pendingUndo, [f.from[0].email])
+  const before = await readFile(f.moved.file), count = f.calls.length
+  assert.equal((await sweep(f.h.paths, f.options)).complete, false)
+  assert.equal((await finishPending(f.h.paths, { ...f.options, automatic: true })).complete, false)
+  assert.equal(f.calls.length, count)
+  assert.deepEqual(await readFile(f.moved.file), before)
+  const listing = `500 1 ${new Date(f.identity.started).toString().replace(/^(\w+ \w+ \d+) (\d+) ([\d:]+).*$/, '$1 $3 $2')} /Applications/Claude.app/Contents/MacOS/Claude\n`
+  const shown = await cli(f.h.root, ['accounts', '--json'], processSetup({ list: listing, commands: listing }))
+  assert.equal(shown.code, 0, shown.stderr)
+  assert.ok(JSON.parse(shown.stdout).filter(row => row.pending === 'undo').every(row => row.signedIn && row.pendingAction === 'finish'))
+  const finished = await finishPending(f.h.paths, f.options)
+  assert.equal(finished.complete, true)
+  assert.ok(finished.dest)
+  assert.ok(f.rows.every(row => row.status === 'active'))
+  assert.deepEqual(await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool]), f.before)
+})
+
+test('background Undo preserves its checkpoint while recovering an interrupted approved reopen', async () => {
+  for (const remote of [false, true]) for (const state of ['absent', 'running', 'failed', 'stale receipt']) {
+    const f = await pendingOrganizations({ orgs: ['T'] }), { h } = f
+    await sweep(h.paths, f.options)
+    await writeFile(f.to.taskFile, JSON.stringify({ scheduledTasks: [], runRetries: {} }))
+    await undo(h.paths, { ...f.options, active: { account: h.acct.T, org: h.org.T } })
+    const receipt = JSON.parse(await readFile(f.moved.file))
+    assert.ok(receipt.undoing.length)
+    if (!remote) { receipt.remoteUndoing = []; f.rows[0].status = 'active' }
+    await writeFile(f.moved.file, JSON.stringify(receipt))
+    const journal = `${f.moved.file}.journal`
+    await writeFile(journal, JSON.stringify({ sequence: (receipt.journalSequence ?? 0) + 1, pending: null, sessions: [], failed: [], retained: [] }) + '\n')
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), bytes = await readFile(f.moved.file), journalBytes = await readFile(journal), cloudCalls = f.calls.length
+    const restartFile = path.join(h.paths.state, 'restart.json')
+    await writeFile(restartFile, JSON.stringify({ outcome: 'moving', app: h.paths.claudeApp, receiptFile: f.moved.file, desktop: { pid: 500, started: 'prior' } }))
+    let rows = state === 'running' ? [desktopFixture()[0]] : [], calls = []
+    const io = { inspect: () => rows, command: async (file, args, timeout) => {
+      calls.push(file)
+      assert.equal(file, '/usr/bin/open')
+      assert.deepEqual(args, ['-g', '-a', h.paths.claudeApp])
+      assert.equal(timeout, 8000)
+      if (state !== 'failed') rows = [desktopFixture()[0]]
+      return { status: state === 'failed' ? 1 : 0 }
+    } }
+    if (remote && state !== 'stale receipt') {
+      const automatic = finishPending(h.paths, { ...f.options, io, automatic: true, receiptFile: f.moved.file })
+      if (state === 'failed') await assert.rejects(automatic, { code: 'REOPEN_FAILED', message: /Reopen Claude Desktop manually/ })
+      else {
+        const pending = await automatic
+        assert.equal(pending.pending, true)
+        assert.equal(pending.complete, false)
+      }
+    }
+    const sweeping = sweep(h.paths, { ...f.options, io, receiptFile: state === 'stale receipt' ? `${f.moved.file}.old` : f.moved.file })
+    if (state === 'failed' && !remote) await assert.rejects(sweeping, { code: 'REOPEN_FAILED', message: /Reopen Claude Desktop manually/ })
+    else {
+      const result = await sweeping
+      if (state === 'stale receipt') assert.match(result.error, /operation receipt changed/)
+      else {
+        assert.equal(result.pending, true)
+        assert.equal(result.complete, false)
+        assert.deepEqual(result.pendingUndo, remote ? [f.from[0].email] : [])
+      }
+      assert.notEqual(result.complete, true)
+    }
+    assert.deepEqual(calls, state === 'running' ? [] : ['/usr/bin/open'])
+    const restart = JSON.parse(await readFile(restartFile))
+    assert.equal(restart.outcome, state === 'running' ? 'interrupted-app-running' : state === 'failed' ? 'reopen-failed' : 'interrupted-reopened')
+    assert.ok(restart.recoveredAt)
+    assert.equal(f.calls.length, cloudCalls)
+    assert.equal(f.rows[0].status, remote ? 'archived' : 'active')
+    assert.deepEqual(await readFile(f.moved.file), bytes)
+    assert.deepEqual(await readFile(journal), journalBytes)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+    assert.equal((await sweep(h.paths, { ...f.options, io })).complete, false)
+    assert.deepEqual(calls, state === 'running' ? [] : ['/usr/bin/open'])
+    assert.deepEqual(await readFile(f.moved.file), bytes)
+    assert.deepEqual(await readFile(journal), journalBytes)
+  }
+})
+
+test('same-login cleanup retains server account, organization membership and response organization checks', async t => {
+  for (const mismatch of ['server account', 'membership', 'response org', 'Desktop login', 'logout']) {
+    const f = await pendingOrganizations({ orgs: ['T'] }), { h } = f, requests = []
+    const mocked = t.mock.method(globalThis, 'fetch', async (url, options) => {
+      const endpoint = new URL(url).pathname
+      requests.push(endpoint)
+      assert.equal(options.method ?? 'GET', 'GET')
+      if (endpoint === '/api/account') return Response.json({ uuid: mismatch === 'server account' ? h.acct.T : h.acct.P })
+      if (endpoint === '/api/organizations') return Response.json((mismatch === 'membership' ? [h.org.P] : [h.org.P, h.org.T]).map(uuid => ({ uuid })))
+      assert.equal(endpoint, '/v1/code/sessions')
+      assert.equal(options.headers['x-organization-uuid'], h.org.T)
+      return Response.json({ data: [] }, { headers: { 'anthropic-organization-id': h.org.P } })
+    })
+    try {
+      const cloud = expected => cloudClient(h.paths, expected, {
+        active: { account: mismatch === 'Desktop login' ? h.acct.T : h.acct.P, org: h.org.P, state: mismatch === 'logout' ? 'logged-out' : 'known' },
+        cookies: new Map([['sessionKey', 'fixture'], ['lastActiveOrg', h.org.P]]), userAgent: 'fixture'
+      })
+      const result = await finishPending(h.paths, { ...f.options, cloud })
+      assert.equal(result.ok, false, mismatch)
+      assert.equal(result.complete, false)
+      assert.ok(result.failed.length)
+      assert.equal(f.rows[0].status, 'active')
+      assert.equal(result.receipt.remote.length, 0)
+      assert.equal(requests.length, mismatch === 'response org' ? 3 : mismatch === 'membership' ? 2 : mismatch === 'server account' ? 1 : 0)
+    } finally { mocked.mock.restore() }
+  }
+})
+
+test('local Undo continuation stays explicit after its last remote restoration checkpoint', async () => {
+  const f = await pendingOrganizations({ orgs: ['T'] })
+  await sweep(f.h.paths, f.options)
+  await undo(f.h.paths, { ...f.options, active: { account: f.h.acct.T, org: f.h.org.T } })
+  const receipt = JSON.parse(await readFile(f.moved.file))
+  receipt.remoteUndoing = []
+  f.rows[0].status = 'active'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const before = await readFile(f.moved.file), count = f.calls.length
+  assert.equal((await sweep(f.h.paths, f.options)).complete, false)
+  assert.equal(f.calls.length, count)
+  assert.deepEqual(await readFile(f.moved.file), before)
+  const listed = await cli(f.h.root, ['accounts', '--json'])
+  assert.equal(listed.code, 0, listed.stderr)
+  const pending = JSON.parse(listed.stdout).filter(row => row.pending === 'undo')
+  assert.equal(pending.length, 1)
+  assert.equal(pending[0].pendingAction, 'finish')
+  const finished = await finishPending(f.h.paths, f.options)
+  assert.equal(finished.complete, true)
+  assert.ok(finished.dest)
+  assert.equal(f.calls.length, count)
+  assert.deepEqual(await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool]), f.before)
+})
+
 test('accounts includes a known login organization with no Desktop directory', async () => {
   const h = await home()
   const account = id(920)
@@ -2819,7 +3120,7 @@ test('automatic cloud retries bind their receipt and claim backoff under the mut
   assert.equal(calls, 1)
   const receipt = JSON.parse(await readFile(first.file))
   assert.equal(receipt.cloudChecks[0].status, 'failed')
-  assert.equal(receipt.automaticCloudAttempt.key, `${from.account}/${from.org}`)
+  assert.ok(receipt.cloudAttempts[`${from.account}/${from.org}`] > 0)
 })
 
 test('a successful cloud phase preserves an earlier local verification failure', async () => {
@@ -3140,7 +3441,7 @@ test('Undo cancels unchecked cloud sources and completes across source logins', 
 
   const staged = await undo(h.paths, { cloud: firstCloud })
   assert.deepEqual(states, { first: 'active', second: 'archived' })
-  assert.deepEqual(staged.pendingUndo, [from[1].label])
+  assert.deepEqual(staged.pendingUndo, [from[1].email])
   assert.equal(staged.dest, undefined)
   assert.equal(staged.receipt.cloudChecks.every((check) => check.status === 'cancelled' || check.status === 'complete'), true)
   assert.deepEqual((await readdir(h.dir('Z'))).sort(), [`local_${first}.json`, `local_${second}.json`].sort())
@@ -3537,7 +3838,7 @@ test('automatic pending cloud retries retain typed artifact limits without resca
   try {
     for (let attempt = 0; attempt < 2; attempt++) {
       const receipt = JSON.parse(await readFile(moved.file))
-      if (receipt.automaticCloudAttempt) receipt.automaticCloudAttempt.at = 0
+      if (receipt.cloudAttempts) receipt.cloudAttempts[`${f.from.account}/${f.from.org}`] = 0
       await writeFile(moved.file, JSON.stringify(receipt))
       const result = await finishPending(f.h.paths, { cloud: f.cloud, automatic: f.from, artifactLimit })
       assert.equal(result.failed[0].code, 'CLOUD_ARTIFACT_BUDGET')
@@ -3545,7 +3846,7 @@ test('automatic pending cloud retries retain typed artifact limits without resca
     assert.equal(reads, 0)
     await appendFile(path.join(f.directory, 'agent-a0.jsonl'), '\n')
     const receipt = JSON.parse(await readFile(moved.file))
-    receipt.automaticCloudAttempt.at = 0
+    receipt.cloudAttempts[`${f.from.account}/${f.from.org}`] = 0
     await writeFile(moved.file, JSON.stringify(receipt))
     await finishPending(f.h.paths, { cloud: f.cloud, automatic: f.from, artifactLimit })
     assert.ok(reads > 0)
@@ -3832,7 +4133,8 @@ test('local rescue workers wait with their record identity and the same receipt 
   const pending = JSON.parse(listed.stdout).find(row => row.account === h.acct.P)
   assert.deepEqual(pending.pendingWaiting, inv.cloud.waiting)
   assert.equal(pending.pendingState, 'worker')
-  assert.equal(pending.pendingAction, 'wait')
+  assert.equal(pending.signedIn, false)
+  assert.equal(pending.pendingAction, 'sign-in')
   assert.equal(pending.pendingAutomatic, true)
   assert.equal((await sweep(h.paths, { cloud: f.cloud, active: f.from, processes: running })).pending, true)
   assert.equal(f.calls, 0)
@@ -3843,6 +4145,7 @@ test('local rescue workers wait with their record identity and the same receipt 
   assert.equal(stopped.result.file, moved.file)
   assert.equal(stopped.result.complete, true)
   assert.equal(stopped.result.receipt.sessions.length, 1)
+  assert.deepEqual(stopped.result.rescuedTitles, stopped.result.receipt.sessions.map(row => row.title))
   assert.equal(stopped.result.receipt.cloudChecks[0].status, 'complete')
   assert.deepEqual(stopped.result.receipt.cloudChecks[0].waiting, [])
   assert.equal(f.calls, 1)
@@ -4366,7 +4669,7 @@ test('Undo stages the matching cloud identity before changing local records', as
   assert.equal(result.ok, true)
   const wrong = { ...cloud, account: h.acct.Q, org: h.org.Q }
   const staged = await undo(h.paths, { cloud: wrong })
-  assert.deepEqual(staged.pendingUndo, [from.label])
+  assert.deepEqual(staged.pendingUndo, [from.email])
   assert.equal(status, 'archived')
   assert.ok(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)))
 })
@@ -6597,7 +6900,7 @@ test('Undo refuses new destination forks before cloud or local changes and on ev
     const moved = await move(await inventory([from], to, h.paths, () => {}, { cloud }), to, h.paths)
     assert.equal(moved.ok, true)
     assert.equal(status, 'archived')
-    if (staged) assert.deepEqual((await undo(h.paths, { cloud: { ...cloud, account: h.acct.Q, org: h.org.Q } })).pendingUndo, [from.label])
+    if (staged) assert.deepEqual((await undo(h.paths, { cloud: { ...cloud, account: h.acct.Q, org: h.org.Q } })).pendingUndo, [from.email])
     const childFile = path.join(h.dir('T'), `local_${child}.json`)
     if (unreadable) await writeFile(childFile, '{broken')
     else await h.record('T', child, rehomeRecord({ isArchived: true, forkedFromSessionId: `local_${SOURCE}` }))
@@ -6607,7 +6910,8 @@ test('Undo refuses new destination forks before cloud or local changes and on ev
     for (const operation of staged ? [undo, finishPending, finishWorkflow, sweep] : [undo]) {
       const result = await operation(h.paths, { cloud, processes: [] })
       const problems = result.restoreProblems ?? (result.reconciled ?? result.recovered)?.problems
-      assert.match(problems[0], unreadable ? /unreadable Desktop record:/ : /parent Desktop record would be removed by Undo/)
+      if (operation === sweep) assert.equal(result.pending, true)
+      else assert.match(problems[0], unreadable ? /unreadable Desktop record:/ : /parent Desktop record would be removed by Undo/)
       assert.equal(result.dest, undefined)
       assert.deepEqual(calls, [])
       assert.equal(status, 'archived')
@@ -7688,8 +7992,12 @@ test('panel states distinguish typed waiting, unsupported, ownership and login s
     const single = pendingPresentation(receipt, { ...source, waiting }, { active: true, signedIn: true }, 'cloud', desktopFixture())
     assert.equal(single.pendingState, code ? 'worker' : 'cloud-open')
   }
-  assert.equal(pendingPresentation(receipt, source, { active: false, signedIn: true }, 'cloud').pendingAction, 'switch-org')
+  assert.equal(pendingPresentation(receipt, source, { active: false, signedIn: true }, 'cloud').pendingAction, 'wait')
   assert.equal(pendingPresentation(receipt, source, { active: false, signedIn: false }, 'cloud').pendingAction, 'sign-in')
+  for (const [remaining, signedIn, action] of [[true, true, 'finish'], [true, false, 'sign-in'], [false, false, 'finish']]) {
+    const pending = pendingPresentation({ remoteUndoing: remaining ? [{ id: 'cse_one' }] : [] }, source, { active: false, signedIn }, 'undo')
+    assert.equal(pending.pendingAction, action)
+  }
   for (const release of ['worker', 'scheduler', undefined]) {
     const held = { id: SOURCE, recordId: `local_${SOURCE}`, release, sources: [{ ...source, id: SOURCE, file: '/synthetic/held.json' }] }
     const current = pendingPresentation({ held: [held] }, source, {}, 'local', desktopFixture(), release === 'scheduler')
@@ -7786,14 +8094,19 @@ function wordingFixtures() {
   const mixedWaiting = pending(0, 'cloud', 2, 'CLOUD_CONTENT_UNSUPPORTED'), mixedAccount = mixedWaiting[0]
   const mixedSource = { account: mixedAccount.account, org: mixedAccount.org, failures: mixedAccount.pendingFailures.slice(0, 1), waiting: [{ id: 'session_1', title: 'Another open conversation', localId: SOURCE }] }
   Object.assign(mixedAccount, { pendingFailures: mixedSource.failures, pendingWaiting: mixedSource.waiting, ...pendingPresentation({}, mixedSource, mixedAccount, 'cloud', desktopFixture()) })
+  const twoSources = pending(0, 'cloud', 1)
+  twoSources[1] = pending(1, 'cloud', 1)[1]
+  for (const row of twoSources.filter(row => row.pending)) row.receiptDestination = 'home/personal'
+  const localUndo = pending(2, 'undo', 1)
+  Object.assign(localUndo[2], pendingPresentation({ undoing: [], remote: [{ id: 'cse_one' }] }, localUndo[2], localUndo[2], 'undo'))
   const rows = [
     { name: '01-done', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label }, contains: ['Done. 361 sessions are now in', base[0].label], primary: null },
     { name: '02-held', accounts: held, contains: ['259 moved.', '102 more need Claude to restart.'], primary: 'Restart Claude and move 102' },
     { name: '03-restart-dialog', plan, dialog: true, contains: ['Restart Claude to move 102 more sessions?', 'These open chats will stop:'], primary: 'Restart and move' },
-    { name: '04-same-login', accounts: pending(1, 'cloud', 1), contains: ['1 old copy needs checking', 'Switch Claude to Personal'], primary: null },
+    { name: '04-same-login', accounts: pending(1, 'cloud', 1), contains: ['1 old copy needs checking', 'Cleanup will retry automatically.'], primary: null },
     { name: '05-other-login', accounts: pending(2, 'cloud', 3), contains: ['3 old copies need checking', 'Sign Claude in as home@example.test'], primary: null, stop: 'Leave them' },
-    { name: '06-clearing', accounts: pending(1, 'cloud', 1, null, null, 1), operation: ['finish', '--json'], event: { stage: 'cloud', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceLabel: base[1].label }, contains: ['361 moved. Clearing 1 old copy from', base[1].label], primary: null },
-    { name: '07-bringing-over', accounts: base.map((row, index) => ({ ...row, active: index === 1 })), event: { stage: 'rescue', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceLabel: base[1].label }, contains: ['Bringing over 1 conversation from', base[1].label], primary: null },
+    { name: '06-clearing', accounts: pending(1, 'cloud', 1, null, null, 1), operation: ['finish', '--json'], event: { stage: 'cloud', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['361 moved. Clearing 1 old copy from', base[1].label], primary: null },
+    { name: '07-bringing-over', accounts: base.map((row, index) => ({ ...row, active: index === 1 })), event: { stage: 'rescue', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['Bringing over 1 conversation from', base[1].label], primary: null },
     { name: '08-unsupported', accounts: pending(1, 'cloud', 1, 'CLOUD_CONTENT_UNSUPPORTED'), contains: ["attachments that can't be copied", base[1].label], primary: null, stop: 'Got it', expanded: true },
     { name: '09-open-chats', accounts: pending(1, 'local', 2, null, 'worker'), contains: ['359 moved.', '2 open chats move after they go idle'], primary: 'Restart Claude and move 2' },
     { name: '10-interrupted', accounts: pending(1, 'recovery', 0), contains: ['The last move was interrupted.'], primary: 'Finish the move' },
@@ -7809,7 +8122,7 @@ function wordingFixtures() {
     { name: '20-stopped-here', event: { done: true, ok: true, complete: true, moved: 259, keptLocal: 1, heldCancelled: 102 }, operation: ['keep-local', '--json'], contains: ['259 moved. Stopped here.', 'Remaining work cancelled.'], primary: null },
     { name: '21-partial', event: { done: true, ok: false, complete: true, summary: { moved: 233, notMoved: Array.from({ length: 10 }, (_, i) => ({ id: id(i), error: 'MOVE_BLOCKED' })), groups: [], attention: [] } }, contains: ['233 moved.', '10 sessions were not moved.'], primary: null },
     { name: '22-legacy-notification-waiting', accounts: pending(0, 'cloud', 1, 'CLOUD_RESCUE_NOTIFICATION'), contains: ['Waiting to verify 1 conversation', 'The check will retry automatically.'], primary: null },
-    { name: '23-worker-waiting', accounts: pending(0, 'cloud', 1, 'CLOUD_RESCUE_WORKER'), contains: ['Waiting for local Claude work to stop', 'bringing over 1 conversation'], primary: null },
+    { name: '23-worker-waiting', accounts: pending(0, 'cloud', 1, 'CLOUD_RESCUE_WORKER'), contains: ['Waiting for local Claude work to stop', 'checking 1 old copy'], primary: null },
     { name: '24-companion-complete', event: { done: true, ok: true, complete: true, moved: 362, destinationLabel: base[0].label, rescuedTitles: ['Research conversation · from Remote Control'] }, contains: ['Done. 362 sessions', 'Brought over: Research conversation · from Remote Control'], primary: null },
     { name: '25-completion-pending', event: { done: true, ok: true, complete: false, moved: 12 }, contains: ['12 moved. Remaining work is waiting.'], primary: null },
     { name: '26-undo-ready', accounts: pending(2, 'undo', 1, null, null, 2), contains: ['Undo is partly done.', 'Press Finish undo.'], primary: 'Finish undo' },
@@ -7817,7 +8130,14 @@ function wordingFixtures() {
     { name: '28-mixed-held-and-cloud', accounts: mixed, contains: ['259 moved.', '102 more need Claude to restart.', '3 old copies need checking'], primary: 'Restart Claude and move 102', stop: 'Leave them' },
     { name: '29-unreadable', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_UNREADABLE'), contains: ['Waiting to verify 1 conversation', 'The check will retry automatically.'], primary: null },
     { name: '30-unsupported-dismissed', operation: ['keep-local', '--json', '--leave-check', 'a'.repeat(64)], event: { done: true, ok: true, complete: true, moved: 0, keptLocal: 1, heldCancelled: 0 }, contains: ['Stopped here. Remaining source checks cancelled.'], primary: null },
-    { name: '31-mixed-unsupported-and-waiting', accounts: mixedWaiting, contains: ['Waiting to verify 2 conversations'], primary: 'Restart Claude and finish cleanup', stop: 'Stop here' }
+    { name: '31-mixed-unsupported-and-waiting', accounts: mixedWaiting, contains: ['Waiting to verify 2 conversations'], primary: 'Restart Claude and finish cleanup', stop: 'Stop here' },
+    { name: '32-one-source-clearing', accounts: twoSources, background: true, event: { stage: 'cloud', live: true, text: '0/1', completed: 0, total: 1, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['Clearing 1 old copy from', base[1].label], primary: null },
+    { name: '33-background-verification', accounts: twoSources, background: true, event: { stage: 'verify', live: true, text: '1/3', completed: 1, total: 3 }, contains: ['Cleanup will retry automatically.'], primary: null },
+    { name: '34-same-login-undo', accounts: pending(1, 'undo', 1), contains: ['Press Finish undo.'], primary: 'Finish undo' },
+    { name: '35-local-undo-recovery', accounts: localUndo, contains: ['Press Finish undo.'], primary: 'Finish undo' },
+    { name: '36-background-companion', accounts: twoSources, event: { swept: true, ok: true, complete: false, moved: 1, rescuedTitles: ['Research conversation · from Remote Control'] }, contains: ['Brought over 1 conversation.', 'Brought over: Research conversation · from Remote Control'], primary: null },
+    { name: '37-reopen-failed', accounts: pending(1, 'undo', 1), event: { swept: true, ok: false, code: 'REOPEN_FAILED', error: 'Synthetic reopen failure' }, contains: ['Claude could not be confirmed open.', 'Open Claude, then press Try again.'], primary: 'Try again' },
+    { name: '38-same-login-uncertain', accounts: pending(1, 'cloud', 1, 'CLOUD_ARTIFACT_UNCERTAIN'), contains: ['The check will retry automatically.'], primary: null }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
@@ -7860,6 +8180,7 @@ struct WordingFixture: Decodable {
     let dialog: Bool?
     let cancel: Bool?
     let expanded: Bool?
+    let background: Bool?
     let contains: [String]
     let primary: String?
     let stop: String?
@@ -7895,10 +8216,10 @@ struct WordingChecks {
                 if fixture.cancel == true { model.checkCancel(fixture.plan!) }
                 if let line = fixture.event {
                     let event = try JSONDecoder().decode(Event.self, from: Data(line.utf8))
-                    if event.swept == true {
+                    if event.swept == true || fixture.background == true {
                         model.checkSweep()
                         requests.last!.1(line)
-                        requests.last!.2(0, "")
+                        if event.swept == true { requests.last!.2(event.ok == false ? 1 : 0, "") }
                     } else {
                         model.begin()
                         model.checkStarted(8.1)
@@ -7932,6 +8253,16 @@ struct WordingChecks {
                 if fixture.name == "30-unsupported-dismissed" { precondition(model.visibleCompletion == nil) }
                 if fixture.name == "24-companion-complete" { precondition(model.companionText == "Brought over: Research conversation · from Remote Control") }
                 if fixture.name == "31-mixed-unsupported-and-waiting" { precondition(model.scopedChecks.isEmpty && !text.contains("attachments that can't be copied")) }
+                if ["04-same-login", "05-other-login", "12-undo-pending", "34-same-login-undo", "35-local-undo-recovery", "38-same-login-uncertain"].contains(fixture.name) {
+                    precondition(!text.contains("Switch Claude") && !text.contains("select Personal"))
+                }
+                if fixture.background == true {
+                    precondition(!model.running && model.badge.isEmpty && !model.moveProgress.hasProgress && model.canMutate)
+                    precondition(model.sourceTag(model.accounts[0]) == "waiting")
+                    precondition(model.sourceTag(model.accounts[1]) == (fixture.name == "32-one-source-clearing" ? "clearing" : "waiting"))
+                }
+                if fixture.name == "23-worker-waiting" { precondition(!text.contains("bringing over")) }
+                if fixture.name == "36-background-companion" { precondition(model.companionText == "Brought over: Research conversation · from Remote Control" && model.visibleCompletion == nil) }
                 if fixture.name == "05-other-login" || fixture.name == "08-unsupported" {
                     let tokens = model.scopedChecks
                     precondition(!tokens.isEmpty)
@@ -8388,7 +8719,7 @@ struct StateChecks {
         requests = []
         let login = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("12-undo-pending").utf8)))
         precondition(login.undoPending && !login.pendingReady && login.primaryTitle == nil)
-        precondition(login.pendingPrompt.contains("Sign Claude in as home@example.test and select Personal"))
+        precondition(login.pendingPrompt.contains("Sign Claude in as home@example.test, then press Finish undo"))
         login.finishPending()
         login.undo()
         precondition(requests.isEmpty)
@@ -8418,6 +8749,43 @@ struct StateChecks {
         precondition(queuedLeave.primaryTitle == "Restart Claude and move 102")
         precondition(queuedLeave.displaySummary == "259 moved. 102 more need Claude to restart.")
         automaticRefreshFixture = false
+        for fixture in ["34-same-login-undo", "35-local-undo-recovery"] {
+            requests = []
+            let undo = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(fixture).utf8)))
+            precondition(undo.pendingReady && undo.primaryTitle == "Finish undo")
+            sweepReply(undo, #"{"swept":true,"ok":true,"complete":false}"#)
+            precondition(requests.count == 1 && undo.primaryTitle == "Finish undo")
+            undo.primary()
+            precondition(requests.last!.0 == ["finish", "--json"])
+        }
+        for background in [false, true] {
+            requests = []
+            let failed = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("34-same-login-undo").utf8)))
+            if background {
+                failed.checkOperation(["undo", "--json"])
+                sweepReply(failed, #"{"swept":true,"ok":false,"code":"REOPEN_FAILED","receipt":"synthetic-receipt","error":"Synthetic reopen failure"}"#)
+            } else {
+                failed.finishPending()
+                requests[0].1(#"{"done":true,"ok":false,"code":"REOPEN_FAILED","error":"Synthetic reopen failure"}"#)
+                requests[0].2(1, "")
+                requests[1].1(wordingAccounts("01-done"))
+                requests[1].2(0, "")
+            }
+            if background { refreshReply(failed, wordingAccounts("01-done")) }
+            for event in [
+                #"{"swept":true,"ok":true,"complete":false,"receipt":"synthetic-receipt"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"another-receipt"}"#,
+                #"{"swept":true,"ok":true,"complete":true,"receipt":"synthetic-receipt","problems":[{"check":"transcript"}]}"#
+            ] {
+                sweepReply(failed, event)
+                precondition(failed.note.contains("Open Claude, then press Try again."))
+            }
+            let count = requests.count
+            precondition(failed.note.contains("Open Claude, then press Try again.") && failed.primaryTitle == "Try again")
+            precondition(!failed.running && !failed.restartAvailable)
+            failed.primary()
+            precondition(requests.count == count + 1 && requests.last!.0 == ["finish", "--json"])
+        }
         print("Swift queue and metadata states passed")
     }
 }

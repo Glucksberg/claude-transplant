@@ -8,6 +8,8 @@
 
 Use a synthetic HOME for tests. App-control commands and cloud operations are mocked. Set `npm_config_offline=true npm_config_update_notifier=false` to prevent npm's update check.
 
+The October 11, 2026 disposable API test ran on a Mac with Claude Desktop 2.31226.1 and embedded Claude Code 2.1.295 installed. It verified archive, unarchive and final cleanup in another organization while Desktop stayed in its selected organization. The Code binary was not run for this test. Any repeat requires owner approval for one empty test session, with no prompts, workers or app actions. Automated coverage stays mocked.
+
 When process inspection is denied, focused fixtures can preload an empty `/bin/ps` result and a not-running `/usr/bin/pgrep` result. Tests that enumerate real processes need `ps` access.
 
 Run `swiftc -typecheck -parse-as-library menubar.swift`. The `@main` app needs library parsing.

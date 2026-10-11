@@ -151,6 +151,7 @@ struct Event: Decodable {
     let recoveryRequired: Bool?
     let destinationLabel: String?
     let sourceLabel: String?
+    let sourceId: String?
     let sourceLabels: [String]?
     let heldCount: Int?
     let remainingCount: Int?
@@ -312,6 +313,7 @@ final class Model: ObservableObject {
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
     @Published private(set) var sweeping = false
+    @Published private(set) var sourceActivity: Event?
     private var queued: [String]?
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
@@ -388,7 +390,7 @@ final class Model: ObservableObject {
     var canMutate: Bool { !running && recoveryProblem == nil }
     var undoPending: Bool { pendingAccounts.contains { $0.pending == "undo" } }
     var canKeepLocal: Bool { canMutate && pendingAccounts.contains { ["cloud", "local"].contains($0.pending ?? "") } }
-    var pendingReady: Bool { canMutate && pendingAccounts.contains { ($0.pending != "undo" || $0.active == true) && ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.active == true ? "finish" : "sign-in")) } && (config != nil || demo) }
+    var pendingReady: Bool { canMutate && pendingAccounts.contains { ["finish", "restart"].contains($0.pendingAction ?? ($0.pending == "local" || $0.pending == "recovery" || $0.pending == "undo" && $0.signedIn == true ? "finish" : "wait")) } && (config != nil || demo) }
     var pendingButtonTitle: String {
         if reviewRestart { return restartReviewTitle }
         if pendingAccounts.contains(where: { $0.pendingAction == "restart" }) {
@@ -414,19 +416,18 @@ final class Model: ObservableObject {
         let amount = count.map(String.init) ?? "Remaining"
         let copies = count.map { quantity($0, "old copy", "old copies") } ?? "Old copies"
         let conversations = count.map { quantity($0, "conversation", "conversations") } ?? "Conversations"
-        let identity = account.signedIn == true ? account.label : account.email ?? account.label
-        let switchText = account.signedIn == true ? "Switch Claude to \(account.plan)" : "Sign Claude in as \(account.email ?? account.label) and select \(account.plan)"
+        let signInText = "Sign Claude in as \(account.email ?? account.label)"
         if account.pending == "undo" {
             let status = account.pendingPartial == true ? "Undo is partly done." : "Undo is waiting."
-            return status + (account.active == true ? " Press Finish undo." : " \(switchText), then press Finish undo.")
+            return status + (account.pendingAction == "finish" ? " Press Finish undo." : " \(signInText), then press Finish undo.")
         }
         switch account.pendingState {
         case "unsupported": return "\(conversations) \(count == 1 ? "stays" : "stay") in \(account.label) because \(count == 1 ? "it has" : "they have") attachments that can't be copied to this Mac."
         case "protected": return "\(conversations) \(count == 1 ? "remains" : "remain") in \(account.label)".punctuated + " Check Details before bringing over the additional messages."
-        case "worker": return "Waiting for local Claude work to stop before bringing over \(conversations.lowercased()) from \(account.label)".punctuated
+        case "worker": return "Waiting for local Claude work to stop before checking \(copies.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? "" : " \(signInText) to continue.")
         case "external": return "Waiting for external Claude sessions to stop before moving \(amount.lowercased()) remaining sessions."
-        case "waiting": return "Waiting to verify \(conversations.lowercased()) in \(account.label)".punctuated + (account.active == true ? " The check will retry automatically." : " \(switchText) and the check will retry automatically.")
-        case "cloud-open": return "\(copies) in \(account.label) \(count == 1 ? "is" : "are") still connected. Cleanup waits for \(count == 1 ? "it" : "them") to disconnect."
+        case "waiting": return "Waiting to verify \(conversations.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? " The check will retry automatically." : " \(signInText) and the check will retry automatically.")
+        case "cloud-open": return "\(copies) in \(account.label) \(count == 1 ? "is" : "are") still connected. Cleanup waits for \(count == 1 ? "it" : "them") to disconnect." + (account.signedIn == true ? "" : " \(signInText) to continue.")
         case "open" where account.pendingAutomatic == true:
             if let seconds = account.pendingIdleSeconds, seconds > 0 {
                 let duration = seconds % 60 == 0 ? quantity(seconds / 60, "idle minute", "idle minutes") : quantity(seconds, "idle second", "idle seconds")
@@ -436,16 +437,15 @@ final class Model: ObservableObject {
             return "\(amount) open \(count == 1 ? "chat moves" : "chats move") after \(count == 1 ? "it goes" : "they go") idle, or now with a restart."
         case "held", "open": return account.pendingAction == "finish" ? "\(amount) remaining \(count == 1 ? "session is" : "sessions are") ready to move." : count.map { "\($0) more \($0 == 1 ? "needs" : "need") Claude to restart." } ?? "The remaining sessions need Claude to restart."
         default:
-            if count == nil { return "Source history in \(account.label) still needs checking." + (account.active == true ? "" : " \(switchText) to continue.") }
-            if account.active == true { return "Checking \(copies.lowercased()) in \(identity)".punctuated }
-            return "\(copies) \(count == 1 ? "needs" : "need") checking in \(identity)".punctuated + " \(switchText) and cleanup will retry automatically."
+            let status = count == nil ? "Source history in \(account.label) still needs checking." : "\(copies) \(count == 1 ? "needs" : "need") checking in \(account.label)".punctuated
+            return status + (account.signedIn == true ? " Cleanup will retry automatically." : " \(signInText) and cleanup will retry automatically.")
         }
     }
     var primaryTitle: String? {
         guard canMutate else { return nil }
-        if !pendingAccounts.isEmpty { return pendingReady ? pendingButtonTitle : nil }
         if reviewRestart && !operationArgs.isEmpty { return restartReviewTitle }
         if retryable && !operationArgs.isEmpty { return "Try again" }
+        if !pendingAccounts.isEmpty { return pendingReady ? pendingButtonTitle : nil }
         return !pendingResult && !stopped && ready ? "Move" : nil
     }
     func primary() {
@@ -464,13 +464,13 @@ final class Model: ObservableObject {
         else { keepLocal() }
     }
     func sourceTag(_ account: Account) -> String? {
+        if let event = sourceActivity, event.sourceId == account.id { return (event.activity ?? event.stage) == "cloud" ? "clearing" : (event.activity ?? event.stage) == "rescue" ? "bringing over" : "checking" }
         if account.kept == true { return "kept" }
         guard account.pending != nil else { return nil }
         if account.pendingState == "unsupported" || account.pendingState == "protected" { return "kept" }
         if account.pendingState == "open" && account.pendingAutomatic == true { return "waiting" }
         if account.pendingAction == "restart" { return "restart needed" }
-        if account.pendingAction == "sign-in" || account.pending == "undo" && account.signedIn == false { return "sign in needed" }
-        if account.pendingState == "cleanup" && account.active == true && (running || sweeping) { return "clearing" }
+        if account.pendingAction == "sign-in" { return "sign in needed" }
         return "waiting"
     }
     var detailLines: [(String, String)] {
@@ -482,11 +482,11 @@ final class Model: ObservableObject {
             (account.pendingFailures ?? []).map { ("issue", identity($0.title, $0.id) + " | " + $0.error) }
         }
     }
-    var displaySummary: String { recoveryProblem != nil ? "Paused: the last move's record needs repair." : running ? progressLabel : note.isEmpty ? pendingPrompt : note }
+    var displaySummary: String { recoveryProblem != nil ? "Paused: the last move's record needs repair." : running ? progressLabel : sourceActivity.flatMap(sourceProgressText) ?? (note.isEmpty ? pendingPrompt : note) }
     var visibleCompletion: (summary: String, detail: String)? {
         canMutate && completion?.summary == note ? completion : nil
     }
-    var companionText: String? { visibleCompletion == nil || companionTitles.isEmpty ? nil : "Brought over: " + companionTitles.joined(separator: ", ") }
+    var companionText: String? { !canMutate || companionTitles.isEmpty ? nil : "Brought over: " + companionTitles.joined(separator: ", ") }
 
     func canSource(_ account: Account) -> Bool { account.id != to }
 
@@ -555,6 +555,7 @@ final class Model: ObservableObject {
     private func clearResult() {
         failedFinish = nil
         pendingResult = false
+        sourceActivity = nil
         selectionComplete = false
         lines = []
         detailsExpanded = false
@@ -610,6 +611,7 @@ final class Model: ObservableObject {
 
     func begin(resetProgress: Bool = true) {
         failedFinish = nil
+        sourceActivity = nil
         lines = []
         detailsExpanded = false
         note = ""
@@ -641,15 +643,10 @@ final class Model: ObservableObject {
             pendingPlan = event
         } else if let stage = event.stage, let text = event.text {
             if event.live == true {
+                updateSourceActivity(event)
                 moveProgress.update(stage, completed: event.completed, total: event.total, preparatory: event.preparatory == true)
                 progressLabel = event.preparatory == true ? "Checking remaining sessions" : ["scan", "cloud scan"].contains(stage) ? "Preparing sessions" : stage == "verify" ? "Checking the move" : ["desktop", "reopen"].contains(stage) ? "Restarting Claude Desktop" : ["move", "retire", "rescue"].contains(stage) ? "Moving sessions" : "Finishing the move"
-                if event.preparatory != true, ["cloud", "rescue"].contains(event.activity ?? stage), let source = event.sourceLabel {
-                    let remaining = max(0, (event.total ?? 0) - (event.completed ?? 0))
-                    let prefix = (event.moved ?? 0) > 0 ? "\(event.moved!) moved. " : ""
-                    progressLabel = remaining == 0 ? "Finishing source checks" : prefix + ((event.activity ?? stage) == "cloud"
-                        ? "Clearing \(quantity(remaining, "old copy", "old copies")) from \(source)."
-                        : "Bringing over \(quantity(remaining, "conversation", "conversations")) from \(source).")
-                }
+                if event.preparatory != true, let text = sourceProgressText(event) { progressLabel = text }
                 badge = "\(moveProgress.percent)%"
             } else {
                 lines.removeAll { $0.0 == stage }
@@ -674,6 +671,8 @@ final class Model: ObservableObject {
             stopped = event.ok == false
             if ["RESTART_PLAN_CHANGED", "RESTART_APPROVAL_CHANGED"].contains(event.code ?? "") {
                 changedApproval()
+            } else if event.code == "REOPEN_FAILED" {
+                reopenFailure()
             } else if event.recoveryRequired == true {
                 note = "The last move was interrupted."
             } else if !(event.pendingUndo ?? []).isEmpty {
@@ -701,7 +700,7 @@ final class Model: ObservableObject {
                 lines.append(("companion", titles.joined(separator: "\n")))
                 if event.ok == true && event.complete == true && issues == 0 { companionTitles = titles }
             }
-            restartAvailable = event.restart ?? false
+            restartAvailable = event.code == "REOPEN_FAILED" ? false : event.restart ?? false
             if !pendingResult && event.ok != false { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
             notify(note, "")
         } else if event.undone != nil {
@@ -739,6 +738,29 @@ final class Model: ObservableObject {
     }
     private var operationName: String { operationArgs.first == "undo" || pendingAccounts.contains(where: { $0.pending == "undo" }) ? "Undo" : operationArgs.first == "restart" ? "Restart" : operationArgs.first == "keep-local" ? "Stopping here" : "Move" }
     private var restartReviewTitle: String { operationName == "Undo" ? "Restart Claude and finish Undo" : operationName == "Restart" ? "Restart Claude" : "Restart Claude and move" }
+
+    private func reopenFailure() {
+        retryable = true
+        stopped = true
+        preserveNotice = true
+        restartAvailable = false
+        note = "\(operationName) stopped: Claude could not be confirmed open. Open Claude, then press Try again."
+    }
+
+    private func updateSourceActivity(_ event: Event) {
+        sourceActivity = event.live == true && event.preparatory != true && event.sourceId != nil && (event.completed ?? 0) < (event.total ?? 0) ? event : nil
+    }
+
+    private func sourceProgressText(_ event: Event) -> String? {
+        guard let source = event.sourceLabel else { return nil }
+        let stage = event.activity ?? event.stage
+        guard stage == "cloud" || stage == "rescue" else { return event.sourceId == nil ? nil : "Checking source history in \(source)".punctuated }
+        let remaining = max(0, (event.total ?? 0) - (event.completed ?? 0))
+        let prefix = (event.moved ?? 0) > 0 ? "\(event.moved!) moved. " : ""
+        return remaining == 0 ? "Finishing source checks" : prefix + (stage == "cloud"
+            ? "Clearing \(quantity(remaining, "old copy", "old copies")) from \(source)."
+            : "Bringing over \(quantity(remaining, "conversation", "conversations")) from \(source).")
+    }
 
     private func changedApproval() {
         reviewRestart = true
@@ -840,11 +862,14 @@ final class Model: ObservableObject {
         guard canMutate, !sweeping, !snapshot else { return }
         sweeping = true
         var result: Event?
-        run(["sweep", "--json"], line: { line in
-            if let data = line.data(using: .utf8), let decoded = try? JSONDecoder().decode(Event.self, from: data), decoded.swept == true || decoded.code != nil { result = decoded }
+        run(["sweep", "--json"], line: { [weak self] line in
+            guard let data = line.data(using: .utf8), let decoded = try? JSONDecoder().decode(Event.self, from: data) else { return }
+            if decoded.stage != nil && decoded.live == true { self?.updateSourceActivity(decoded) }
+            else if decoded.swept == true || decoded.code != nil { result = decoded }
         }) { [weak self] status, error in
             guard let self else { return }
             sweeping = false
+            sourceActivity = nil
             defer {
                 if let args = queued {
                     queued = nil
@@ -856,7 +881,7 @@ final class Model: ObservableObject {
             if result?.code == "LOCK_BUSY" { return }
             let problem = result?.error.flatMap { $0.isEmpty ? nil : $0 } ?? (status != 0 || result?.ok != true ? (error.isEmpty ? "Background check did not complete" : error) : nil)
             let clean = problem == nil && result?.issues == 0
-            if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish, let sweepNote, note == sweepNote {
+            if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish && result?.complete == true && pendingAccounts.isEmpty && (result?.changed ?? []).isEmpty, let sweepNote, note == sweepNote {
                 note = ""
                 symbol = "arrow.left.arrow.right"
                 self.sweepNote = nil
@@ -868,6 +893,11 @@ final class Model: ObservableObject {
                 lines.append(("background", problem))
                 note = pendingAccounts.contains(where: { $0.pendingState == "waiting" }) ? "" : "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"
+                if result?.code == "REOPEN_FAILED" {
+                    failedFinish = result?.receipt ?? failedFinish ?? pendingAccounts.first?.receipt
+                    operationArgs = ["finish", "--json"]
+                    reopenFailure()
+                }
             } else if let changed = result?.changed, !changed.isEmpty {
                 let unavailable = changed.filter { $0.fields.contains("record unavailable") }
                 let names = ["title": "title", "isArchived": "archive state", "isStarred": "starred state"]
@@ -892,9 +922,14 @@ final class Model: ObservableObject {
                 symbol = "arrow.left.arrow.right"
                 settle()
             }
-            if let summary = result?.summary, !summary.notMoved.isEmpty, (result?.changed ?? []).isEmpty {
+            if result?.code != "REOPEN_FAILED", let summary = result?.summary, !summary.notMoved.isEmpty, (result?.changed ?? []).isEmpty {
                 lines = summaryLines(summary) + lines.filter { ["background", "metadata"].contains($0.0) }
                 if !restartAvailable { note = pendingAccounts.isEmpty ? "\(summary.moved) moved. " + quantity(summary.notMoved.count, "session was not moved.", "sessions were not moved.") : pendingPrompt }
+            }
+            if clean, let titles = result?.rescuedTitles, !titles.isEmpty {
+                companionTitles = titles
+                lines.append(("companion", titles.joined(separator: "\n")))
+                if result?.restart != true { note = "Brought over \(quantity(titles.count, "conversation.", "conversations."))" }
             }
             if note != previousNote, !note.isEmpty { sweepNote = note }
         }
@@ -933,6 +968,7 @@ final class Model: ObservableObject {
             completion = (result.summary, "History verified · " + String(format: "%.1f seconds", max(0.1, ProcessInfo.processInfo.systemUptime - started)))
         }
         running = false
+        sourceActivity = nil
         badge = status == 0 && !pendingResult ? "100%" : ""
         if status == 0, !demo, !snapshot, moveProgress.hasProgress {
             moveProgress.record(ProcessInfo.processInfo.systemUptime)
