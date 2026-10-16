@@ -2314,12 +2314,25 @@ async function restoreProblems(plan, root, parkedOnly = false) {
 }
 
 async function snapshotPlan(item) {
-  return {
+  const plan = {
     ...item,
     hashes: await Promise.all((item.hashes ?? []).map(async ([file]) => [file, sha(await readFile(file))])),
     trees: await Promise.all((item.trees ?? []).map(async ([file]) => [file, (await manifest(file)).sha])),
     semantics: await Promise.all((item.semantics ?? []).map(async ([file]) => [file, recordSemantic(await readJson(file))]))
   }
+  for (const [file, parked] of item.moved) {
+    if (!LOCAL_RECORD.test(path.basename(file, '.json'))) continue
+    const temp = `${file}.tmp`
+    const detail = await lstat(temp).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+    if (!detail) continue
+    if (!detail.isFile()) throw new Error(`Desktop record temp is not a regular file: ${path.basename(temp)}`)
+    const raw = await readFile(temp)
+    if (stable(JSON.parse(raw)) !== stable(await readJson(file))) throw new Error(`Desktop record has a different pending update: ${path.basename(file)}`)
+    plan.hashes.push([temp, sha(raw)])
+    plan.required = [...(plan.required ?? []), temp]
+    plan.moved = [...plan.moved, [temp, `${parked}.tmp`]]
+  }
+  return plan
 }
 
 async function verify(rows, report = () => {}, check = () => {}) {
@@ -2453,13 +2466,15 @@ async function recoveryPending(paths) {
   return needsRecovery(receipt) ? { name, file, receipt } : null
 }
 
+const parkingOrder = item => [...item.moved].sort(([a], [b]) => Number(b.endsWith('.json.tmp')) - Number(a.endsWith('.json.tmp')))
+
 async function park(plan, before = async () => {}) {
   for (const item of plan) {
     await before(item)
     const hashes = new Map(item.hashes ?? [])
     const trees = new Map(item.trees ?? [])
     const semantics = new Map(item.semantics ?? [])
-    for (const [original, parked] of item.moved) {
+    for (const [original, parked] of parkingOrder(item)) {
       const [hasOriginal, hasParked] = await Promise.all([exists(original), exists(parked)])
       if (hasOriginal && hasParked) throw new Error(`retirement path occupied: ${path.basename(parked)}`)
       if (hasParked) continue
@@ -2467,6 +2482,7 @@ async function park(plan, before = async () => {}) {
       if (hashes.has(original) && sha(await readFile(original)) !== hashes.get(original)) throw new Error(`retirement artifact changed: ${path.basename(original)}`)
       if (trees.has(original) && (await manifest(original)).sha !== trees.get(original)) throw new Error(`retirement artifact changed: ${path.basename(original)}`)
       if (semantics.has(original) && recordSemantic(await readJson(original)) !== semantics.get(original)) throw new Error(`retirement artifact changed: ${path.basename(original)}`)
+      if (LOCAL_RECORD.test(path.basename(original, '.json')) && await exists(`${original}.tmp`)) throw new Error(`Desktop record has a new pending update: ${path.basename(original)}`)
       await mkdir(path.dirname(parked), { recursive: true })
       await rename(original, parked)
     }
@@ -2475,7 +2491,7 @@ async function park(plan, before = async () => {}) {
 
 async function restore(plan, root, before = () => {}) {
   for (const p of [...plan].reverse()) {
-    for (const [original, parked] of [...p.moved].reverse()) {
+    for (const [original, parked] of parkingOrder(p).reverse()) {
       await before()
       if ((await exists(parked)) && !(await exists(original))) await rename(parked, original)
     }
@@ -3021,7 +3037,7 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
   }
   const readyPlan = []
   for (const item of plan) {
-    const row = item.source ? sourceRows.get(item.moved[0][0]) : targetRows.get(item.moved.at(-1)[0])
+    const row = (item.source ? sourceRows : targetRows).get(item.moved[0][0])
     const unchanged = row && await untouched(row, liveWorkers, row.strategy !== 'rehome')
     if (!row || !unchanged) {
       receipt.failed.push({ id: item.id, title: item.title, error: `${item.source ? 'source' : 'destination'} changed before retirement, kept`, ...(item.source && row ? failureIdentity(row) : {}) })
@@ -3057,7 +3073,7 @@ async function retire(inv, to, receipt, paths, at, problems, save, report = () =
       if (!carrierSafe) throw new Error(`destination changed during retirement: ${item.by}`)
       const carrierId = carrier?.targetId ?? carrier?.id
       if (carrierId && parkWorkers.has(carrierId.toLowerCase())) throw new Error(`running worker changed during retirement: ${item.id}`)
-      const row = item.source ? sourceRows.get(item.moved[0][0]) : targetRows.get(item.moved.at(-1)[0])
+      const row = (item.source ? sourceRows : targetRows).get(item.moved[0][0])
       if (!row || !(await untouched(row, parkWorkers, row.strategy !== 'rehome'))) throw new Error(`${item.source ? 'source' : 'destination'} changed during retirement: ${item.id}`)
     })
     check(true)
