@@ -1060,7 +1060,7 @@ test('human CLI reports Finish recovery without an undefined pending count', asy
 
 test('native and fallback helpers share the kernel lock and release it after a move', async () => {
   const nativeAvailable = await stat('/usr/bin/lockf').then(() => true, () => false)
-  for (const [native, fallback] of [[false, false], [false, true], ...(nativeAvailable ? [[true, true]] : [])]) {
+  for (const [native, fallback] of nativeAvailable ? [[false, false], [false, true], [true, false], [true, true]] : [[false, true]]) {
     const h = await home()
     await h.write(id(999), [entry('user', 999, null, id(999))])
     await h.record('P', id(999))
