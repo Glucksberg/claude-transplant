@@ -2349,6 +2349,21 @@ test('menubar snapshot renders live accounts without installing', async () => {
   assert.equal(await stat(path.join(h.root, 'Library/LaunchAgents/io.github.vitaliyhayda.claude-transplant.plist')).then(() => true, () => false), false)
 })
 
+test('installed menubar script reports the package version', async () => {
+  const h = await home()
+  const services = `
+    const native = childProcess.spawnSync
+    childProcess.spawnSync = (file, ...rest) => ['launchctl', 'pkill'].includes(file) ? { status: 0, stdout: '', stderr: '' } : native(file, ...rest)
+  `
+  const installed = await cli(h.root, ['menubar'], services)
+  const script = path.join(h.paths.state, 'Claude Transplant.app/Contents/Resources/transplant.js')
+  const reported = await promisify(execFile)(process.execPath, [script, '--version'], { env: { ...process.env, HOME: h.root } }).then((r) => r.stdout.trim(), (e) => e.stderr.trim())
+  const { version } = JSON.parse(await readFile(path.join(here, 'package.json'), 'utf8'))
+
+  assert.equal(installed.code, 0, installed.stderr)
+  assert.equal(reported, version)
+})
+
 test('same-account organization moves rehome one record without copying history', async () => {
   const h = await home()
   const teamDir = path.join(h.paths.records, h.acct.P, h.org.T)

@@ -4682,6 +4682,7 @@ async function menubar(paths, remove, snapshot) {
   }
   const script = path.join(app, 'Contents/Resources/transplant.js')
   await copyFile(path.join(HERE, 'transplant.js'), script)
+  await copyFile(path.join(HERE, 'package.json'), path.join(app, 'Contents/Resources/package.json'))
   const config = jsonText({ node: process.execPath, script })
   await writeFile(path.join(paths.state, 'menubar.json'), config)
   await writeFile(path.join(app, 'Contents/Resources/menubar.json'), config)
