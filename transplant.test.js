@@ -2435,6 +2435,21 @@ test('remote worker listing succeeds when the last matching process has no reada
   assert.deepEqual(result.hosts[0].workers, [])
 })
 
+test('remote workers stop nothing more once Desktop changes accounts during the check', async () => {
+  const h = await home()
+  await h.record('P', id(1), { sshConfig: { sshHost: 'dev@first' } })
+  await h.record('P', id(2), { sshConfig: { sshHost: 'dev@second' } })
+  const listing = `41 ${h.acct.T} ${h.org.T} 60\n`
+  const fixture = sshFixture({ 'dev@first': { status: 0, stdout: listing, stderr: '' }, 'dev@second': { status: 0, stdout: listing, stderr: '' } })
+  const identity = { account: h.acct.P, org: h.org.P, state: 'known' }
+  const answers = [identity, { account: h.acct.T, org: h.org.T, state: 'known' }]
+  const result = await remoteWorkers(h.paths, { identity, since: null, run: fixture.run, confirm: async () => answers.shift() })
+
+  assert.match(result.refused, /changed accounts/)
+  assert.deepEqual(fixture.calls.filter((call) => call.input.includes('kill')).map((call) => call.host), ['dev@first'])
+  assert.deepEqual(result.hosts.map((row) => [row.host, row.stopped]), [['dev@first', [41]], ['dev@second', []]])
+})
+
 test('remote workers refuse without a known Desktop login and contact no host', async () => {
   const h = await home()
   await h.record('P', id(1), { sshConfig: { sshHost: 'dev@build' } })
