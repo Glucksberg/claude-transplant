@@ -628,8 +628,10 @@ final class Model: ObservableObject {
             if !pendingAccounts.isEmpty && !preserveNotice { note = ""; completion = nil; badge = ""; symbol = "clock.arrow.circlepath" }
             let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
             let changed = identity != activeIdentity
+            let switched = changed && !activeIdentity.isEmpty && !identity.isEmpty
             activeIdentity = identity
             if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty) { sweep() }
+            if !snapshot && switched { releaseWorkers(manual: false) }
         }
     }
 
