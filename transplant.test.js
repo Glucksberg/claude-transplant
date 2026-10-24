@@ -8847,7 +8847,8 @@ async function swiftFixtureSource() {
 
 ` + source.slice(promptEnd)
   return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
-    .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)') + String.raw`
+    .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)')
+    .replace('if !snapshot && switched', 'if automaticRefreshFixture && switched') + String.raw`
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 @MainActor var automaticRefreshFixture = false
 @MainActor var restartDialogs: [RestartPrompt] = []
@@ -9687,13 +9688,14 @@ struct StateChecks {
   assert.equal(finished.receipt.sessions.length, 4)
 })
 
-test('Swift stops old SSH workers from the panel and after a successful move', async () => {
+test('Swift stops old SSH workers from the panel, after a successful move, and after an account switch', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-workers-'))
   const host = (name, workers, stopped, error = null) => ({ host: name, port: 6996, workers, stopped, error })
   const stale = JSON.stringify({ ok: false, dry: false, account: 'a', org: 'o', hosts: [host('build', [{ pid: 11, stale: true }, { pid: 12, stale: false }], [11]), host('offline', [], [], 'Connection timed out')] })
   const kept = JSON.stringify({ ok: true, dry: false, account: 'a', org: 'o', hosts: [host('build', [{ pid: 11, stale: true }, { pid: 13, stale: true }], [13])] })
   const clean = JSON.stringify({ ok: true, dry: false, account: 'a', org: 'o', hosts: [host('build', [{ pid: 12, stale: false }], [])] })
   const refused = JSON.stringify({ ok: false, reason: 'Claude Desktop must be running and signed in to the account that should own remote workers' })
+  const login = (active) => JSON.stringify(JSON.stringify(['a', 'b'].map(name => ({ account: name, org: 'o', label: name, active: name === active, signedIn: true }))))
   const source = await swiftFixtureSource() + String.raw`
 @main
 struct WorkerChecks {
@@ -9750,10 +9752,34 @@ struct WorkerChecks {
             respond(moved, #"STALE"#)
             precondition(moved.workersNote == "Stopped 1 old SSH worker. 1 host unreachable.")
         }
+        automaticRefreshFixture = true
+        func reply(_ model: Model, _ list: String) {
+            let index = requests.count
+            model.refresh()
+            precondition(requests[index].0 == ["accounts", "--json"])
+            requests[index].1(list)
+            requests[index].2(0, "")
+            if model.sweeping, let sweep = requests.lastIndex(where: { $0.0 == ["sweep", "--json"] }) {
+                requests[sweep].1(#"{"swept":true,"ok":true}"#)
+                requests[sweep].2(0, "")
+            }
+        }
+        for (before, after, expected) in [(#"LOGIN_A"#, #"LOGIN_B"#, true), (#"LOGIN_A"#, #"LOGIN_A"#, false), (#"LOGIN_NONE"#, #"LOGIN_B"#, false), (#"LOGIN_A"#, #"LOGIN_NONE"#, false)] {
+            requests = []
+            let watcher = Model(demo: Demo.accounts)
+            reply(watcher, before)
+            precondition(!requests.contains { $0.0.first == "workers" })
+            reply(watcher, after)
+            precondition(requests.contains { $0.0 == ["workers", "--json"] } == expected)
+            guard expected else { continue }
+            requests = requests.filter { $0.0.first == "workers" }
+            respond(watcher, #"STALE"#)
+            precondition(watcher.workersNote == "Stopped 1 old SSH worker. 1 host unreachable.")
+        }
         print("Swift worker states passed")
     }
 }
-`.replaceAll('#"STALE"#', JSON.stringify(stale)).replaceAll('#"KEPT"#', JSON.stringify(kept)).replaceAll('#"CLEAN"#', JSON.stringify(clean)).replaceAll('#"REFUSED"#', JSON.stringify(refused))
+`.replaceAll('#"STALE"#', JSON.stringify(stale)).replaceAll('#"KEPT"#', JSON.stringify(kept)).replaceAll('#"CLEAN"#', JSON.stringify(clean)).replaceAll('#"REFUSED"#', JSON.stringify(refused)).replaceAll('#"LOGIN_A"#', login('a')).replaceAll('#"LOGIN_B"#', login('b')).replaceAll('#"LOGIN_NONE"#', login(null))
   const file = path.join(root, 'workers.swift'), binary = path.join(root, 'workers')
   await writeFile(file, source)
   await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
