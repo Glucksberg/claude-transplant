@@ -1415,9 +1415,21 @@ struct Panel: View {
                 Text(model.workersNote).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             }
             HStack(spacing: 12) {
-                Button(model.releasing ? "Checking SSH workers…" : "Stop old SSH workers") { model.releaseWorkers() }
-                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary).disabled(model.releasing)
-                    .help("Stops remote Claude Code processes still signed in to an account Claude no longer uses")
+                Button { model.releaseWorkers() } label: {
+                    HStack(spacing: 6) {
+                        if model.releasing { ProgressView().controlSize(.mini) } else { Image(systemName: "server.rack") }
+                        Text(model.releasing ? "Checking SSH workers…" : "Stop old SSH workers")
+                    }
+                    .font(.callout.weight(.medium))
+                    .fixedSize()
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(.quaternary, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+                .disabled(model.releasing)
+                .help("Stops remote Claude Code processes still signed in to an account Claude no longer uses")
                 if model.skipRestartWarning {
                     Button("Show restart warnings", action: model.restoreRestartWarning).buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
                 }
