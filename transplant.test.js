@@ -9621,6 +9621,65 @@ struct StateChecks {
   assert.equal(finished.receipt.sessions.length, 4)
 })
 
+test('Swift panel returns to the start screen after a seen result and keeps offering a restart', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-home-'))
+  const summary = { moved: 122, notMoved: [{ id: 's1', title: 'Left behind', error: 'source changed since inventory' }], groups: [], attention: [] }
+  const done = JSON.stringify({ done: true, ok: true, complete: true, receipt: '/receipts/latest.json', moved: 122, summary, destinationLabel: 'you@work.com · Acme Inc.' })
+  const swept = JSON.stringify({ swept: true, ok: true, issues: 0, receipt: '/receipts/latest.json', summary })
+  const elsewhere = JSON.stringify({ done: true, ok: true, complete: true, receipt: '/receipts/other.json', moved: 5 })
+  const quit = JSON.stringify({ done: true, ok: false, complete: false, retryable: true, code: 'QUIT_UNCONFIRMED', moved: 0 })
+  const source = await swiftFixtureSource() + String.raw`
+@main
+struct HomeChecks {
+    @MainActor
+    static func main() {
+        let summary = try! JSONDecoder().decode(ReceiptSummary.self, from: Data(#"SUMMARY"#.utf8))
+        var list = Demo.accounts
+        for index in list.indices { list[index].receipt = "/receipts/latest.json"; list[index].receiptSummary = summary }
+        let model = Model(demo: list)
+        model.selectTarget(list[0].id)
+        model.begin()
+        model.handle(#"DONE"#)
+        model.checkOperation(["--from", list[1].selector, "--to", list[0].selector, "--cloud", "--json"])
+        model.checkFinish(0)
+        precondition(model.note == "122 moved. 1 session was not moved.", model.note)
+        precondition(model.restartAvailable)
+        model.panelVisibility(true)
+        precondition(model.note == "122 moved. 1 session was not moved.")
+        model.panelVisibility(false)
+        precondition(model.note.isEmpty && model.lines.isEmpty && model.completion == nil && model.displaySummary.isEmpty, model.displaySummary)
+        precondition(model.restartAvailable && model.to != nil && !model.from.isEmpty)
+        requests = []
+        model.checkSweep()
+        requests[0].1(#"SWEPT"#)
+        requests[0].2(0, "")
+        precondition(model.note.isEmpty && model.lines.isEmpty && model.displaySummary.isEmpty, model.displaySummary)
+        requests = []
+        let other = Model(demo: Demo.accounts)
+        other.selectTarget(Demo.accounts[3].id)
+        other.begin()
+        other.handle(#"ELSEWHERE"#)
+        precondition(!other.restartAvailable)
+        let failed = Model(demo: Demo.accounts)
+        failed.selectTarget(Demo.accounts[0].id)
+        failed.begin()
+        failed.handle(#"QUIT"#)
+        failed.checkOperation(["--from", Demo.accounts[1].selector, "--to", Demo.accounts[0].selector, "--cloud", "--json"])
+        failed.checkFinish(1)
+        let shown = failed.note
+        failed.panelVisibility(false)
+        precondition(!shown.isEmpty && failed.note == shown && failed.primaryTitle == "Try again", failed.note)
+        print("Swift home states passed")
+    }
+}
+`.replaceAll('#"SUMMARY"#', JSON.stringify(JSON.stringify(summary))).replaceAll('#"DONE"#', JSON.stringify(done)).replaceAll('#"SWEPT"#', JSON.stringify(swept)).replaceAll('#"ELSEWHERE"#', JSON.stringify(elsewhere)).replaceAll('#"QUIT"#', JSON.stringify(quit))
+  const file = path.join(root, 'home.swift'), binary = path.join(root, 'home')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [], { timeout: 15_000 })
+  assert.match(stdout, /Swift home states passed/)
+})
+
 test('missing and unreadable moved records remain distinct from informational field changes', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])

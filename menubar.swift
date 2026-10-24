@@ -353,6 +353,8 @@ final class Model: ObservableObject {
     private var targetChosen = false
     private var selectionComplete = false
     private var panelOpen = false
+    private var quietReceipt: String?
+    private var restartSince: Date?
     private var sweepNote: String?
     private var retryable = false
     private var stopped = false
@@ -400,7 +402,7 @@ final class Model: ObservableObject {
     var receiptSummaries: [ReceiptSummary] {
         var seen = Set<String>()
         return accounts.compactMap { account in
-            guard let file = account.receipt, seen.insert(file).inserted else { return nil }
+            guard let file = account.receipt, file != quietReceipt, seen.insert(file).inserted else { return nil }
             return account.receiptSummary
         }
     }
@@ -571,7 +573,22 @@ final class Model: ObservableObject {
 
     func panelVisibility(_ visible: Bool) {
         panelOpen = visible
-        if visible { refresh() }
+        if visible { refresh() } else { goHome() }
+    }
+
+    private func goHome() {
+        guard !running, pendingAccounts.isEmpty, recoveryProblem == nil, !retryable, !reviewRestart, !capacityRecovery, failedFinish == nil else { return }
+        let restart = restartAvailable
+        quietReceipt = accounts.compactMap(\.receipt).first ?? quietReceipt
+        clearResult()
+        restartAvailable = restart
+        excluded = []
+        from = []
+        to = nil
+        targetChosen = false
+        symbol = "arrow.left.arrow.right"
+        badge = ""
+        settle()
     }
 
     private func clearResult() {
@@ -605,6 +622,7 @@ final class Model: ObservableObject {
             guard status == 0, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             settle()
+            if restartAvailable, let restartSince, let launched = NSRunningApplication.runningApplications(withBundleIdentifier: "com.anthropic.claudefordesktop").compactMap(\.launchDate).max(), launched > restartSince { restartAvailable = false }
             if !pendingAccounts.isEmpty && !preserveNotice { note = ""; completion = nil; badge = ""; symbol = "clock.arrow.circlepath" }
             let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
             let changed = identity != activeIdentity
@@ -734,7 +752,9 @@ final class Model: ObservableObject {
                 lines.append(("companion", titles.joined(separator: "\n")))
                 if event.ok == true && event.complete == true && issues == 0 { companionTitles = titles }
             }
-            restartAvailable = event.code == "REOPEN_FAILED" ? false : event.restart ?? false
+            let destinationActive = accounts.first(where: { $0.active == true }).map { $0.label == (event.destinationLabel ?? operationDestination) } ?? false
+            restartAvailable = event.code == "REOPEN_FAILED" ? false : event.restart == true || moved > 0 && event.restarted != true && (event.heldCount ?? 0) == 0 && destinationActive
+            if restartAvailable { restartSince = Date() }
             if !pendingResult && event.ok != false { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
             notify(note, "")
         } else if event.undone != nil {
@@ -988,7 +1008,7 @@ final class Model: ObservableObject {
                 symbol = "arrow.left.arrow.right"
                 settle()
             }
-            if result?.code != "REOPEN_FAILED", let summary = result?.summary, !summary.notMoved.isEmpty, (result?.changed ?? []).isEmpty {
+            if result?.code != "REOPEN_FAILED", result?.receipt == nil || result?.receipt != quietReceipt, let summary = result?.summary, !summary.notMoved.isEmpty, (result?.changed ?? []).isEmpty {
                 lines = summaryLines(summary) + lines.filter { ["background", "metadata"].contains($0.0) }
                 if !restartAvailable { note = pendingAccounts.isEmpty ? "\(summary.moved) moved. " + quantity(summary.notMoved.count, "session was not moved.", "sessions were not moved.") : pendingPrompt }
             }
@@ -1340,7 +1360,7 @@ struct Panel: View {
                     else { ScrollView { detailRows }.frame(height: 200) }
                 }.font(.caption)
             }
-            if model.restartAvailable && model.pendingAccounts.isEmpty {
+            if model.restartAvailable && !model.pendingReady {
                 Button(action: { model.restartDesktop() }) { Text("Restart Claude").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
                     .disabled(!model.canMutate)
             }
