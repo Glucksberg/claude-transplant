@@ -4729,6 +4729,7 @@ export async function remoteWorkers(paths, options = {}) {
   if (identity.state !== 'known') return { identity, hosts: [], refused: 'Claude Desktop must be running and signed in to the account that should own remote workers' }
   const since = options.since !== undefined ? options.since : await loginSince(paths, identity)
   const run = options.run ?? ((args, input) => spawnSync('/usr/bin/ssh', args, { input, encoding: 'utf8', timeout: 30_000 }))
+  const confirm = options.confirm ?? (options.identity ? async () => identity : () => signedIn(paths))
   const all = await accounts(paths)
   const targets = new Map()
   for (const { record } of all.flatMap((account) => account.sessions)) {
@@ -4755,6 +4756,8 @@ export async function remoteWorkers(paths, options = {}) {
     }
     const stale = host.workers.filter((row) => row.stale)
     if (options.dry || !stale.length) continue
+    const current = await confirm()
+    if (current.state !== 'known' || !sameAccount(current, identity)) return { identity, hosts, refused: 'Claude Desktop changed accounts during the check, nothing more was stopped' }
     const stopped = run(args, stopRemoteWorkers(stale))
     if (stopped.error || stopped.status !== 0) host.error = sshFailure(stopped)
     host.stopped = (stopped.stdout ?? '').split('\n').filter((line) => /^\d+$/.test(line)).map(Number)
