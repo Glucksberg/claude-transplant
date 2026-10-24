@@ -370,6 +370,7 @@ final class Model: ObservableObject {
     private var poller: AnyCancellable?
     private var progressTimer: AnyCancellable?
     private var activeIdentity = ""
+    private var lastLogin = ""
     private var targetChosen = false
     private var selectionComplete = false
     private var panelOpen = false
@@ -628,8 +629,9 @@ final class Model: ObservableObject {
             if !pendingAccounts.isEmpty && !preserveNotice { note = ""; completion = nil; badge = ""; symbol = "clock.arrow.circlepath" }
             let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
             let changed = identity != activeIdentity
-            let switched = changed && !activeIdentity.isEmpty && !identity.isEmpty
+            let switched = !identity.isEmpty && !lastLogin.isEmpty && identity != lastLogin
             activeIdentity = identity
+            if !identity.isEmpty { lastLogin = identity }
             if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty) { sweep() }
             if !snapshot && switched { releaseWorkers(manual: false) }
         }

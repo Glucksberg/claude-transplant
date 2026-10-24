@@ -9796,13 +9796,13 @@ struct WorkerChecks {
                 requests[sweep].2(0, "")
             }
         }
-        for (before, after, expected) in [(#"LOGIN_A"#, #"LOGIN_B"#, true), (#"LOGIN_A"#, #"LOGIN_A"#, false), (#"LOGIN_NONE"#, #"LOGIN_B"#, false), (#"LOGIN_A"#, #"LOGIN_NONE"#, false)] {
+        for (logins, expected) in [([#"LOGIN_A"#, #"LOGIN_B"#], true), ([#"LOGIN_A"#, #"LOGIN_A"#], false), ([#"LOGIN_NONE"#, #"LOGIN_B"#], false), ([#"LOGIN_A"#, #"LOGIN_NONE"#], false), ([#"LOGIN_A"#, #"LOGIN_NONE"#, #"LOGIN_B"#], true), ([#"LOGIN_A"#, #"LOGIN_NONE"#, #"LOGIN_A"#], false)] {
             requests = []
             let watcher = Model(demo: Demo.accounts)
-            reply(watcher, before)
+            for login in logins.dropLast() { reply(watcher, login) }
             precondition(!requests.contains { $0.0.first == "workers" })
-            reply(watcher, after)
-            precondition(requests.contains { $0.0 == ["workers", "--json"] } == expected)
+            reply(watcher, logins.last!)
+            precondition(requests.contains { $0.0 == ["workers", "--json"] } == expected, logins.joined(separator: " -> "))
             guard expected else { continue }
             requests = requests.filter { $0.0.first == "workers" }
             respond(watcher, #"STALE"#)
