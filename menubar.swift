@@ -332,7 +332,7 @@ final class Model: ObservableObject {
     @Published private(set) var sourceActivity: Event?
     private var queued: [String]?
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
-    @Published var restartAvailable = false
+    @Published var restartAvailable = false { didSet { if restartAvailable && !oldValue { restartSince = Date() } } }
     @Published var moveProgress = MoveProgress()
     var snapshotFailed = false
     let snapshot: Bool
@@ -577,16 +577,20 @@ final class Model: ObservableObject {
     }
 
     private func goHome() {
-        guard !running, pendingAccounts.isEmpty, recoveryProblem == nil, !retryable, !reviewRestart, !capacityRecovery, failedFinish == nil else { return }
-        let restart = restartAvailable
+        guard !running, pendingAccounts.isEmpty, recoveryProblem == nil, !retryable, !reviewRestart, !capacityRecovery, failedFinish == nil,
+              selectionComplete || completion != nil || !note.isEmpty || !lines.isEmpty else { return }
+        let restart = restartAvailable, since = restartSince, finished = selectionComplete
         quietReceipt = retryReceipt ?? accounts.compactMap(\.receipt).first ?? quietReceipt
         if !demo && !snapshot { UserDefaults.standard.set(quietReceipt, forKey: "quietReceipt") }
         clearResult()
         restartAvailable = restart
-        excluded = []
-        from = []
-        to = nil
-        targetChosen = false
+        restartSince = since
+        if finished {
+            excluded = []
+            from = []
+            to = nil
+            targetChosen = false
+        }
         symbol = "arrow.left.arrow.right"
         badge = ""
         settle()
