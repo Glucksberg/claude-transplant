@@ -102,6 +102,7 @@ To    ↑↓ move · enter confirm
 | `undo` | quarantine the last move and restore source entries and task registrations, refused if a target changed or a source cannot be restored |
 | `finish` | recover interrupted task transfers, finish held local records or same-login cloud checks, continue a staged undo, and list earlier refusals as information |
 | `sweep` | verify placed records and retry eligible pending work, never requests a restart or continues Undo |
+| `workers` | stop SSH Code workers signed in to another account or started before the current login, `--dry-run` lists them |
 | `restart` | show the plan for the existing Desktop refresh action |
 | `keep-local` | cancel remaining work and cloud checks, keep completed moves |
 | `accounts` | list accounts |
@@ -124,6 +125,7 @@ Every command may write the tool's own files under `~/Library/Application Suppor
 | move, `finish`, `sweep`, `undo` | Desktop session records and scheduled task registries under `claude-code-sessions` |
 | `--restart-approved <token>` | quits and reopens Claude Desktop around the requested operation |
 | a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control mirrors archived or restored there, rescued local transcripts when a remote branch diverged |
+| `workers` | every SSH host named in Desktop session records, over `ssh` in batch mode: reads only the account and organization ids and age of Claude Code worker processes, and without `--dry-run` sends the stale ones SIGTERM, Linux hosts only |
 | `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
 | Move in the menubar | the same as a move with `--cloud`, the panel always passes it |
 | `menubar --snapshot <png>` | that image file |
@@ -148,6 +150,10 @@ Yes, it is a move, not a copy. Moving back is the same one click and takes secon
 
 Yes. It keeps its id, and the next message goes through the account you are signed into with the whole conversation as context. Personal history moved into a Team or Enterprise organization becomes that organization's data.
 
+### Why does an SSH session still say I hit my usage limit after switching?
+
+SSH sessions run Claude Code on the remote host. Desktop leaves that process running when it quits or switches accounts and re-adopts it later. The process keeps the login it started with and refreshes its token through whichever account Desktop had open meanwhile, so it can keep spending the account you left even when its environment names the current one. `claude-transplant workers` stops remote workers signed in to another account or started before the current login, and the next message starts a fresh one under the account you use. Verified on macOS 26.6.2 with Claude Desktop 3.6556.2 and remote Claude Code 2.1.308 on Linux hosts.
+
 ### Can a Team or Enterprise admin see moved history?
 
 Team owners get usage analytics only. Enterprise compliance tooling can retrieve Claude Code session transcripts, and the next message in a moved session sends its whole conversation to that organization.
@@ -160,7 +166,7 @@ Shorter answers:
 
 - Does a move use tokens or talk to a model? No. Continuing a moved session costs the same as resuming any session after a break, and the prompt cache is per organization, so the first message after a switch never hits it either way.
 - Which plans and accounts work? Any plan that runs Claude Code in Claude Desktop, Pro, Max, Team, or Enterprise. Two organizations on one email, a Team seat next to a personal plan, are two sidebars and both are supported.
-- What happens to sessions that are running when I switch? Desktop ends the workers of the account you leave. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
+- What happens to sessions that are running when I switch? Desktop ends the local workers of the account you leave. SSH workers survive, see above. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
 - Is anything uploaded or read from Keychain? From the CLI, not unless you pass `--cloud`. The menubar's Move always passes it: Desktop's claude.ai session is read from Keychain in memory, sent only to claude.ai to reconcile Remote Control mirrors, and never stored.
 - What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account.
 - Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side, is still open, or a new fork still needs the moved parent.
@@ -271,6 +277,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
+| Trust `CLAUDE_CODE_ACCOUNT_UUID` of a re-adopted SSH worker | Its token refreshes through whichever account Desktop has open, a worker started under the current login hit the previous account's limit after a round trip. Worker age against the latest login switch decides. Verified with Desktop 3.6556.2 and remote Claude Code 2.1.308 on 2026-10-24 |
 
 </details>
 

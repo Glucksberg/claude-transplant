@@ -44,6 +44,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant accounts    list accounts
   claude-transplant restart     plan an explicit Desktop restart
   claude-transplant sweep       verify placed metadata and retry the active pending source
+  claude-transplant workers     stop SSH Code workers still signed in to another account, --dry-run lists them
   claude-transplant menubar     install the menubar app, --snapshot <png>, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
@@ -4693,6 +4694,73 @@ async function menubar(paths, remove, snapshot) {
   return `menubar installed | starts at login | ${app}`
 }
 
+const REMOTE_WORKERS = String.raw`for p in $(pgrep -f /.claude/remote/ccd-cli/); do
+  a=$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^CLAUDE_CODE_ACCOUNT_UUID=//p')
+  o=$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^CLAUDE_CODE_ORGANIZATION_UUID=//p')
+  [ -n "$a" ] && echo "$p $a $o $(ps -o etimes= -p $p | tr -d ' ')"
+done
+`
+const stopRemoteWorkers = (rows) => String.raw`while read p a o; do
+  [ "$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^CLAUDE_CODE_ACCOUNT_UUID=//p')" = "$a" ] || continue
+  [ "$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^CLAUDE_CODE_ORGANIZATION_UUID=//p')" = "$o" ] || continue
+  kill -TERM $(pgrep -P $p) $p 2>/dev/null && echo $p
+done <<'ROWS'
+` + rows.map((row) => `${row.pid} ${row.account} ${row.org}\n`).join('') + 'ROWS\n'
+const sshFailure = (result) => (result.error?.message ?? result.stderr ?? '').trim().split('\n').at(-1) || `ssh exited ${result.status}`
+
+async function loginSince(paths, identity) {
+  const files = (await readdir(paths.logs).catch(() => [])).filter((name) => /^main(?:[1-9]\d*)?\.log$/.test(name)).sort((a, b) => Number(a.slice(4, -4)) - Number(b.slice(4, -4)))
+  let since = null
+  for (const file of files) {
+    const lines = (await readFile(path.join(paths.logs, file), 'utf8').catch(() => '')).split('\n')
+    for (let index = lines.length - 1; index >= 0; index--) {
+      const match = lines[index].match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,3})?) \[\w+\] \[LocalSessionManager\] Initialization succeeded\b.*?accountId=([^,\s]+), orgId=([^,\s]+)/)
+      if (!match) continue
+      if (!sameAccount({ account: match[2].toLowerCase(), org: match[3].toLowerCase() }, identity)) return since
+      since = Date.parse(match[1].replace(' ', 'T'))
+    }
+  }
+  return null
+}
+
+export async function remoteWorkers(paths, options = {}) {
+  const identity = options.identity ?? await signedIn(paths)
+  if (identity.state !== 'known') return { identity, hosts: [], refused: 'Claude Desktop must be running and signed in to the account that should own remote workers' }
+  const since = options.since !== undefined ? options.since : await loginSince(paths, identity)
+  const loginAge = since === null ? null : (Date.now() - since) / 1000
+  const run = options.run ?? ((args, input) => spawnSync('/usr/bin/ssh', args, { input, encoding: 'utf8', timeout: 30_000 }))
+  const all = await accounts(paths)
+  const targets = new Map()
+  for (const { record } of all.flatMap((account) => account.sessions)) {
+    const ssh = record.sshConfig
+    if (typeof ssh?.sshHost !== 'string' || !ssh.sshHost || ssh.sshHost.startsWith('-') || (ssh.sshPort != null && !/^\d+$/.test(String(ssh.sshPort)))) continue
+    targets.set(`${ssh.sshHost}|${ssh.sshPort ?? ''}|${ssh.sshIdentityFile ?? ''}`, ssh)
+  }
+  const label = (row) => all.find((account) => sameAccount(account, row))?.label ?? `${short(row.account)} · ${short(row.org)}`
+  const hosts = []
+  for (const ssh of targets.values()) {
+    const key = typeof ssh.sshIdentityFile === 'string' && ssh.sshIdentityFile ? ssh.sshIdentityFile.replace(/^~(?=\/)/, paths.home) : null
+    const args = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', ...(ssh.sshPort ? ['-p', String(ssh.sshPort)] : []), ...(key ? ['-i', key] : []), ssh.sshHost, 'sh', '-s']
+    const host = { host: ssh.sshHost, port: ssh.sshPort ?? null, workers: [], stopped: [], error: null }
+    hosts.push(host)
+    const listed = run(args, REMOTE_WORKERS)
+    if (listed.error || listed.status !== 0) { host.error = sshFailure(listed); continue }
+    for (const line of listed.stdout.split('\n')) {
+      const match = line.match(/^(\d+) (\S+) (\S+)(?: (\d+))?$/)
+      if (!match || !UUID.test(match[2]) || !UUID.test(match[3])) continue
+      const row = { pid: Number(match[1]), account: match[2].toLowerCase(), org: match[3].toLowerCase(), age: match[4] ? Number(match[4]) : null }
+      const reason = !sameAccount(row, identity) ? 'other account' : loginAge !== null && row.age !== null && row.age > loginAge ? 'older than this login' : null
+      host.workers.push({ ...row, label: label(row), stale: reason !== null, reason })
+    }
+    const stale = host.workers.filter((row) => row.stale)
+    if (options.dry || !stale.length) continue
+    const stopped = run(args, stopRemoteWorkers(stale))
+    if (stopped.error || stopped.status !== 0) host.error = sshFailure(stopped)
+    host.stopped = (stopped.stdout ?? '').split('\n').filter((line) => /^\d+$/.test(line)).map(Number)
+  }
+  return { identity, hosts }
+}
+
 function parse(argv) {
   const args = { from: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null, restartApproved: null, moveOnly: false, leaveChecks: [] }
   const value = (i) => { if (argv[i] === undefined || argv[i].startsWith('-')) throw new Error(`${argv[i - 1]} needs a value`); return argv[i] }
@@ -4717,6 +4785,7 @@ function parse(argv) {
   if ((args.help || args.version) && argv.length > 1) throw new Error(`${args.help ? '--help' : '--version'} goes alone`)
   const incompatible = args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot
   if (['accounts', 'keep-local', 'sweep'].includes(args.cmd) && (incompatible || args.restartApproved || args.moveOnly)) throw new Error(`${args.cmd} accepts only --json`)
+  if (args.cmd === 'workers' && (args.from.length || args.to || args.cloud || args.remove || args.snapshot || args.restartApproved != null || args.moveOnly || args.leaveChecks.length)) throw new Error('workers accepts only --dry-run and --json')
   if (['finish', 'undo'].includes(args.cmd) && (incompatible || args.cmd === 'undo' && args.moveOnly)) throw new Error(`${args.cmd} accepts only --json and --restart-approved`)
   if (args.restartApproved != null && !/^[a-f0-9]{64}$/.test(args.restartApproved)) throw new Error('restart approval token must be the one displayed by the engine')
   if (args.moveOnly && (args.restartApproved || args.dry || (args.cmd && args.cmd !== 'finish'))) throw new Error('--move-only applies only to a move or held continuation')
@@ -4802,6 +4871,20 @@ async function main(argv) {
     out.write(`\n  receipt     ${file}\n  undo        npx claude-transplant undo\n${note ? `  then        ${note}\n` : ''}`)
   }
   if (args.cmd === 'menubar') return out.write(`${await locked(paths, () => menubar(paths, args.remove, args.snapshot))}\n`)
+  if (args.cmd === 'workers') {
+    const result = await remoteWorkers(paths, { dry: args.dry })
+    if (result.refused || result.hosts.some((host) => host.error)) process.exitCode = 1
+    if (args.json) return emit(result.refused ? { ok: false, reason: result.refused } : { ok: !result.hosts.some((host) => host.error), dry: args.dry, account: result.identity.account, org: result.identity.org, hosts: result.hosts })
+    if (result.refused) return out.write(`  refused     ${result.refused}\n`)
+    if (!result.hosts.length) return out.write('  workers     no SSH sessions in Claude Desktop records\n')
+    for (const host of result.hosts) {
+      if (host.error) { out.write(`  unreachable ${host.host} | ${host.error}\n`); continue }
+      const stale = host.workers.filter((row) => row.stale)
+      out.write(`  host        ${host.host} | ${quantity(host.workers.length - stale.length, 'current worker')} | ${quantity(stale.length, 'stale worker')}\n`)
+      for (const row of stale) out.write(`  ${(args.dry ? 'would stop' : host.stopped.includes(row.pid) ? 'stopped' : 'kept').padEnd(11)} ${row.pid} | ${row.label} | ${row.reason}\n`)
+    }
+    return
+  }
   if (args.cmd === 'sweep') {
     const result = await sweep(paths, { report: args.json ? reporter(true) : undefined })
     const failed = result.result?.failed ?? result.result?.receipt?.failed ?? result.verification?.failed ?? []

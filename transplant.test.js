@@ -10,7 +10,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, move, normalize, parseProcesses, pendingPresentation, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, executeMove, remoteWorkers, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, move, normalize, parseProcesses, pendingPresentation, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -2347,6 +2347,72 @@ test('menubar snapshot renders live accounts without installing', async () => {
   assert.equal(png.subarray(1, 4).toString(), 'PNG')
   assert.equal(await stat(path.join(h.paths.state, 'Claude Transplant.app')).then(() => true, () => false), false)
   assert.equal(await stat(path.join(h.root, 'Library/LaunchAgents/io.github.vitaliyhayda.claude-transplant.plist')).then(() => true, () => false), false)
+})
+
+const sshFixture = (listings) => {
+  const calls = []
+  const run = (args, input) => {
+    const host = args.at(-3)
+    calls.push({ host, args, input })
+    if (!input.includes('kill')) return listings[host] ?? { status: 255, stdout: '', stderr: `ssh: connect to host ${host}: Operation timed out\n` }
+    const pids = [...input.matchAll(/^(\d+) /gm)].map((match) => match[1])
+    return { status: 0, stdout: pids.map((pid) => `${pid}\n`).join(''), stderr: '' }
+  }
+  return { calls, run }
+}
+
+test('remote workers stop SSH processes signed in to another account and keep the current login', async () => {
+  const h = await home()
+  const shared = { sshHost: 'dev@build', sshPort: 6996, sshIdentityFile: '~/.ssh/build' }
+  await h.record('P', id(1), { sshConfig: shared })
+  await h.record('T', id(2), { sshConfig: shared })
+  await h.record('P', id(3), { sshConfig: { sshHost: 'dev@offline' } })
+  await h.record('P', id(4))
+  const listing = [`11 ${h.acct.P} ${h.org.P} 60`, `12 ${h.acct.T} ${h.org.T} 60`, `13 ${h.acct.P} ${h.org.T}`, '14 not-a-uuid x; rm -rf ~', `15 ${h.acct.P} ${h.org.P} 7200`, ''].join('\n')
+  const identity = { account: h.acct.P, org: h.org.P, state: 'known' }
+  const since = Date.now() - 600_000
+  const preview = sshFixture({ 'dev@build': { status: 0, stdout: listing, stderr: '' } })
+  const planned = await remoteWorkers(h.paths, { identity, since, run: preview.run, dry: true })
+  const stopping = sshFixture({ 'dev@build': { status: 0, stdout: listing, stderr: '' } })
+  const stopped = await remoteWorkers(h.paths, { identity, since, run: stopping.run })
+  const build = stopped.hosts.find((row) => row.host === 'dev@build')
+  const offline = stopped.hosts.find((row) => row.host === 'dev@offline')
+  const kill = stopping.calls.find((call) => call.input.includes('kill'))
+
+  assert.equal(preview.calls.some((call) => call.input.includes('kill')), false)
+  assert.deepEqual(planned.hosts.find((row) => row.host === 'dev@build').workers.filter((row) => row.stale).map((row) => row.pid), [12, 13, 15])
+  assert.deepEqual(stopping.calls.filter((call) => call.host === 'dev@build').length, 2)
+  assert.deepEqual(kill.args.slice(0, -3), ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-p', '6996', '-i', path.join(h.root, '.ssh/build')])
+  assert.deepEqual([...kill.input.matchAll(/^(\d+) /gm)].map((match) => match[1]), ['12', '13', '15'])
+  assert.equal(kill.input.includes('rm -rf'), false)
+  assert.deepEqual(build.stopped, [12, 13, 15])
+  assert.deepEqual(build.workers.map((row) => [row.pid, row.reason]), [[11, null], [12, 'other account'], [13, 'other account'], [15, 'older than this login']])
+  assert.match(offline.error, /timed out/)
+  assert.deepEqual(offline.workers, [])
+})
+
+test('remote workers older than the latest account switch are stale even when their environment names the current login', async () => {
+  const h = await home(), f = await identityFixture(h)
+  await h.record('P', id(1), { sshConfig: { sshHost: 'dev@build' } })
+  await f.write(f.init(0, h.acct.T, h.org.T) + f.init(100) + f.init(200))
+  const switched = (Date.now() - (f.started + 100_000)) / 1000
+  const listing = [`21 ${h.acct.P} ${h.org.P} ${Math.round(switched + 60)}`, `22 ${h.acct.P} ${h.org.P} ${Math.round(switched - 60)}`, ''].join('\n')
+  const fixture = sshFixture({ 'dev@build': { status: 0, stdout: listing, stderr: '' } })
+  const result = await remoteWorkers(h.paths, { identity: { account: h.acct.P, org: h.org.P, state: 'known' }, run: fixture.run, dry: true })
+
+  assert.deepEqual(result.hosts[0].workers.map((row) => [row.pid, row.reason]), [[21, 'older than this login'], [22, null]])
+})
+
+test('remote workers refuse without a known Desktop login and contact no host', async () => {
+  const h = await home()
+  await h.record('P', id(1), { sshConfig: { sshHost: 'dev@build' } })
+  const fixture = sshFixture({})
+  const result = await remoteWorkers(h.paths, { identity: { account: null, org: null, state: 'unknown' }, run: fixture.run })
+  const rejected = await cli(h.root, ['workers', '--cloud'])
+
+  assert.match(result.refused, /signed in/)
+  assert.deepEqual(fixture.calls, [])
+  assert.match(rejected.stderr, /workers accepts only --dry-run and --json/)
 })
 
 test('same-account organization moves rehome one record without copying history', async () => {
