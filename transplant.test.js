@@ -9867,6 +9867,22 @@ struct HomeChecks {
         requests[0].1(#"SWEPT"#)
         requests[0].2(0, "")
         precondition(model.note.isEmpty && model.lines.isEmpty && model.displaySummary.isEmpty, model.displaySummary)
+        var previous = Demo.accounts
+        for index in previous.indices { previous[index].receipt = "/receipts/previous.json" }
+        let early = Model(demo: previous)
+        early.selectTarget(previous[0].id)
+        early.begin()
+        early.handle(#"DONE"#)
+        early.checkOperation(["--from", previous[1].selector, "--to", previous[0].selector, "--cloud", "--json"])
+        early.checkFinish(0)
+        early.panelVisibility(false)
+        early.accounts = list
+        precondition(early.receiptSummaries.isEmpty)
+        requests = []
+        early.checkSweep()
+        requests[0].1(#"SWEPT"#)
+        requests[0].2(0, "")
+        precondition(early.note.isEmpty && early.lines.isEmpty && early.displaySummary.isEmpty, early.displaySummary)
         requests = []
         let other = Model(demo: Demo.accounts)
         other.selectTarget(Demo.accounts[3].id)

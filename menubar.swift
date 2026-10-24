@@ -600,7 +600,7 @@ final class Model: ObservableObject {
     private func goHome() {
         guard !running, pendingAccounts.isEmpty, recoveryProblem == nil, !retryable, !reviewRestart, !capacityRecovery, failedFinish == nil else { return }
         let restart = restartAvailable
-        quietReceipt = accounts.compactMap(\.receipt).first ?? quietReceipt
+        quietReceipt = retryReceipt ?? accounts.compactMap(\.receipt).first ?? quietReceipt
         if !demo && !snapshot { UserDefaults.standard.set(quietReceipt, forKey: "quietReceipt") }
         clearResult()
         restartAvailable = restart
