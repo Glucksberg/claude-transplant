@@ -373,7 +373,7 @@ final class Model: ObservableObject {
     private var targetChosen = false
     private var selectionComplete = false
     private var panelOpen = false
-    private var quietReceipt: String?
+    private var quietReceipt = UserDefaults.standard.string(forKey: "quietReceipt")
     private var restartSince: Date?
     private var sweepNote: String?
     private var retryable = false
@@ -600,6 +600,7 @@ final class Model: ObservableObject {
         guard !running, pendingAccounts.isEmpty, recoveryProblem == nil, !retryable, !reviewRestart, !capacityRecovery, failedFinish == nil else { return }
         let restart = restartAvailable
         quietReceipt = accounts.compactMap(\.receipt).first ?? quietReceipt
+        if !demo && !snapshot { UserDefaults.standard.set(quietReceipt, forKey: "quietReceipt") }
         clearResult()
         restartAvailable = restart
         if !releasing { workersNote = "" }
