@@ -2403,6 +2403,38 @@ test('remote workers older than the latest account switch are stale even when th
   assert.deepEqual(result.hosts[0].workers.map((row) => [row.pid, row.reason]), [[21, 'older than this login'], [22, null]])
 })
 
+test('remote workers compare each worker with the login age when its host answered', async () => {
+  const h = await home()
+  await h.record('P', id(1), { sshConfig: { sshHost: 'dev@slow' } })
+  const listing = `31 ${h.acct.P} ${h.org.P} 2\n`
+  const run = (args, input) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1500)
+    return { status: 0, stdout: listing, stderr: '' }
+  }
+  const result = await remoteWorkers(h.paths, { identity: { account: h.acct.P, org: h.org.P, state: 'known' }, since: Date.now() - 1000, run, dry: true })
+
+  assert.deepEqual(result.hosts[0].workers.map((row) => [row.pid, row.reason]), [[31, null]])
+})
+
+test('remote worker listing succeeds when the last matching process has no readable environment', async (t) => {
+  const h = await home()
+  await h.record('P', id(1), { sshConfig: { sshHost: 'dev@build' } })
+  const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)', path.join(h.root, '.claude/remote/ccd-cli/9')], { stdio: 'ignore' })
+  t.after(() => child.kill())
+  await once(child, 'spawn')
+  const listed = []
+  const run = (args, input) => {
+    const result = spawnSync('/bin/sh', ['-s'], { input, encoding: 'utf8' })
+    listed.push(result.status)
+    return result
+  }
+  const result = await remoteWorkers(h.paths, { identity: { account: h.acct.P, org: h.org.P, state: 'known' }, since: null, run, dry: true })
+
+  assert.deepEqual(listed, [0])
+  assert.equal(result.hosts[0].error, null)
+  assert.deepEqual(result.hosts[0].workers, [])
+})
+
 test('remote workers refuse without a known Desktop login and contact no host', async () => {
   const h = await home()
   await h.record('P', id(1), { sshConfig: { sshHost: 'dev@build' } })

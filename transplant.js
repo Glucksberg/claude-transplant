@@ -4697,8 +4697,9 @@ async function menubar(paths, remove, snapshot) {
 const REMOTE_WORKERS = String.raw`for p in $(pgrep -f /.claude/remote/ccd-cli/); do
   a=$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^CLAUDE_CODE_ACCOUNT_UUID=//p')
   o=$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^CLAUDE_CODE_ORGANIZATION_UUID=//p')
-  [ -n "$a" ] && echo "$p $a $o $(ps -o etimes= -p $p | tr -d ' ')"
+  if [ -n "$a" ]; then echo "$p $a $o $(ps -o etimes= -p $p | tr -d ' ')"; fi
 done
+exit 0
 `
 const stopRemoteWorkers = (rows) => String.raw`while read p a o; do
   [ "$(tr '\000' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^CLAUDE_CODE_ACCOUNT_UUID=//p')" = "$a" ] || continue
@@ -4727,7 +4728,6 @@ export async function remoteWorkers(paths, options = {}) {
   const identity = options.identity ?? await signedIn(paths)
   if (identity.state !== 'known') return { identity, hosts: [], refused: 'Claude Desktop must be running and signed in to the account that should own remote workers' }
   const since = options.since !== undefined ? options.since : await loginSince(paths, identity)
-  const loginAge = since === null ? null : (Date.now() - since) / 1000
   const run = options.run ?? ((args, input) => spawnSync('/usr/bin/ssh', args, { input, encoding: 'utf8', timeout: 30_000 }))
   const all = await accounts(paths)
   const targets = new Map()
@@ -4745,6 +4745,7 @@ export async function remoteWorkers(paths, options = {}) {
     hosts.push(host)
     const listed = run(args, REMOTE_WORKERS)
     if (listed.error || listed.status !== 0) { host.error = sshFailure(listed); continue }
+    const loginAge = since === null ? null : (Date.now() - since) / 1000
     for (const line of listed.stdout.split('\n')) {
       const match = line.match(/^(\d+) (\S+) (\S+)(?: (\d+))?$/)
       if (!match || !UUID.test(match[2]) || !UUID.test(match[3])) continue
