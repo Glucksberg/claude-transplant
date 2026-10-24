@@ -105,6 +105,24 @@ struct RestartCapacity: Decodable {
     let availableMs: Double?
 }
 
+struct WorkerRow: Decodable {
+    let pid: Int
+    let stale: Bool
+}
+
+struct WorkerHost: Decodable {
+    let host: String
+    let workers: [WorkerRow]
+    let stopped: [Int]
+    let error: String?
+}
+
+struct WorkersResult: Decodable {
+    let ok: Bool
+    let reason: String?
+    let hosts: [WorkerHost]?
+}
+
 struct Event: Decodable {
     let receipt: String?
     let summary: ReceiptSummary?
@@ -329,6 +347,8 @@ final class Model: ObservableObject {
     @Published var symbol = "arrow.left.arrow.right"
     @Published var running = false
     @Published private(set) var sweeping = false
+    @Published private(set) var releasing = false
+    @Published var workersNote = ""
     @Published private(set) var sourceActivity: Event?
     private var queued: [String]?
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
@@ -1001,6 +1021,36 @@ final class Model: ObservableObject {
         }
     }
 
+    func releaseWorkers(manual: Bool = true) {
+        guard !releasing else { return }
+        releasing = true
+        if manual { workersNote = "" }
+        var result: WorkersResult?
+        run(["workers", "--json"], line: { line in
+            if let data = line.data(using: .utf8), let decoded = try? JSONDecoder().decode(WorkersResult.self, from: data) { result = decoded }
+        }) { [weak self] _, error in
+            guard let self else { return }
+            releasing = false
+            guard let result else {
+                if manual { workersNote = error.isEmpty ? "The SSH worker check did not complete." : error }
+                return
+            }
+            if let reason = result.reason {
+                if manual { workersNote = reason.sentence + "." }
+                return
+            }
+            let hosts = result.hosts ?? []
+            let stopped = hosts.reduce(0) { $0 + $1.stopped.count }
+            let kept = hosts.reduce(0) { $0 + $1.workers.filter(\.stale).count } - stopped
+            let unreachable = hosts.filter { $0.error != nil }.count
+            if !manual && stopped == 0 && kept == 0 && unreachable == 0 { return }
+            var parts = [hosts.isEmpty ? "No SSH sessions to check." : stopped > 0 ? "Stopped \(quantity(stopped, "old SSH worker", "old SSH workers"))." : kept > 0 ? "" : "No old SSH workers."]
+            if kept > 0 { parts.append("\(quantity(kept, "old SSH worker is", "old SSH workers are")) still running.") }
+            if unreachable > 0 { parts.append("\(quantity(unreachable, "host", "hosts")) unreachable.") }
+            workersNote = parts.filter { !$0.isEmpty }.joined(separator: " ")
+        }
+    }
+
     nonisolated private static func capture(_ executable: String, _ arguments: [String]) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
@@ -1055,6 +1105,7 @@ final class Model: ObservableObject {
             self.badge = ""
         }
         refresh()
+        if status == 0, operationArgs.contains("--from") { releaseWorkers(manual: false) }
     }
 
     private func notify(_ title: String, _ body: String) {
@@ -1360,7 +1411,13 @@ struct Panel: View {
                 Spacer()
                 Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary).fixedSize()
             }
-            HStack {
+            if !model.workersNote.isEmpty {
+                Text(model.workersNote).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+            HStack(spacing: 12) {
+                Button(model.releasing ? "Checking SSH workers…" : "Stop old SSH workers") { model.releaseWorkers() }
+                    .buttonStyle(.plain).font(.caption).foregroundStyle(.secondary).disabled(model.releasing)
+                    .help("Stops remote Claude Code processes still signed in to an account Claude no longer uses")
                 if model.skipRestartWarning {
                     Button("Show restart warnings", action: model.restoreRestartWarning).buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
                 }

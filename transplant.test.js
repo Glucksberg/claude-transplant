@@ -9687,6 +9687,80 @@ struct StateChecks {
   assert.equal(finished.receipt.sessions.length, 4)
 })
 
+test('Swift stops old SSH workers from the panel and after a successful move', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-swift-workers-'))
+  const host = (name, workers, stopped, error = null) => ({ host: name, port: 6996, workers, stopped, error })
+  const stale = JSON.stringify({ ok: false, dry: false, account: 'a', org: 'o', hosts: [host('build', [{ pid: 11, stale: true }, { pid: 12, stale: false }], [11]), host('offline', [], [], 'Connection timed out')] })
+  const kept = JSON.stringify({ ok: true, dry: false, account: 'a', org: 'o', hosts: [host('build', [{ pid: 11, stale: true }, { pid: 13, stale: true }], [13])] })
+  const clean = JSON.stringify({ ok: true, dry: false, account: 'a', org: 'o', hosts: [host('build', [{ pid: 12, stale: false }], [])] })
+  const refused = JSON.stringify({ ok: false, reason: 'Claude Desktop must be running and signed in to the account that should own remote workers' })
+  const source = await swiftFixtureSource() + String.raw`
+@main
+struct WorkerChecks {
+    @MainActor
+    static func respond(_ model: Model, _ json: String) {
+        let request = requests.last!
+        precondition(request.0 == ["workers", "--json"])
+        precondition(model.releasing)
+        model.releaseWorkers()
+        precondition(requests.filter { $0.0.first == "workers" }.count == 1)
+        request.1(json)
+        request.2(json.contains("\"reason\"") ? 1 : 0, "")
+        precondition(!model.releasing)
+    }
+
+    @MainActor
+    static func main() {
+        let panel = Model(demo: Demo.accounts)
+        panel.releaseWorkers()
+        respond(panel, #"STALE"#)
+        precondition(panel.workersNote == "Stopped 1 old SSH worker. 1 host unreachable.", panel.workersNote)
+        requests = []
+        panel.releaseWorkers()
+        respond(panel, #"KEPT"#)
+        precondition(panel.workersNote == "Stopped 1 old SSH worker. 1 old SSH worker is still running.", panel.workersNote)
+        requests = []
+        panel.releaseWorkers()
+        respond(panel, #"CLEAN"#)
+        precondition(panel.workersNote == "No old SSH workers.", panel.workersNote)
+        requests = []
+        panel.releaseWorkers()
+        respond(panel, #"REFUSED"#)
+        precondition(panel.workersNote.hasPrefix("Claude Desktop must be running"), panel.workersNote)
+        requests = []
+        panel.releaseWorkers()
+        requests.last!.2(1, "spawn failed")
+        precondition(panel.workersNote == "spawn failed" && !panel.releasing)
+        for (operation, status, expected) in [(["--from", "work personal", "--to", "work company", "--cloud", "--json"], Int32(0), true), (["--from", "work personal", "--to", "work company", "--cloud", "--json"], Int32(1), false), (["undo", "--json"], Int32(0), false), (["finish", "--json"], Int32(0), false)] {
+            requests = []
+            let moved = Model(demo: Demo.accounts)
+            moved.checkOperation(operation)
+            moved.checkFinish(status)
+            precondition(requests.contains { $0.0 == ["workers", "--json"] } == expected, operation.joined(separator: " "))
+            guard expected else { continue }
+            requests = requests.filter { $0.0.first == "workers" }
+            respond(moved, #"CLEAN"#)
+            precondition(moved.workersNote.isEmpty)
+            requests = []
+            moved.checkFinish(0)
+            respond(moved, #"REFUSED"#)
+            precondition(moved.workersNote.isEmpty)
+            requests = []
+            moved.checkFinish(0)
+            respond(moved, #"STALE"#)
+            precondition(moved.workersNote == "Stopped 1 old SSH worker. 1 host unreachable.")
+        }
+        print("Swift worker states passed")
+    }
+}
+`.replaceAll('#"STALE"#', JSON.stringify(stale)).replaceAll('#"KEPT"#', JSON.stringify(kept)).replaceAll('#"CLEAN"#', JSON.stringify(clean)).replaceAll('#"REFUSED"#', JSON.stringify(refused))
+  const file = path.join(root, 'workers.swift'), binary = path.join(root, 'workers')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [], { timeout: 15_000 })
+  assert.match(stdout, /Swift worker states passed/)
+})
+
 test('missing and unreadable moved records remain distinct from informational field changes', async () => {
   const h = await home()
   await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
