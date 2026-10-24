@@ -9859,9 +9859,22 @@ struct HomeChecks {
         precondition(model.restartAvailable)
         model.panelVisibility(true)
         precondition(model.note == "122 moved. 1 session was not moved.")
+        let since = model.checkRestartSince
         model.panelVisibility(false)
         precondition(model.note.isEmpty && model.lines.isEmpty && model.completion == nil && model.displaySummary.isEmpty, model.displaySummary)
         precondition(model.restartAvailable && model.to != nil && !model.from.isEmpty)
+        precondition(since != nil && model.checkRestartSince == since)
+        model.restartAvailable = false
+        Thread.sleep(forTimeInterval: 0.01)
+        model.restartAvailable = true
+        precondition(model.checkRestartSince! > since!)
+        let unfinished = Model(demo: Demo.accounts)
+        unfinished.selectTarget(Demo.accounts[3].id)
+        unfinished.toggle(unfinished.from.sorted().first!)
+        let chosen = unfinished.to, sources = unfinished.from, left = unfinished.excluded
+        precondition(!left.isEmpty)
+        unfinished.panelVisibility(false)
+        precondition(unfinished.to == chosen && unfinished.from == sources && unfinished.excluded == left)
         requests = []
         model.checkSweep()
         requests[0].1(#"SWEPT"#)
@@ -9900,6 +9913,9 @@ struct HomeChecks {
         precondition(!shown.isEmpty && failed.note == shown && failed.primaryTitle == "Try again", failed.note)
         print("Swift home states passed")
     }
+}
+extension Model {
+    var checkRestartSince: Date? { restartSince }
 }
 `.replaceAll('#"SUMMARY"#', JSON.stringify(JSON.stringify(summary))).replaceAll('#"DONE"#', JSON.stringify(done)).replaceAll('#"SWEPT"#', JSON.stringify(swept)).replaceAll('#"ELSEWHERE"#', JSON.stringify(elsewhere)).replaceAll('#"QUIT"#', JSON.stringify(quit))
   const file = path.join(root, 'home.swift'), binary = path.join(root, 'home')
