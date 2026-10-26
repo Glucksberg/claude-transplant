@@ -7,6 +7,7 @@ import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { getHeapStatistics } from 'node:v8'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const TYPES = new Set(['user', 'assistant', 'attachment', 'system', 'progress'])
@@ -22,8 +23,9 @@ const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
 const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
 const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
-const RESTART_BUDGET = 30_000
+const RESTART_BUDGET = 60_000
 const REOPEN_RESERVE = 8_000
+const restartMoveBudget = (budget = RESTART_BUDGET, reserve = REOPEN_RESERVE) => Math.max(0, Math.min(22_000, (budget - reserve) / 2))
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
 const CACHE_VERSION = 11
@@ -55,6 +57,48 @@ const HELP = `claude-transplant   move Claude Code history between accounts
 `
 
 const sha = (data) => createHash('sha256').update(data).digest('hex')
+export function memoryBudget(io = {}) {
+  const limit = Math.floor((io.total ?? os.totalmem()) * 0.2)
+  const heap = io.heap ?? getHeapStatistics().heap_size_limit
+  const usage = io.usage ?? (() => process.memoryUsage())
+  const available = io.available ?? (() => process.availableMemory?.() ?? os.freemem())
+  let reserved = 0
+  const remaining = () => {
+    const { rss, heapUsed } = usage()
+    return Math.max(0, Math.min(limit - rss, heap - heapUsed, available()) * 0.8 - reserved)
+  }
+  const check = (bytes = 0) => {
+    const room = remaining()
+    if (bytes > room || room === 0) throw Object.assign(new Error('Waiting for memory to verify source history'), { code: 'CLOUD_MEMORY_PRESSURE' })
+  }
+  return {
+    limit, check,
+    parallel: () => {
+      const { rss, heapUsed } = usage()
+      const pressure = Math.max((rss + reserved) / limit, (heapUsed + reserved) / heap)
+      return pressure < 0.5 && available() > Math.min(512 * 1024 * 1024, limit / 4) ? 8 : pressure < 0.75 ? 2 : 1
+    },
+    read: async response => {
+      const chunks = []
+      let bytes = 0
+      try {
+        check()
+        if (response.body) for await (const chunk of response.body) {
+          check(chunk.byteLength * 4)
+          reserved += chunk.byteLength * 4
+          bytes += chunk.byteLength
+          chunks.push(chunk)
+        }
+        const text = Buffer.concat(chunks, bytes).toString('utf8')
+        const value = text ? JSON.parse(text) : null
+        check()
+        return value
+      } finally { reserved -= bytes * 4 }
+    }
+  }
+}
+let sharedMemory
+const operationMemory = () => sharedMemory ??= memoryBudget()
 let artifactEngineHash
 const artifactEngine = () => artifactEngineHash ??= sha(readFileSync(fileURLToPath(import.meta.url)))
 const sortKeys = (v) => Array.isArray(v) ? v.map(sortKeys) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v
@@ -84,7 +128,7 @@ const waitingSessions = (receipt) => [...new Map([
 const heldCount = (held = []) => new Set(held.flatMap(row => row.sources?.map(source => source.file ?? `${source.account}/${source.org}/${source.id}`) ?? [row.id])).size
 const cloudCancelToken = (file, check) => sha(stable({ file, account: check.account, org: check.org, sessionIds: check.sessionIds ? [...new Set(check.sessionIds)].sort() : null }))
 
-export function pendingPresentation(receipt, source, account, mode, table = [], scheduler = false, timeouts = new Map()) {
+export function pendingPresentation(receipt, source, account, mode, table = [], scheduler = false, timeouts = new Map(), identity = null) {
   const empty = { pendingState: null, pendingAction: null, pendingCount: null, pendingAutomatic: false }
   if (!source) return empty
   if (mode === 'recovery') return { ...empty, pendingState: 'interrupted', pendingAction: 'finish' }
@@ -106,12 +150,16 @@ export function pendingPresentation(receipt, source, account, mode, table = [], 
   const ids = [...new Set(pending.map(row => row.id).filter(Boolean))]
   const archived = new Set((receipt.remote ?? []).filter(row => sameAccount(row, source)).map(row => remoteId(row.id)))
   const count = failures.some(row => !row.id) ? null : ids.length || (source.sessionIds ? source.sessionIds.filter(id => !archived.has(remoteId(id))).length : null)
-  const state = failures.length && !waiting.length && failures.every(row => row.code === 'CLOUD_CONTENT_UNSUPPORTED') ? 'unsupported'
+  const state = historyLimited(source) ? 'limit'
+    : failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING') ? 'login'
+    : failures.length && failures.every(row => row.code === 'CLOUD_MEMORY_PRESSURE') ? 'memory'
+    : failures.length && !waiting.length && failures.every(row => row.code === 'CLOUD_CONTENT_UNSUPPORTED') ? 'unsupported'
     : pending.length && pending.every(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'worker'
       : failures.length || waiting.some(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
-  const action = state === 'unsupported' ? 'blocked' : !account.signedIn ? 'sign-in' : state === 'worker' ? 'wait'
+  const action = ['unsupported', 'limit'].includes(state) ? 'blocked' : !account.signedIn ? 'sign-in' : state === 'worker' ? 'wait'
     : waiting.length && canRestartWaiting({ cloudChecks: [source] }, table) ? 'restart' : 'wait'
-  return { pendingState: state, pendingAction: action, pendingCount: count, pendingAutomatic: state !== 'unsupported' }
+  return { pendingState: state, pendingAction: action, pendingCount: count, pendingAutomatic: !['unsupported', 'limit'].includes(state),
+    pendingRetryAt: account.signedIn && !['unsupported', 'limit', 'worker', 'cloud-open'].includes(state) ? cloudRetryAt(receipt, source, identity) : null }
 }
 const legacyLocalFailures = (receipt) => receipt.localCancelledAt ? [] : (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
 const needsRecovery = (receipt) => Boolean(receipt.pending || receipt.retiring || receipt.finalizing || receipt.undoing || receipt.remotePending || receipt.remoteUndoing?.length)
@@ -394,7 +442,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const budget = io.budget ?? RESTART_BUDGET
   const reserve = io.reserve ?? REOPEN_RESERVE
   const started = now(), deadline = started + budget
-  const mutationDeadline = deadline - reserve
+  const moveBudget = restartMoveBudget(budget, reserve)
+  const shutdownDeadline = started + Math.max(0, Math.min(30_000, budget - reserve - moveBudget))
+  let mutationDeadline = deadline - reserve
   const file = path.join(paths.state, 'restart.json')
   const state = { at: stamp(), attemptId: randomUUID(), requestedAt: new Date().toISOString(), app: paths.claudeApp, desktop: plan.desktop, held: plan.held,
     deadline: new Date(Date.now() + budget).toISOString(), outcome: 'closing' }
@@ -424,12 +474,13 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) throw Object.assign(new Error('Open Claude sessions changed. Review the restart plan again.'), { code: 'RESTART_PLAN_CHANGED' })
     if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw Object.assign(new Error('An external worker now owns a held session. No restart was started.'), { code: 'RESTART_EXTERNAL_WORKER' })
     report('desktop', 'Closing Claude Desktop', { live: true })
-    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, mutationDeadline - now()))
-    const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), mutationDeadline, now, wait)
+    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, shutdownDeadline - now()))
+    const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), shutdownDeadline, now, wait)
     if (!gone || quit.status !== 0) {
       state.outcome = quit.timedOut ? 'quit-timeout' : 'quit-not-confirmed'
       state.error = 'Claude Desktop did not confirm shutdown. Answer any native quit dialog yourself. Held records were not moved.'
     } else {
+      mutationDeadline = Math.min(deadline - reserve, now() + moveBudget)
       state.exitedAt = new Date().toISOString()
       state.outcome = 'moving'
       await save()
@@ -446,12 +497,13 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!remaining || !appProcess(paths, remaining)) {
       state.outcomeBeforeReopen = state.outcome
       state.outcome = 'reopening'
-      const remaining = deadline - now()
+      const reopenDeadline = Math.min(deadline, now() + reserve)
+      const remaining = reopenDeadline - now()
       if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
       const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining)))()
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
       const opened = await opening.catch(() => ({ status: null }))
-      const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, deadline, now, wait)
+      const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, reopenDeadline, now, wait)
       state.outcome = opened.status === 0 && present ? 'reopened' : 'reopen-failed'
       if (state.outcome === 'reopened') state.reopenedAt = new Date().toISOString()
       else state.error = 'Could not confirm Claude Desktop reopened. Reopen it manually.'
@@ -960,7 +1012,7 @@ function desktopCookies(paths) {
     const value = plainHex ? Buffer.from(plainHex, 'hex').toString('utf8') : decryptCookie(host, Buffer.from(encryptedHex, 'hex'), key, version)
     if (value && !/[;\r\n]/.test(value)) values.set(name, value)
   }
-  if (!values.has('sessionKey')) throw new Error('Claude Desktop login cookie is missing')
+  if (!values.has('sessionKey')) throw Object.assign(new Error('Claude Desktop login is still updating'), { code: 'CLOUD_AUTH_PENDING' })
   return values
 }
 
@@ -974,6 +1026,7 @@ const remoteId = (id) => {
 }
 
 export async function cloudClient(paths, expected = null, io = {}) {
+  const memory = io.memory ?? operationMemory()
   const current = io.active ?? await signedIn(paths)
   if (current.state === 'logged-out') throw new Error('Claude Desktop is signed out')
   if (expected && current.state === 'known' && !sameLogin(expected, current)) throw new Error(`sign Claude Desktop into ${loginLabel(expected)}`)
@@ -991,24 +1044,24 @@ export async function cloudClient(paths, expected = null, io = {}) {
     'anthropic-beta': 'oauth-2025-04-20'
   }
   const raw = async (endpoint, options = {}, org = null) => {
+    memory.check()
     const response = await fetch(`https://claude.ai${endpoint}`, {
       ...options,
       headers: { ...baseHeaders, ...(org ? { 'x-organization-uuid': org } : {}), ...(options.headers ?? {}) },
       redirect: 'error',
       signal: options.signal ?? AbortSignal.timeout(15_000)
     })
-    if (!response.ok) throw new Error(`Claude ${endpoint.split('?')[0]} returned ${response.status}`)
+    if (!response.ok) throw Object.assign(new Error(`Claude ${endpoint.split('?')[0]} returned ${response.status}`), { code: response.status === 401 ? 'CLOUD_AUTH_PENDING' : 'CLOUD_HTTP_ERROR' })
     if (org && endpoint.startsWith('/v1/code/')) {
       const responseOrg = response.headers.get('anthropic-organization-id')
       if (responseOrg !== org) throw new Error('Claude Remote Control organization changed')
     }
     if (response.status === 204) return null
-    const text = await response.text()
-    return text ? JSON.parse(text) : null
+    return memory.read(response)
   }
   const account = await raw('/api/account')
   if (!UUID.test(account?.uuid ?? '')) throw new Error('Claude Desktop account could not be verified')
-  if (selected?.account && account.uuid !== selected.account) throw new Error(expected ? `sign Claude Desktop into ${loginLabel(expected)}` : 'Claude Desktop login is still updating. Try again in a moment.')
+  if (selected?.account && account.uuid !== selected.account) throw Object.assign(new Error(expected && !sameLogin(selected, current) ? `sign Claude Desktop into ${loginLabel(expected)}` : 'Claude Desktop login is still updating. Try again in a moment.'), { code: sameLogin(selected, current) ? 'CLOUD_AUTH_PENDING' : 'CLOUD_ACCOUNT_MISMATCH' })
   const organizations = await raw('/api/organizations')
   const preferredOrg = selected?.org ?? cookies.get('lastActiveOrg')
   const organization = Array.isArray(organizations) ? organizations.find((item) => item.uuid === preferredOrg) : null
@@ -1023,7 +1076,6 @@ export async function cloudClient(paths, expected = null, io = {}) {
   }
   const eventRows = async (id) => {
     const out = []
-    let bytes = 0
     let cursor = null
     let lastSequence = null
     const seen = new Set()
@@ -1033,9 +1085,7 @@ export async function cloudClient(paths, expected = null, io = {}) {
       const body = await request(`/v1/code/sessions/${wireRemoteId(id)}/events?${query}`)
       if (!Array.isArray(body?.data) || body.data.length > 500) throw new Error('Remote Control history response changed')
       const data = body.data
-      if (out.length + data.length > 1_000_000) throw new Error('Remote Control history exceeded 1,000,000 events')
-      bytes += Buffer.byteLength(JSON.stringify(data))
-      if (bytes > 128 * 1024 * 1024) throw new Error('Remote Control history exceeded 128 MiB')
+      if (out.length + data.length > 1_000_000) throw Object.assign(new Error('Remote Control history exceeded 1,000,000 events'), { code: 'CLOUD_HISTORY_LIMIT' })
       if (data.some((event) => !event || typeof event !== 'object' || typeof event.event_type !== 'string' || !event.payload || typeof event.payload !== 'object')) throw new Error('Remote Control event response changed')
       for (const event of data) {
         const sequence = typeof event.sequence_num === 'number' && Number.isSafeInteger(event.sequence_num) && event.sequence_num >= 0
@@ -1050,9 +1100,10 @@ export async function cloudClient(paths, expected = null, io = {}) {
       if (!cursor || seen.has(cursor)) throw new Error('Remote Control history cursor did not advance')
       seen.add(cursor)
     }
-    throw new Error('Remote Control history exceeded 1,000,000 events')
+    throw Object.assign(new Error('Remote Control history exceeded 1,000,000 events'), { code: 'CLOUD_HISTORY_LIMIT' })
   }
   return {
+    memory,
     account: account.uuid,
     org,
     list: async () => {
@@ -1686,7 +1737,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
     return {
       checked: true,
       matches: [],
-      blocked: [{ id: null, title: 'Remote Control', account, error: `cloud check failed: ${error.message}` }],
+      blocked: [{ id: null, title: 'Remote Control', account, error: `cloud check failed: ${error.message}`, code: error.code }],
       later: [],
       client: cloud,
       account: cloud.account,
@@ -1816,8 +1867,9 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       progress(report, 'cloud scan', ++completed, sessions.length)
     }
   }
-  for (let at = 0; at < sessions.length; at += 8) {
-    const batch = await Promise.all(sessions.slice(at, at + 8).map(analyze))
+  for (let at = 0; at < sessions.length;) {
+    const batch = await Promise.all(sessions.slice(at, at + (cloud.memory ?? operationMemory()).parallel()).map(analyze))
+    at += batch.length
     for (const result of batch) {
       if (result.match) matches.push(result.match)
       else if (result.waiting) waiting.push(result.waiting)
@@ -1897,7 +1949,7 @@ function localPlan(pending, to) {
 }
 
 export async function inventory(from, to, paths, report = () => {}, options = {}) {
-  const check = options.check ?? (() => {})
+  const check = () => { options.check?.(); (options.cloud?.memory ?? operationMemory()).check() }
   check()
   const requestedAt = options.requestedAt ?? new Date().toISOString()
   const cloudRequested = options.cloudRequested === true || Boolean(options.cloud)
@@ -3122,7 +3174,15 @@ const remoteOpen = (session) => session?.connection_status === 'connected' || Ar
 const remoteBusy = (session) => session?.connection_status !== 'disconnected' ||
   !Array.isArray(session?.client_presence) || session.client_presence.length > 0 ||
   !REMOTE_IDLE.has(session?.worker_status)
-const remoteStateSha = (rows) => sha(stable(rows.filter((row) => ['user', 'assistant'].includes(row.event_type) || row.event_type.startsWith('control_'))))
+const remoteStateSha = (rows) => {
+  const hash = createHash('sha256').update('[')
+  let separator = ''
+  for (const row of rows) if (['user', 'assistant'].includes(row.event_type) || row.event_type.startsWith('control_')) {
+    hash.update(separator).update(stable(row))
+    separator = ','
+  }
+  return hash.update(']').digest('hex')
+}
 
 function remoteActionsPending(session) {
   const metadata = session.external_metadata
@@ -3439,6 +3499,9 @@ function finishCloudAttempt(receipt, cloud, later = [], waiting = []) {
   const check = receiptCloudCheck(receipt, cloud)
   if (!check) return null
   const failures = receipt.failed.filter((failure) => cloudTagged(failure, cloud))
+  check.attemptEngine = artifactEngine()
+  if (failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING')) check.authRetries = (check.authRetries ?? 0) + 1
+  else delete check.authRetries
   check.waiting = [...new Map([...(check.waiting ?? []), ...waiting].map(row => [row.id, row])).values()]
   check.status = failures.length ? failures.every(row => row.blockedByLocal?.length) && !check.waiting.length ? 'blocked-local' : 'failed' : check.waiting.length ? 'waiting' : 'complete'
   check.checkedAt = new Date().toISOString()
@@ -3585,6 +3648,14 @@ const cloudScope = (supplied, source) => !supplied || typeof supplied === 'funct
 const cloudAttemptAt = (receipt, source) => {
   const key = `${source.account}/${source.org}`, at = receipt.cloudAttempts?.[key] ?? (receipt.automaticCloudAttempt?.key === key ? receipt.automaticCloudAttempt.at : 0)
   return Number.isFinite(at) && at >= 0 ? at : 0
+}
+const historyLimited = source => source?.failures?.length && source.failures.every(row => row.code === 'CLOUD_HISTORY_LIMIT') && source.attemptEngine === artifactEngine()
+const cloudRetryAt = (receipt, source, active, now = Date.now()) => {
+  if (historyLimited(source)) return null
+  const last = cloudAttemptAt(receipt, source)
+  const auth = source.failures?.length && source.failures.every(row => row.code === 'CLOUD_AUTH_PENDING')
+  if (!last || last > now || auth && sameLogin(source, active) && active?.at && source.loginAt !== active.at) return now
+  return last + (auth && (source.authRetries ?? 0) <= 2 ? 15_000 : 60_000)
 }
 
 async function sourceCloud(paths, source, supplied) {
@@ -3966,13 +4037,15 @@ export function finishPending(paths, options = {}) {
     const eligible = outstanding.filter(source => sameLogin(source, active) && cloudScope(options.cloud, source))
     const check = eligible.filter(source => !options.automatic ||
       (typeof options.automatic !== 'object' || sameAccount(source, options.automatic)) &&
-      (now - cloudAttemptAt(receipt, source) >= 60_000 || cloudAttemptAt(receipt, source) > now) &&
+      cloudRetryAt(receipt, source, active, now) !== null && now >= cloudRetryAt(receipt, source, active, now) &&
       !canRestartWaiting({ cloudChecks: [source] }, table)).sort((a, b) => cloudAttemptAt(receipt, a) - cloudAttemptAt(receipt, b))[0]
     if (!check) {
       if (options.automatic || eligible.length || outstanding.some(source => sameLogin(source, active))) return { pending: true, ok: true, complete: false }
       throw new Error(`sign Claude Desktop into ${[...new Set(outstanding.map(loginLabel))].join(' or ')}`)
     }
     const report = (stage, text, extra = {}) => options.report?.(stage, text, { ...sourceProgress(check), ...extra })
+    if (active.at && check.loginAt !== active.at) check.authRetries = 0
+    check.loginAt = active.at ?? null
     receipt.cloudAttempts = { ...receipt.cloudAttempts, [`${check.account}/${check.org}`]: now }
     clearCloudAttempt(receipt, check)
     await saveJson(file, receipt)
@@ -4245,7 +4318,7 @@ export function executeMove(from, to, paths, options = {}) {
         const active = options.cloud ?? await signedIn(paths)
         const proposal = { version: 1, ...plan, kind, resume: Boolean(existing), receiptFile, finishAccount: options.finishAccount ?? null, selection: chosen, requestedAt, createdAt: new Date().toISOString(), nonce: randomUUID(),
           deferredCloudSources: options.cloudRequested ? chosen?.from.filter((source) => (!active.account || source.account === active.account) && (!active.org || source.org === active.org)).map(accountRef) ?? [] : [] }
-        if (initial) proposal.capacity = restartCapacity(initial.inv, plan, preparationMs, (options.io?.budget ?? RESTART_BUDGET) - (options.io?.reserve ?? REOPEN_RESERVE))
+        if (initial) proposal.capacity = restartCapacity(initial.inv, plan, preparationMs, restartMoveBudget(options.io?.budget, options.io?.reserve))
         proposal.token = sha(stable(proposal))
         await saveJson(planFile, proposal)
         return { plan: proposal, ok: proposal.capacity?.fits !== false, code: proposal.capacity?.code ?? undefined }
@@ -4281,7 +4354,7 @@ export function executeMove(from, to, paths, options = {}) {
         }
       }
       const budget = (options.io?.budget ?? RESTART_BUDGET) - (now() - approvedAt)
-      const capacity = plan.capacity?.fits === false ? plan.capacity : initial ? restartCapacity(initial.inv, pendingPlan, preparationMs, budget - (options.io?.reserve ?? REOPEN_RESERVE), sample) : null
+      const capacity = plan.capacity?.fits === false ? plan.capacity : initial ? restartCapacity(initial.inv, pendingPlan, preparationMs, restartMoveBudget(budget, options.io?.reserve), sample) : null
       if (budget <= (options.io?.reserve ?? REOPEN_RESERVE) || capacity?.fits === false) return { ...prepared, ok: false, capacity, code: 'RESTART_CAPACITY', reason: 'The remaining move is not expected to fit this restart budget. Claude was left running.' }
       const restarted = await withDesktopRestart({ ...pendingPlan, receiptFile: existing?.file ?? plan.receiptFile }, paths, async (context) => {
         await unlink(planFile)
@@ -4691,7 +4764,7 @@ async function menubar(paths, remove, snapshot) {
   }
   const script = path.join(app, 'Contents/Resources/transplant.js')
   await copyFile(path.join(HERE, 'transplant.js'), script)
-  const config = jsonText({ node: process.execPath, script })
+  const config = jsonText({ node: process.execPath, script, nodeArgs: [`--max-old-space-size=${Math.max(64, Math.floor(os.totalmem() * 0.2 * 0.65 / 1024 / 1024))}`] })
   await writeFile(path.join(paths.state, 'menubar.json'), config)
   await writeFile(path.join(app, 'Contents/Resources/menubar.json'), config)
   stop()
@@ -4968,6 +5041,7 @@ async function main(argv) {
         return null
       })
       const table = deferred ? processTable(paths.claudeApp) : []
+      const identity = deferred ? await signedIn(paths, table) : null
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
       return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
@@ -4978,7 +5052,7 @@ async function main(argv) {
         const current = all.find(row => row.active), scheduler = table.some(row => desktopExecutable(row.executable)) &&
           (!current || [source, deferred?.receipt.toAccount].some(row => sameAccount(row, current))) &&
           (deferred?.receipt.held ?? []).some(row => row.release !== 'worker')
-        const presentation = pendingPresentation(deferred?.receipt ?? {}, source, { active, signedIn }, deferred?.mode, table, scheduler, timeouts)
+        const presentation = pendingPresentation(deferred?.receipt ?? {}, source, { active, signedIn }, deferred?.mode, table, scheduler, timeouts, identity)
         return {
           account,
           org,

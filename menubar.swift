@@ -25,6 +25,7 @@ struct Account: Decodable, Identifiable {
     var pendingState: String? = nil
     var pendingCount: Int? = nil
     var pendingAutomatic: Bool? = nil
+    var pendingRetryAt: Double? = nil
     var pendingOpenCount: Int? = nil
     var pendingIdleSeconds: Int? = nil
     var pendingPartial: Bool? = nil
@@ -39,6 +40,8 @@ struct Account: Decodable, Identifiable {
 struct Config: Decodable {
     let node: String
     let script: String
+    var nodeArgs: [String]? = nil
+    func arguments(_ args: [String]) -> [String] { (nodeArgs ?? []) + [script] + args }
 }
 
 struct Failure: Decodable {
@@ -368,7 +371,7 @@ final class Model: ObservableObject {
         let file = Bundle.main.url(forResource: "menubar", withExtension: "json") ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
         config = supplied ?? (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
         if snapshot {
-            guard let config, let text = Model.capture(node(config.node), [config.script, "accounts", "--json"]), let decoded = try? JSONDecoder().decode([Account].self, from: Data(text.utf8)) else { snapshotFailed = true; return }
+            guard let config, let text = Model.capture(node(config.node), config.arguments(["accounts", "--json"])), let decoded = try? JSONDecoder().decode([Account].self, from: Data(text.utf8)) else { snapshotFailed = true; return }
             accounts = decoded
             settle()
             return
@@ -420,10 +423,11 @@ final class Model: ObservableObject {
         return "Finish the move"
     }
     var ready: Bool { canMutate && pendingAccounts.isEmpty && !from.isEmpty && to != nil && (config != nil || demo) }
+    private var pendingMoved: Int { max(sourceActivity?.moved ?? 0, receiptSummaries.isEmpty ? pendingAccounts.compactMap(\.receiptMoved).max() ?? 0 : receiptSummaries.reduce(0) { $0 + $1.moved }) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty || receiptSummaries.contains(where: { !$0.notMoved.isEmpty }) else { return "" }
         if pendingAccounts.contains(where: { $0.pending == "recovery" }) { return "The last move was interrupted." }
-        let moved = receiptSummaries.isEmpty ? pendingAccounts.compactMap(\.receiptMoved).max() ?? 0 : receiptSummaries.reduce(0) { $0 + $1.moved }
+        let moved = pendingMoved
         let notMoved = receiptSummaries.reduce(0) { $0 + $1.notMoved.count }
         let parts = pendingAccounts.map(pendingText)
         let prefix = moved > 0 && !pendingAccounts.contains(where: { $0.pending == "undo" }) ? "\(moved) moved. " : ""
@@ -436,15 +440,20 @@ final class Model: ObservableObject {
         let copies = count.map { quantity($0, "old copy", "old copies") } ?? "Old copies"
         let conversations = count.map { quantity($0, "conversation", "conversations") } ?? "Conversations"
         let signInText = "Sign Claude in as \(account.email ?? account.label)"
+        let seconds = account.pendingRetryAt.map { max(0, Int(ceil($0 / 1000 - Date().timeIntervalSince1970))) }
+        let retry = seconds.map { $0 > 0 ? " Retrying in \($0)s." : " Checking again shortly." } ?? " The check will retry automatically."
         if account.pending == "undo" {
             let status = account.pendingPartial == true ? "Undo is partly done." : "Undo is waiting."
             return status + (account.pendingAction == "finish" ? " Press Finish undo." : " \(signInText), then press Finish undo.")
         }
         switch account.pendingState {
+        case "login": return account.signedIn == true ? "Waiting for Claude to finish signing in." + retry : signInText + " to continue."
+        case "memory": return "Waiting for memory to verify source history." + retry
+        case "limit": return "\(conversations) \(count == 1 ? "exceeds" : "exceed") the history limit and \(count == 1 ? "remains" : "remain") in \(account.label)."
         case "unsupported": return "\(conversations) \(count == 1 ? "stays" : "stay") in \(account.label) because \(count == 1 ? "it has" : "they have") attachments that can't be copied to this Mac."
         case "worker": return "Waiting for local Claude work to stop before checking \(copies.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? "" : " \(signInText) to continue.")
         case "external": return "Waiting for external Claude sessions to stop before moving \(amount.lowercased()) remaining sessions."
-        case "waiting": return "Waiting to verify \(conversations.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? " The check will retry automatically." : " \(signInText) and the check will retry automatically.")
+        case "waiting": return "Waiting to verify \(conversations.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? retry : " \(signInText) and the check will retry automatically.")
         case "cloud-open": return "\(copies) in \(account.label) \(count == 1 ? "is" : "are") still connected. Cleanup waits for \(count == 1 ? "it" : "them") to disconnect." + (account.signedIn == true ? "" : " \(signInText) to continue.")
         case "open" where account.pendingAutomatic == true:
             if let seconds = account.pendingIdleSeconds, seconds > 0 {
@@ -456,7 +465,7 @@ final class Model: ObservableObject {
         case "held", "open": return account.pendingAction == "finish" ? "\(amount) remaining \(count == 1 ? "session is" : "sessions are") ready to move." : count.map { "\($0) more \($0 == 1 ? "needs" : "need") Claude to restart." } ?? "The remaining sessions need Claude to restart."
         default:
             let status = count == nil ? "Source history in \(account.label) still needs checking." : "\(copies) \(count == 1 ? "needs" : "need") checking in \(account.label)".punctuated
-            return status + (account.signedIn == true ? " Cleanup will retry automatically." : " \(signInText) and cleanup will retry automatically.")
+            return status + (account.signedIn == true ? account.pendingRetryAt == nil ? " Cleanup will retry automatically." : retry : " \(signInText) and cleanup will retry automatically.")
         }
     }
     var primaryTitle: String? {
@@ -476,10 +485,10 @@ final class Model: ObservableObject {
         else { move() }
     }
     var scopedChecks: [String] {
-        let eligible = pendingAccounts.filter { ($0.pendingCount ?? 0) > 0 && ($0.pendingState == "unsupported" || $0.pending == "cloud" && $0.pendingState == "cleanup" && $0.signedIn == false) }
+        let eligible = pendingAccounts.filter { ($0.pendingCount ?? 0) > 0 && (["unsupported", "limit"].contains($0.pendingState ?? "") || $0.pending == "cloud" && $0.pendingState == "cleanup" && $0.signedIn == false) }
         return eligible.compactMap(\.pendingCancel)
     }
-    var stopTitle: String { !scopedChecks.isEmpty ? pendingAccounts.filter { scopedChecks.contains($0.pendingCancel ?? "") }.allSatisfy { $0.pendingState == "unsupported" } ? "Got it" : "Leave them" : "Stop here" }
+    var stopTitle: String { !scopedChecks.isEmpty ? pendingAccounts.filter { scopedChecks.contains($0.pendingCancel ?? "") }.allSatisfy { ["unsupported", "limit"].contains($0.pendingState ?? "") } ? "Got it" : "Leave them" : "Stop here" }
     func stopHere() {
         guard canKeepLocal else { return }
         if stopTitle != "Stop here" { start(["keep-local", "--json"] + scopedChecks.flatMap { ["--leave-check", $0] }) }
@@ -489,7 +498,8 @@ final class Model: ObservableObject {
         if let event = sourceActivity, event.sourceId == account.id { return (event.activity ?? event.stage) == "cloud" ? "clearing" : (event.activity ?? event.stage) == "rescue" ? "bringing over" : "checking" }
         if account.kept == true { return "kept" }
         guard account.pending != nil else { return nil }
-        if account.pendingState == "unsupported" { return "kept" }
+        if ["unsupported", "limit"].contains(account.pendingState ?? "") { return "kept" }
+        if account.pendingState == "login", account.signedIn == true { return "signing in" }
         if account.pendingState == "open" && account.pendingAutomatic == true { return "waiting" }
         if account.pendingAction == "restart" { return "restart needed" }
         if account.pendingAction == "sign-in" { return "sign in needed" }
@@ -505,6 +515,17 @@ final class Model: ObservableObject {
         }
     }
     var displaySummary: String { recoveryProblem != nil ? "Paused: the last move's record needs repair." : running ? progressLabel : sourceActivity.flatMap(sourceProgressText) ?? (note.isEmpty ? pendingPrompt : note) }
+    var statusDetail: String? {
+        guard !running, recoveryProblem == nil, !undoPending, !stopped, !reviewRestart, !capacityRecovery, !capacityBlocked,
+              note.isEmpty || note == pendingPrompt || sourceActivity != nil else { return nil }
+        guard let account = pendingAccounts.first(where: { ["restart", "finish"].contains($0.pendingAction ?? "") }) ?? activePendingAccount ?? pendingAccounts.first else { return nil }
+        if let event = sourceActivity, let text = sourceProgressText(event) {
+            let prefix = "\(event.moved ?? 0) moved. "
+            return text.hasPrefix(prefix) ? String(text.dropFirst(prefix.count)) : text
+        }
+        return pendingText(account)
+    }
+    var statusHeadline: String { statusDetail == nil ? displaySummary : pendingMoved > 0 ? quantity(pendingMoved, "session moved", "sessions moved") : "No sessions moved yet" }
     var visibleCompletion: (summary: String, detail: String)? {
         canMutate && completion?.summary == note ? completion : nil
     }
@@ -805,6 +826,7 @@ final class Model: ObservableObject {
 
     private func updateSourceActivity(_ event: Event) {
         sourceActivity = event.live == true && event.preparatory != true && event.sourceId != nil && (event.completed ?? 0) < (event.total ?? 0) ? event : nil
+        if sourceActivity != nil { lines = lines.map { ($0.0 == "background" ? "previous check" : $0.0, $0.1) } }
     }
 
     private func sourceProgressText(_ event: Event) -> String? {
@@ -946,6 +968,7 @@ final class Model: ObservableObject {
             if result?.code == "LOCK_BUSY" { return }
             let problem = result?.error.flatMap { $0.isEmpty ? nil : $0 } ?? (status != 0 || result?.ok != true ? (error.isEmpty ? "Background check did not complete" : error) : nil)
             let clean = problem == nil && result?.issues == 0
+            if clean, result?.complete == true { lines.removeAll { ["background", "previous check"].contains($0.0) } }
             if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish && result?.complete == true && pendingAccounts.isEmpty && (result?.changed ?? []).isEmpty, let sweepNote, note == sweepNote {
                 note = ""
                 symbol = "arrow.left.arrow.right"
@@ -954,9 +977,9 @@ final class Model: ObservableObject {
             if result != nil { lines.removeAll { $0.0 == "metadata" } }
             let previousNote = note
             if let problem {
-                lines.removeAll { $0.0 == "background" }
+                lines.removeAll { ["background", "previous check"].contains($0.0) }
                 lines.append(("background", problem))
-                note = pendingAccounts.contains(where: { $0.pendingState == "waiting" }) ? "" : "The remaining work needs attention"
+                note = pendingAccounts.contains(where: { ["waiting", "login", "memory"].contains($0.pendingState ?? "") }) ? "" : "The remaining work needs attention"
                 symbol = "exclamationmark.triangle"
                 if result?.code == "REOPEN_FAILED" {
                     failedFinish = result?.receipt ?? failedFinish ?? pendingAccounts.first?.receipt
@@ -1083,7 +1106,7 @@ final class Model: ObservableObject {
         guard let config else { done(1, "Menubar configuration is missing, run npx claude-transplant menubar"); return }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: node(config.node))
-        process.arguments = [config.script] + args
+        process.arguments = config.arguments(args)
         let pipe = Pipe()
         let errorURL = FileManager.default.temporaryDirectory.appendingPathComponent("claude-transplant-\(UUID().uuidString).err")
         FileManager.default.createFile(atPath: errorURL.path, contents: nil)
@@ -1331,7 +1354,10 @@ struct Panel: View {
                 CompletionNotice(summary: completion.summary, detail: completion.detail)
                     .padding(.vertical, 2).transition(.opacity)
             } else if !model.displaySummary.isEmpty {
-                Text(model.displaySummary.sentence).font(.callout.weight(.medium))
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.statusHeadline.sentence).font(.callout.weight(.medium))
+                    if let detail = model.statusDetail { Text(detail).font(.callout).foregroundStyle(.secondary) }
+                }.fixedSize(horizontal: false, vertical: true)
             }
             if let text = model.companionText { Text(text).font(.caption).foregroundStyle(.secondary).lineLimit(2).help(text) }
             if !model.detailLines.isEmpty {

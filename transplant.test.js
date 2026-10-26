@@ -10,7 +10,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, move, normalize, parseProcesses, pendingPresentation, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, move, normalize, parseProcesses, pendingPresentation, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -357,7 +357,7 @@ test('new workers invalidate the reviewed restart scope before any quit', async 
   assert.match(result.error, /sessions changed/)
 })
 
-test('a slow shutdown uses only its mutation budget and leaves held files untouched', async () => {
+test('a slow shutdown uses only its shutdown budget and leaves held files untouched', async () => {
   const h = await home()
   const rows = desktopFixture()
   const plan = await restartPlan(null, h.paths, rows)
@@ -367,8 +367,31 @@ test('a slow shutdown uses only its mutation budget and leaves held files untouc
     wait: async (ms) => { time += ms }, command: async () => ({ status: 0 })
   })
   assert.equal(moved, false)
-  assert.equal(time, 800)
+  assert.equal(time, 400)
   assert.equal(result.restart.outcome, 'quit-not-confirmed')
+})
+
+test('a twenty-second shutdown preserves the full move phase inside one minute', async () => {
+  const h = await home()
+  let rows = desktopFixture(), time = 0
+  const plan = await restartPlan(null, h.paths, rows), calls = []
+  const result = await withDesktopRestart(plan, h.paths, async ({ check }) => {
+    time += 21_999
+    check(true)
+    return { ok: true }
+  }, () => {}, {
+    now: () => time, inspect: () => rows,
+    command: async (file, args, timeout) => {
+      calls.push({ file, timeout })
+      time += file.endsWith('osascript') ? 20_000 : 7_999
+      rows = file.endsWith('osascript') ? [] : [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'new' }]
+      return { status: 0 }
+    }
+  })
+  assert.equal(result.ok, true, result.error)
+  assert.equal(time, 49_998)
+  assert.equal(calls[0].timeout, 30_000)
+  assert.equal(calls[1].timeout, 8_000)
 })
 
 test('recovery reopens an interrupted approved restart without requesting another shutdown', async () => {
@@ -1998,7 +2021,7 @@ test('cloud identity retains verified cookie fallback for unknown Desktop state 
 })
 
 test('cloud history reads past 10000 events and refuses incomplete or oversized pagination', async t => {
-  for (const scenario of ['large', 'full last page', 'exact event limit', 'repeated cursor', 'repeated sequence', 'oversized page', 'event limit', 'byte limit']) await t.test(scenario, async t => {
+  for (const scenario of ['large', 'full last page', 'exact event limit', 'repeated cursor', 'repeated sequence', 'oversized page', 'event limit', 'memory pressure']) await t.test(scenario, async t => {
     const h = await home(), limit = scenario === 'exact event limit' ? 1_000_000 : scenario === 'full last page' ? 10000 : 10501
     let pages = 0
     t.mock.method(globalThis, 'fetch', async url => {
@@ -2010,13 +2033,14 @@ test('cloud history reads past 10000 events and refuses incomplete or oversized 
       assert.equal(request.searchParams.get('sort_order'), 'asc')
       const start = pages++ * 500
       if (pages > 1) assert.equal(request.searchParams.get('cursor'), scenario === 'repeated cursor' ? 'same' : String(start))
-      const length = scenario === 'oversized page' ? 501 : scenario === 'event limit' || scenario === 'byte limit' ? 500 : Math.min(500, limit - start)
-      const payload = scenario === 'byte limit' ? { content: 'x'.repeat(280000) } : {}
+      const length = scenario === 'oversized page' ? 501 : scenario === 'event limit' || scenario === 'memory pressure' ? 500 : Math.min(500, limit - start)
+      const payload = scenario === 'memory pressure' ? { content: 'x'.repeat(2000) } : {}
       return Response.json({ data: Array.from({ length }, (_, i) => ({ event_type: 'user', sequence_num: scenario === 'repeated sequence' ? i : start + i, payload })),
         resume_cursor: scenario === 'repeated cursor' ? 'same' : String(start + length) }, { headers: { 'anthropic-organization-id': h.org.P } })
     })
-    const cloud = await cloudClient(h.paths, null, { active: { state: 'known', account: h.acct.P, org: h.org.P }, cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' })
-    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 1,000,000 events/, 'byte limit': /exceeded 128 MiB/ }[scenario]
+    const memory = scenario === 'memory pressure' ? memoryBudget({ total: 10 * 1024 * 1024, heap: 2 ** 30, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 2 ** 30 }) : undefined
+    const cloud = await cloudClient(h.paths, null, { active: { state: 'known', account: h.acct.P, org: h.org.P }, cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture', memory })
+    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 1,000,000 events/, 'memory pressure': /Waiting for memory/ }[scenario]
     if (error) await assert.rejects(cloud.eventRows('cse_large'), error)
     else {
       const rows = await cloud.eventRows('cse_large')
@@ -2025,8 +2049,48 @@ test('cloud history reads past 10000 events and refuses incomplete or oversized 
       assert.equal(pages, Math.floor(limit / 500) + 1)
     }
     if (scenario === 'event limit') assert.equal(pages, 2001)
-    if (scenario === 'byte limit' || scenario === 'oversized page') assert.equal(pages, 1)
+    if (scenario === 'memory pressure' || scenario === 'oversized page') assert.equal(pages, 1)
   })
+})
+
+test('operation memory scales to RAM and reduces concurrency before its ceiling', () => {
+  for (const gib of [16, 48]) {
+    let rss = 0, heapUsed = 0, available = 8 * 2 ** 30
+    const budget = memoryBudget({ total: gib * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss, heapUsed }), available: () => available })
+    assert.equal(budget.limit, Math.floor(gib * 2 ** 30 * 0.2))
+    assert.equal(budget.parallel(), 8)
+    rss = budget.limit * 0.6
+    assert.equal(budget.parallel(), 2)
+    rss = budget.limit * 0.8
+    assert.equal(budget.parallel(), 1)
+    rss = budget.limit
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    rss = 0; heapUsed = 4 * 2 ** 30
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    heapUsed = 0; available = 0
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    available = 2 ** 30
+    assert.doesNotThrow(() => budget.check())
+  }
+})
+
+test('concurrent cloud bodies share reservations and return them after refusal', async () => {
+  const budget = memoryBudget({ total: 10000, heap: 10000, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 10000 })
+  let started, resume
+  const ready = new Promise(resolve => { started = resolve }), paused = new Promise(resolve => { resume = resolve })
+  const first = budget.read({ body: (async function* () {
+    yield Buffer.from('"' + 'x'.repeat(150))
+    started()
+    await paused
+    yield Buffer.from('"')
+  })() })
+  await ready
+  await assert.rejects(budget.read(Response.json('x'.repeat(300))), { code: 'CLOUD_MEMORY_PRESSURE' })
+  resume()
+  assert.equal(await first, 'x'.repeat(150))
+  assert.equal(await budget.read(Response.json('x'.repeat(300))), 'x'.repeat(300))
+  await assert.rejects(budget.read(new Response('{bad')), SyntaxError)
+  assert.deepEqual(await budget.read(Response.json({ recovered: true })), { recovered: true })
 })
 
 async function home() {
@@ -2216,6 +2280,55 @@ test('source cooldowns retain legacy backoff without starving another organizati
   assert.equal(manual.complete, true)
   assert.equal(f.rows[0].status, 'archived')
   assert.equal(f.rows[2].status, 'active')
+})
+
+test('login updates retry promptly, use brief backoff and then return to normal pacing', async t => {
+  const f = await pendingOrganizations({ orgs: ['P'] })
+  let now = Date.now(), attempts = 0, ready = false
+  t.mock.method(Date, 'now', () => now)
+  const active = { account: f.h.acct.P, org: f.h.org.P, state: 'known', at: new Date(now - 1000).toISOString() }
+  const options = { ...f.options, active, cloud: source => {
+    attempts++
+    if (!ready) throw Object.assign(new Error('Claude Desktop login is still updating'), { code: 'CLOUD_AUTH_PENDING' })
+    return f.client(source)
+  } }
+  const first = await sweep(f.h.paths, options)
+  const source = first.result.receipt.cloudChecks[0]
+  assert.equal(pendingPresentation(first.result.receipt, source, { signedIn: true }, 'cloud', [], false, new Map(), active).pendingRetryAt, now + 15000)
+  for (const [elapsed, expected] of [[0, 1], [14999, 1], [1, 2], [15000, 3], [59000, 3]]) {
+    now += elapsed
+    await sweep(f.h.paths, options)
+    assert.equal(attempts, expected)
+  }
+  active.at = new Date(now).toISOString()
+  await sweep(f.h.paths, options)
+  assert.equal(attempts, 4)
+  ready = true
+  now += 15000
+  const complete = await sweep(f.h.paths, options)
+  assert.equal(complete.result.complete, true)
+  assert.equal(complete.result.receipt.failed.length, 0)
+  assert.equal(attempts, 5)
+})
+
+test('unchanged event-limit refusals do not redownload and a new engine can retry them', async t => {
+  const f = await pendingOrganizations({ orgs: ['P'] })
+  let now = Date.now(), attempts = 0
+  t.mock.method(Date, 'now', () => now)
+  const options = { ...f.options, cloud: () => { attempts++; throw Object.assign(new Error('history exceeds the event limit'), { code: 'CLOUD_HISTORY_LIMIT' }) } }
+  const first = await sweep(f.h.paths, options), receipt = first.result.receipt, source = receipt.cloudChecks[0]
+  const presentation = pendingPresentation(receipt, source, { signedIn: true }, 'cloud')
+  assert.equal(presentation.pendingState, 'limit')
+  assert.equal(presentation.pendingAutomatic, false)
+  assert.equal(presentation.pendingRetryAt, null)
+  now += 120000
+  assert.equal((await sweep(f.h.paths, options)).pending, true)
+  assert.equal(attempts, 1)
+  source.attemptEngine = 'previous-engine'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const complete = await sweep(f.h.paths, f.options)
+  assert.equal(complete.result.complete, true)
+  assert.equal(f.rows[0].status, 'archived')
 })
 
 test('pending cleanup refuses wrong scoped clients and defers cross-login sources without calls', async () => {
@@ -6202,7 +6315,7 @@ test('task workers and changed restart inventories never authorize an external s
 })
 
 test('task restart capacity stops before quit and preserves held families after completed ordinary work', async () => {
-  for (const elapsed of [6000, 23000]) {
+  for (const elapsed of [8000, 53000]) {
     const h = await taskFamilyFixture(), { from, to } = await h.selection()
     const mock = taskHarness(), { io } = mock
     const planned = await executeMove([from], to, h.paths, { io })
@@ -6224,7 +6337,7 @@ test('task restart capacity stops before quit and preserves held families after 
     assert.equal(result.capacity.fits, false)
     assert.equal(result.code, 'RESTART_CAPACITY')
     assert.equal(result.capacity.code, result.code)
-    if (elapsed === 6000) {
+    if (elapsed === 8000) {
       assert.equal(result.capacity.sample.elapsedMs, elapsed)
       assert.equal(result.capacity.sample.records, 1)
       assert.ok(result.capacity.estimatedMs > result.capacity.availableMs)
@@ -6464,13 +6577,13 @@ test('CLI pre-quit expiry preserves committed counts and exposes unfinished reco
         const result = await rename(...args)
         if (${JSON.stringify(stage)} === 'completed' && args[1].startsWith(${JSON.stringify(h.paths.state + '/')}) && /\\/\\d[^/]*\\.json$/.test(args[1])) {
           const receipt = JSON.parse(await fs.readFile(args[1]))
-          if (receipt.finalizing === false && receipt.sessions.length === 1) time = 23000
+          if (receipt.finalizing === false && receipt.sessions.length === 1) time = 53000
         }
         return result
       }
       fs.link = async (...args) => {
         const result = await link(...args)
-        if (${JSON.stringify(stage)} === 'placement' && args[1] === ${JSON.stringify(path.join(h.dir('T'), `local_${h.cold}.json`))}) time = 23000
+        if (${JSON.stringify(stage)} === 'placement' && args[1] === ${JSON.stringify(path.join(h.dir('T'), `local_${h.cold}.json`))}) time = 53000
         return result
       }
     `
@@ -8860,12 +8973,13 @@ function wordingFixtures() {
     const rows = structuredClone(base).map((row, index) => ({ ...row, active: index === activeIndex, signedIn: row.account === base[activeIndex].account })), account = rows[index], source = { account: account.account, org: account.org, sessionIds: Array.from({ length: count }, (_, i) => `session_${i}`) }
     if (code === 'CLOUD_RESCUE_WORKER') source.waiting = source.sessionIds.map(session => ({ id: session, title: 'Research conversation', code, localId: SOURCE, recordId: `local_${id(99)}` }))
     else if (code) source.failures = source.sessionIds.map(id => ({ id, title: 'Research conversation', code, error: code }))
+    if (code === 'CLOUD_HISTORY_LIMIT') source.attemptEngine = createHash('sha256').update(readFileSync(path.join(here, 'transplant.js'))).digest('hex')
     const held = mode === 'local' ? Array.from({ length: count }, (_, i) => ({ id: id(i + 1), recordId: `local_${id(i + 1)}`, release, title: `Open chat ${i + 1}`, sources: [{ ...source, file: `/synthetic/${i}.json` }] })) : []
     const receipt = { held, remote: mode === 'undo' ? [{ id: 'cse_0' }, { id: 'cse_1' }] : [], remoteUndoing: mode === 'undo' ? [{ ...source, id: 'cse_1' }] : [] }
     const table = release === 'worker' ? [desktopFixture()[0], ...held.map((row, index) => ({ ...desktopFixture()[1], pid: 501 + index, ids: [row.id] }))] : desktopFixture()
     Object.assign(account, { pending: mode, pendingFailures: source.failures ?? [], pendingWaiting: source.waiting ?? [], receipt: 'synthetic-receipt', receiptMoved: mode === 'local' ? 359 : 361,
       receiptDestination: index === 0 ? 'work/personal' : 'work/company', pendingCancel: mode === 'cloud' ? String(index + 1).repeat(64) : null,
-      ...pendingPresentation(receipt, source, account, mode, table, release === 'scheduler', new Map(held.map(row => [row.recordId, seconds]))) })
+      ...pendingPresentation(receipt, source, account, mode, table, release === 'scheduler', new Map(held.map(row => [row.recordId, seconds]))), pendingRetryAt: null })
     return rows
   }
   const plan = { plan: true, kind: 'move', token: 'a'.repeat(64), heldCount: 102, remainingCount: 102, moved: 259,
@@ -8928,7 +9042,10 @@ function wordingFixtures() {
     { name: '40-capacity-suppressed-warning', dialog: true, suppressed: true, plan: capacityPlan, event: capacityPlan, contains: ['not expected to fit the restart time limit', 'Claude will stay running.'], primary: null },
     { name: '41-pre-quit-expiry', accounts: held, event: expired, contains: ['259 moved.', 'Claude stayed running.', 'restart time limit was reached before shutdown.', '102 sessions remain pending.'], primary: null },
     { name: '42-pre-quit-recovery', accounts: held, event: { ...expired, recoveryRequired: true }, contains: ['259 moved.', 'Claude stayed running.', 'Unfinished work needs recovery.'], primary: 'Finish the move' },
-    { name: '43-partial-quit-veto', accounts: held, event: { done: true, ok: false, complete: false, receipt: 'synthetic-receipt', moved: 259, heldCount: 102, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['259 moved. Move stopped:', 'Claude did not confirm it had closed.'], primary: 'Try again' }
+    { name: '43-partial-quit-veto', accounts: held, event: { done: true, ok: false, complete: false, receipt: 'synthetic-receipt', moved: 259, heldCount: 102, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['259 moved. Move stopped:', 'Claude did not confirm it had closed.'], primary: 'Try again' },
+    { name: '44-login-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for Claude to finish signing in.', 'Retrying in'], primary: null },
+    { name: '45-memory-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_MEMORY_PRESSURE').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for memory', 'Retrying in'], primary: null },
+    { name: '46-history-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_LIMIT'), contains: ['exceeds the history limit'], primary: null, stop: 'Got it' }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
@@ -9045,6 +9162,10 @@ struct WordingChecks {
                 }
                 model.detailsExpanded = fixture.expanded == true
                 text = model.displaySummary
+                if ["44-login-retry", "45-memory-retry", "46-history-limit"].contains(fixture.name) {
+                    precondition(model.statusHeadline == "361 sessions moved")
+                    precondition(model.statusDetail != nil && !model.statusDetail!.contains("361 moved"))
+                }
                 if let companion = model.companionText { text += "\n" + companion }
                 primary = model.primaryTitle
                 if let expected = fixture.stop { precondition(model.stopTitle == expected, fixture.name) }
@@ -9433,8 +9554,15 @@ struct StateChecks {
         sweepReply(repeated, repeatError)
         precondition(repeated.note == "The remaining work needs attention")
         precondition(repeated.lines.filter { $0.0 == "background" }.count == 1)
-        sweepReply(repeated, cleanSweep)
+        let retryIndex = requests.count
+        repeated.checkSweep()
+        requests[retryIndex].1(#"{"stage":"cloud scan","live":true,"completed":0,"total":1,"sourceId":"fixture","sourceLabel":"Fixture"}"#)
+        precondition(repeated.lines.filter { $0.0 == "previous check" }.count == 1)
+        precondition(repeated.lines.allSatisfy { $0.0 != "background" })
+        requests[retryIndex].1(cleanSweep)
+        requests[retryIndex].2(0, "")
         precondition(repeated.note.isEmpty)
+        precondition(repeated.lines.allSatisfy { !["background", "previous check"].contains($0.0) })
         sweepReply(recovering, #"{"swept":true,"ok":false,"error":"Could not check source","receipt":"receipt-one"}"#)
         precondition(recovering.note == "The remaining work needs attention")
         sweepReply(recovering, cleanSweep)

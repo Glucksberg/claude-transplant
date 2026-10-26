@@ -192,7 +192,7 @@ Restarts:
 
 - When an operation needs Desktop to close, the engine emits a plan first. The menubar warns which Code workers, windows, Chat, Cowork, and background commands will close.
 - Restart and move approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or both source and target account/organization pairs to be known inactive. An active or unknown scheduler requires this plan even without a worker. Other cold moves show no dialog.
-- An approved restart moves eligible records before quitting Desktop, then waits for Desktop and its descendants to exit, moves held task families together, and reopens Desktop. 30 second budget, graceful quit, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
+- An approved restart moves eligible records before quitting Desktop, then waits for Desktop and its descendants to exit, moves held task families together, and reopens Desktop. The 60s budget reserves separate phases of up to 30s for shutdown, 22s for moving and 8s for reopening. Graceful quit, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
 - Background retries never start a new shutdown.
 - Private, bounded `restart-events.jsonl` logs retain attempt outcomes without prompts or raw errors. Diagnostics never rewrite unfinished receipts or their journals, or recreate discarded receipts. Completed recovery folds matching outcomes into an existing receipt's `restartHistory` once, preserving `receipt.restart`.
 
@@ -205,6 +205,7 @@ Remote Control (`--cloud`):
 - Supplemental reads share 512 MiB per operation, with a 16 MiB relevant-line parse limit. Time hints only prioritize files. Incomplete, unreadable or budget-limited checks remain uncertain and cannot authorize rescue. A complete check that establishes missing history can use the existing guarded rescue path.
 - Supplemental reads run one candidate at a time while remote fetching stays concurrent. Candidates deferred by earlier reads receive priority on a later pass. Only failures measured against the full byte allowance, and per-session line limits, suppress unchanged automatic retries. Existing main-only matching and warm history caches remain usable.
 - Known source mirrors retry automatically across organizations under the signed-in login. Other logins stay pending until you sign in. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
+- Login transitions get prompt retries with brief backoff. The panel separates completed work from the next action and shows the next retry. A source blocked only by the event limit waits for an update or manual retry.
 
 Safety:
 
@@ -273,17 +274,19 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
 | Require `/usr/bin/lockf` on every macOS version | macOS 14.5 lacks the utility. Bundled Perl takes the same kernel lock when it is absent |
 | Require a deleted task's registration to move its archived runs | Archived runs without notification routes or scheduler state can move through the guarded task-family path without recreating the task |
+| Raise each history's memory limit independently | Concurrent reads multiply memory use. Share a process budget and reduce concurrency under pressure |
 
 </details>
 
 ## Limits
 
 - macOS 13 or newer with Claude Desktop. Sign Desktop into the target account to see moved history.
+- Live Sonoma execution remains unverified. The missing-`lockf` fallback is covered by synthetic checks.
 - Remote Control ownership does not transfer. Re-enable it per session under the destination account.
 - Artifact ownership, versions, comments, and share links stay with the original account.
 - Embedded base64, text, and HTTP(S) images and documents can be rescued. Account-owned file ids and unknown shapes are refused.
 - Remote Control uses private Claude endpoints and fails closed if their shape or auth changes.
-- Remote history reads stop at 1,000,000 events or 128 MiB. Incomplete history is never used to authorize cleanup.
+- Remote history reads stop at 1,000,000 events and share a memory target of up to 20% of RAM, with heap and system headroom. Large reads use less concurrency. This is a soft target, not an OS-enforced cap. Incomplete history is never used to authorize cleanup.
 - Supplemental coverage of retained histories after a CLI identity change remains unsupported.
 - File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 - Moving history out of a Team organization is your organization's decision.
