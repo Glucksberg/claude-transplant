@@ -272,6 +272,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
 | Require `/usr/bin/lockf` on every macOS version | macOS 14.5 lacks the utility. Bundled Perl takes the same kernel lock when it is absent |
+| Require a deleted task's registration to move its archived runs | Archived runs without notification routes or scheduler state can move through the guarded task-family path without recreating the task |
 
 </details>
 

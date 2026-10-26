@@ -773,13 +773,15 @@ function taskFamilies(from, to, found) {
       const family = { key: `${account.account}/${account.org}/${seed}`, from: accountRef(account), to: accountRef(to),
         sourceFile: account.taskFile, targetFile: to.taskFile, ids, recordIds, files: members.map(row => row.file), links: members.map(row => taskLinks(row.record)),
         routes: tasks.filter(task => ids.includes(task.id)).map(task => [task.id, task.notifySessionId ?? null]) }
+      const historical = !family.routes.length && members.every(row => row.record.isArchived === true && row.record.scheduledTaskId && !row.record.notifySessionId) &&
+        TASK_STATE_KEYS.every(key => ids.every(id => !Object.hasOwn(account.taskSessions.registry?.[key] ?? {}, id) && !Object.hasOwn(to.taskSessions.registry?.[key] ?? {}, id)))
       const twins = (to.taskSessions.registry?.scheduledTasks ?? []).filter(task => ids.includes(task.id))
       const twinProblem = twins.map(twin => {
         const source = tasks.find(task => task.id === twin.id)
         return source ? staleTaskProblem(source, twin, { source: account.taskSessions.registry, target: to.taskSessions.registry }, (to.allSessions ?? to.sessions).map(row => row.record), to.unreadable.length) : 'target scheduled task collision'
       }).find(Boolean)
       family.error = account.taskError ?? to.taskError ?? (account.unreadable.length ? 'unreadable scheduled task family member' :
-        ids.some(id => !tasks.some(task => task.id === id)) || recordIds.length !== members.length ? 'scheduled task family member missing' :
+        (!historical && ids.some(id => !tasks.some(task => task.id === id))) || recordIds.length !== members.length ? 'scheduled task family member missing' :
         twinProblem ?? ((to.taskSessions.registry?.scheduledTasks ?? []).some(task => !ids.includes(task.id) && recordIds.includes(task.notifySessionId)) ? 'target scheduled task collision' :
         taskStateConflict(taskState(account.taskSessions.registry, ids), taskState(to.taskSessions.registry, ids)) ? 'target scheduled task state collision' : null))
       for (const row of members) row.taskFamily = family

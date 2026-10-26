@@ -4906,6 +4906,109 @@ async function taskFamilyFixture(enabled = false, taskCount = 2, eventCount = 1,
   return { ...h, run, second, cold, tasks, sourceRegistry, targetRegistry, sourceAfter, targetAfter, sourceFile, targetFile, selection }
 }
 
+async function taskHistoryFixture(count = 2) {
+  const h = await home(), sessions = Array.from({ length: count }, (_, index) => id(1000 + index)), taskId = 'deleted-task'
+  const sourceFile = path.join(h.dir('P'), 'scheduled-tasks.json'), targetFile = path.join(h.dir('T'), 'scheduled-tasks.json')
+  const registry = { scheduledTasks: [{ id: 'unrelated-task', enabled: true }], future: { preserved: true } }
+  for (const [index, sid] of sessions.entries()) {
+    await h.write(sid, [entry('user', 2000 + index, null, sid)])
+    await h.record('P', sid, rehomeRecord({ scheduledTaskId: taskId, isArchived: true }))
+  }
+  for (const file of [sourceFile, targetFile]) await writeFile(file, JSON.stringify(registry))
+  const selection = async () => {
+    const all = await accounts(h.paths, [])
+    return { from: all.find(row => row.account === h.acct.P), to: all.find(row => row.account === h.acct.T) }
+  }
+  return { ...h, sessions, taskId, registry, sourceFile, targetFile, selection }
+}
+
+test('archived runs of a deleted task move and undo without recreating its registration', async () => {
+  const h = await taskHistoryFixture(167), { from, to } = await h.selection(), mock = taskHarness()
+  const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  const registries = await Promise.all([h.sourceFile, h.targetFile].map(file => readFile(file)))
+  const planned = await executeMove([from], to, h.paths, { io: mock.io })
+  assert.equal(planned.plan.held.length, 167)
+  assert.deepEqual(mock.calls, [])
+  const result = await executeMove([from], to, h.paths, { io: mock.io, approve: planned.plan.token })
+  assert.equal(result.ok, true, JSON.stringify(result.receipt.failed))
+  assert.equal(result.receipt.sessions.length, 167)
+  assert.equal(result.receipt.superseded.filter(row => row.source).length, 167)
+  assert.deepEqual(result.receipt.taskTransfers[0].tasks, [])
+  assert.deepEqual(mock.calls, ['/usr/bin/osascript', '/usr/bin/open'])
+  assert.deepEqual(await Promise.all([h.sourceFile, h.targetFile].map(file => readFile(file))), registries)
+  for (const sid of h.sessions) {
+    const record = JSON.parse(await readFile(path.join(h.dir('T'), `local_${sid}.json`)))
+    assert.equal(record.scheduledTaskId, h.taskId)
+    assert.equal(record.isArchived, true)
+  }
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+})
+
+test('deleted task history retains missing-member, scheduler-state and ownership guards', async () => {
+  for (const scenario of ['unarchived', 'notification', 'missing history', 'unreadable source', 'unreadable target', 'source registry', 'target registry', 'target task', 'target notification', 'mixed registration', 'source skips', 'target retries', 'worker']) {
+    const h = await taskHistoryFixture(), first = h.sessions[0]
+    if (scenario === 'unarchived') await h.record('P', first, rehomeRecord({ scheduledTaskId: h.taskId }))
+    if (scenario === 'notification') await h.record('P', first, rehomeRecord({ scheduledTaskId: h.taskId, isArchived: true, notifySessionId: `local_${h.sessions[1]}` }))
+    if (scenario === 'missing history') await unlink(path.join(h.project, `${first}.jsonl`))
+    if (scenario.startsWith('unreadable')) await writeFile(path.join(h.dir(scenario === 'unreadable source' ? 'P' : 'T'), `local_${id(799)}.json`), '{broken')
+    if (scenario.endsWith('registry')) await writeFile(scenario === 'source registry' ? h.sourceFile : h.targetFile, '{broken')
+    if (scenario === 'target task') await writeFile(h.targetFile, JSON.stringify({ scheduledTasks: [{ id: h.taskId, enabled: false }] }))
+    if (scenario === 'target notification') await writeFile(h.targetFile, JSON.stringify({ scheduledTasks: [{ id: 'other-task', notifySessionId: `local_${first}` }] }))
+    if (scenario === 'mixed registration') {
+      await writeFile(h.sourceFile, JSON.stringify({ scheduledTasks: [{ id: 'active-task', enabled: true }] }))
+      await h.record('P', first, rehomeRecord({ scheduledTaskId: 'active-task', isArchived: true, forkedFromSessionId: `local_${h.sessions[1]}` }))
+    }
+    if (scenario === 'source skips') await writeFile(h.sourceFile, JSON.stringify({ ...h.registry, recordedSkips: { [h.taskId]: [] } }))
+    if (scenario === 'target retries') await writeFile(h.targetFile, JSON.stringify({ ...h.registry, runRetries: { [h.taskId]: {} } }))
+    const { from, to } = await h.selection(), before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: scenario === 'worker' ? [{ ...desktopFixture(first)[1], desktopPid: null }] : [] })
+    if (scenario === 'unreadable target') {
+      const result = await move(inv, to, h.paths)
+      assert.equal(result.ok, false)
+      assert.equal(result.receipt.sessions.length, 0)
+    } else {
+      assert.equal(inv.move.length, 0, scenario)
+      assert.ok(inv.blocked.length, scenario)
+    }
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+  }
+})
+
+test('deleted task history rechecks new registrations and notification dependencies before moving', async () => {
+  for (const scenario of ['source task', 'target task', 'notification', 'new run', 'new retry']) {
+    const h = await taskHistoryFixture(), { from, to } = await h.selection()
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.move.length, 2)
+    if (scenario.endsWith('task')) await writeFile(scenario === 'source task' ? h.sourceFile : h.targetFile, JSON.stringify({ scheduledTasks: [{ id: h.taskId, enabled: true }] }))
+    if (scenario === 'notification') await h.record('P', id(799), rehomeRecord({ notifySessionId: `local_${h.sessions[0]}` }))
+    if (scenario === 'new run') await h.record('P', id(799), rehomeRecord({ scheduledTaskId: h.taskId, isArchived: true }))
+    if (scenario === 'new retry') await writeFile(h.sourceFile, JSON.stringify({ ...h.registry, runRetries: { [h.taskId]: {} } }))
+    const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+    const result = await move(inv, to, h.paths)
+    assert.equal(result.ok, false, scenario)
+    assert.equal(result.receipt.sessions.length, 0, scenario)
+    assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before, scenario)
+  }
+})
+
+test('deleted task history recovers interrupted retirement and refuses Undo after ownership changes', async () => {
+  const h = await taskHistoryFixture(), before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  await interruptTaskFamily(h, 'move', 'retiring')
+  assert.ok((await finishWorkflow(h.paths, { processes: [] })).reconciled)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+  const result = await finishWorkflow(h.paths, { processes: [] })
+  assert.equal(result.ok, true, JSON.stringify(result))
+  const registry = await readFile(h.targetFile)
+  await writeFile(h.targetFile, JSON.stringify({ scheduledTasks: [{ id: h.taskId, enabled: true }] }))
+  const changed = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  assert.ok((await undo(h.paths, { processes: [] })).restoreProblems.length)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), changed)
+  await writeFile(h.targetFile, registry)
+  assert.ok((await undo(h.paths, { processes: [] })).dest)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+})
+
 function taskHarness(rows = [desktopFixture()[0]], reopened = [{ ...desktopFixture()[0], pid: 700, desktopPid: 700, started: 'reopened' }]) {
   const mock = { rows, calls: [], time: 0 }
   mock.io = { inspect: () => mock.rows, now: () => mock.time, command: async file => {
