@@ -1998,8 +1998,8 @@ test('cloud identity retains verified cookie fallback for unknown Desktop state 
 })
 
 test('cloud history reads past 10000 events and refuses incomplete or oversized pagination', async t => {
-  for (const scenario of ['large', 'full last page', 'repeated cursor', 'repeated sequence', 'oversized page', 'event limit', 'byte limit']) await t.test(scenario, async t => {
-    const h = await home(), limit = scenario === 'full last page' ? 10000 : 10501
+  for (const scenario of ['large', 'full last page', 'exact event limit', 'repeated cursor', 'repeated sequence', 'oversized page', 'event limit', 'byte limit']) await t.test(scenario, async t => {
+    const h = await home(), limit = scenario === 'exact event limit' ? 1_000_000 : scenario === 'full last page' ? 10000 : 10501
     let pages = 0
     t.mock.method(globalThis, 'fetch', async url => {
       const request = new URL(url)
@@ -2016,7 +2016,7 @@ test('cloud history reads past 10000 events and refuses incomplete or oversized 
         resume_cursor: scenario === 'repeated cursor' ? 'same' : String(start + length) }, { headers: { 'anthropic-organization-id': h.org.P } })
     })
     const cloud = await cloudClient(h.paths, null, { active: { state: 'known', account: h.acct.P, org: h.org.P }, cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' })
-    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 100,000 events/, 'byte limit': /exceeded 128 MiB/ }[scenario]
+    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 1,000,000 events/, 'byte limit': /exceeded 128 MiB/ }[scenario]
     if (error) await assert.rejects(cloud.eventRows('cse_large'), error)
     else {
       const rows = await cloud.eventRows('cse_large')
@@ -2024,7 +2024,7 @@ test('cloud history reads past 10000 events and refuses incomplete or oversized 
       assert.equal(rows.at(-1).sequence_num, limit - 1)
       assert.equal(pages, Math.floor(limit / 500) + 1)
     }
-    if (scenario === 'event limit') assert.equal(pages, 200)
+    if (scenario === 'event limit') assert.equal(pages, 2001)
     if (scenario === 'byte limit' || scenario === 'oversized page') assert.equal(pages, 1)
   })
 })
