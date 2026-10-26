@@ -1023,15 +1023,18 @@ export async function cloudClient(paths, expected = null, io = {}) {
   }
   const eventRows = async (id) => {
     const out = []
+    let bytes = 0
     let cursor = null
     let lastSequence = null
     const seen = new Set()
-    for (let page = 0; page < 20; page++) {
+    for (let page = 0; page < 200; page++) {
       const query = new URLSearchParams({ limit: '500', sort_order: 'asc' })
       if (cursor) query.set('cursor', cursor)
       const body = await request(`/v1/code/sessions/${wireRemoteId(id)}/events?${query}`)
-      if (!Array.isArray(body?.data)) throw new Error('Remote Control history response changed')
+      if (!Array.isArray(body?.data) || body.data.length > 500) throw new Error('Remote Control history response changed')
       const data = body.data
+      bytes += Buffer.byteLength(JSON.stringify(data))
+      if (bytes > 128 * 1024 * 1024) throw new Error('Remote Control history exceeded 128 MiB')
       if (data.some((event) => !event || typeof event !== 'object' || typeof event.event_type !== 'string' || !event.payload || typeof event.payload !== 'object')) throw new Error('Remote Control event response changed')
       for (const event of data) {
         const sequence = typeof event.sequence_num === 'number' && Number.isSafeInteger(event.sequence_num) && event.sequence_num >= 0
@@ -1046,7 +1049,7 @@ export async function cloudClient(paths, expected = null, io = {}) {
       if (!cursor || seen.has(cursor)) throw new Error('Remote Control history cursor did not advance')
       seen.add(cursor)
     }
-    throw new Error('Remote Control history exceeded 10,000 events')
+    throw new Error('Remote Control history exceeded 100,000 events')
   }
   return {
     account: account.uuid,

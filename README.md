@@ -283,6 +283,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 - Artifact ownership, versions, comments, and share links stay with the original account.
 - Embedded base64, text, and HTTP(S) images and documents can be rescued. Account-owned file ids and unknown shapes are refused.
 - Remote Control uses private Claude endpoints and fails closed if their shape or auth changes.
+- Remote history reads stop at 100,000 events or 128 MiB. Incomplete history is never used to authorize cleanup.
 - Supplemental coverage of retained histories after a CLI identity change remains unsupported.
 - File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 - Moving history out of a Team organization is your organization's decision.

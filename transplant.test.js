@@ -1997,6 +1997,38 @@ test('cloud identity retains verified cookie fallback for unknown Desktop state 
   assert.deepEqual(requested, ['/api/account'])
 })
 
+test('cloud history reads past 10000 events and refuses incomplete or oversized pagination', async t => {
+  for (const scenario of ['large', 'full last page', 'repeated cursor', 'repeated sequence', 'oversized page', 'event limit', 'byte limit']) await t.test(scenario, async t => {
+    const h = await home(), limit = scenario === 'full last page' ? 10000 : 10501
+    let pages = 0
+    t.mock.method(globalThis, 'fetch', async url => {
+      const request = new URL(url)
+      if (request.pathname === '/api/account') return Response.json({ uuid: h.acct.P })
+      if (request.pathname === '/api/organizations') return Response.json([{ uuid: h.org.P }])
+      assert.equal(request.pathname, '/v1/code/sessions/session_large/events')
+      assert.equal(request.searchParams.get('limit'), '500')
+      assert.equal(request.searchParams.get('sort_order'), 'asc')
+      const start = pages++ * 500
+      if (pages > 1) assert.equal(request.searchParams.get('cursor'), scenario === 'repeated cursor' ? 'same' : String(start))
+      const length = scenario === 'oversized page' ? 501 : scenario === 'event limit' || scenario === 'byte limit' ? 500 : Math.min(500, limit - start)
+      const payload = scenario === 'byte limit' ? { content: 'x'.repeat(280000) } : {}
+      return Response.json({ data: Array.from({ length }, (_, i) => ({ event_type: 'user', sequence_num: scenario === 'repeated sequence' ? i : start + i, payload })),
+        resume_cursor: scenario === 'repeated cursor' ? 'same' : String(start + length) }, { headers: { 'anthropic-organization-id': h.org.P } })
+    })
+    const cloud = await cloudClient(h.paths, null, { active: { state: 'known', account: h.acct.P, org: h.org.P }, cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' })
+    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 100,000 events/, 'byte limit': /exceeded 128 MiB/ }[scenario]
+    if (error) await assert.rejects(cloud.eventRows('cse_large'), error)
+    else {
+      const rows = await cloud.eventRows('cse_large')
+      assert.equal(rows.length, limit)
+      assert.equal(rows.at(-1).sequence_num, limit - 1)
+      assert.equal(pages, Math.floor(limit / 500) + 1)
+    }
+    if (scenario === 'event limit') assert.equal(pages, 200)
+    if (scenario === 'byte limit' || scenario === 'oversized page') assert.equal(pages, 1)
+  })
+})
+
 async function home() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-home-'))
   const paths = layout(root)
