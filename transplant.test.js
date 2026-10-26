@@ -2093,6 +2093,28 @@ test('concurrent cloud bodies share reservations and return them after refusal',
   assert.deepEqual(await budget.read(Response.json({ recovered: true })), { recovered: true })
 })
 
+test('memory pressure during final cloud proof keeps its source active until a complete retry', async () => {
+  const h = await home(), entries = branchEntries(4, SOURCE, 1)
+  await h.write(SOURCE, entries)
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Memory history', bridgeSessionIds: ['session_memory'] }))
+  let pressure = false, reads = 0, status = 'active'
+  const memory = memoryBudget({ total: 16 * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss: pressure ? 16 * 2 ** 30 : 0, heapUsed: 0 }), available: () => 4 * 2 ** 30 })
+  const cloud = cloudFixture(h, { memory, list: async () => [remoteSession({ id: 'cse_memory', title: 'Memory history', status })],
+    session: async () => remoteState(status), archive: async () => { status = 'archived' },
+    eventRows: async () => { if (++reads === 2) pressure = true; return memory.read(Response.json(remoteRows(entries))) } })
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const result = await move(await inventory([from], to, h.paths, () => {}, { cloud, processes: [] }), to, h.paths)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(result.receipt.remote.length, 0)
+  assert.equal(result.receipt.failed[0].code, 'CLOUD_MEMORY_PRESSURE')
+  assert.equal(status, 'active')
+  pressure = false
+  const retried = await finishPending(h.paths, { cloud, active: { state: 'known', account: h.acct.P, org: h.org.P }, processes: [] })
+  assert.equal(retried.complete, true)
+  assert.equal(retried.ok, true)
+  assert.equal(status, 'archived')
+})
+
 async function home() {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ct-home-'))
   const paths = layout(root)
@@ -4066,8 +4088,8 @@ test('artifact search stops after complete proof but still reads required files 
   assert.equal((await f.inventory()).cloud.matches[0].target.matchMode, 'artifacts')
 })
 
-test('artifact budget reservations are shared across eight concurrent cloud analyses', async () => {
-  for (const scenario of ['together', 'alone', 'refused first']) {
+test('artifact budget reservations remain shared across concurrent and throttled cloud analyses', async () => {
+  for (const scenario of ['together', 'throttled', 'alone', 'refused first']) {
     const h = await home(), sources = Array.from({ length: 8 }, (_, index) => id(9000 + index)), histories = new Map(), costs = []
     for (const [index, sid] of sources.entries()) {
       const main = branchEntries(4, sid, 10000 + index * 10), agent = entry('assistant', 11000 + index, null, sid, { agentId: 'fixture', isSidechain: true })
@@ -4082,6 +4104,7 @@ test('artifact budget reservations are shared across eight concurrent cloud anal
     }
     let selected = [...histories.keys()], fetching = 0, peak = 0
     const cloud = cloudFixture(h, {
+      memory: { check: () => {}, parallel: () => scenario === 'throttled' ? 1 : 8 },
       list: async () => selected.map(id => remoteSession({ id, title: id })),
       eventRows: async id => {
         peak = Math.max(peak, ++fetching)
@@ -4096,7 +4119,7 @@ test('artifact budget reservations are shared across eight concurrent cloud anal
     assert.ok(costs.reduce((sum, cost) => sum + cost, 0) > artifactLimit)
     const run = automatic => inventory([from], to, h.paths, () => {}, { cloud, processes: [], artifactLimit, automatic, writeCache: true })
     const before = await fixtureSnapshot(h, [h.paths.pool]), first = await run(false)
-    assert.equal(peak, 8)
+    assert.equal(peak, scenario === 'throttled' ? 1 : 8)
     assert.ok(first.cloud.artifacts.used <= artifactLimit)
     assert.ok(first.cloud.artifacts.used > 0)
     if (scenario === 'refused first') {
