@@ -2,11 +2,12 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
 import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
-import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
 import { fileURLToPath } from 'node:url'
+import { getHeapStatistics } from 'node:v8'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const TYPES = new Set(['user', 'assistant', 'attachment', 'system', 'progress'])
@@ -22,17 +23,20 @@ const TASK_STATE_KEYS = ['recordedSkips', 'runRetries']
 const PARENT_MISSING = 'parent Desktop record is absent from the target and move'
 const TASK_FAMILY_BLOCKED = 'scheduled task family blocked by'
 const desktopExecutable = (file) => typeof file === 'string' && file.endsWith('/Claude.app/Contents/MacOS/Claude')
-const RESTART_BUDGET = 30_000
+const RESTART_BUDGET = 60_000
 const REOPEN_RESERVE = 8_000
+const restartMoveBudget = (budget = RESTART_BUDGET, reserve = REOPEN_RESERVE) => Math.max(0, Math.min(22_000, (budget - reserve) / 2))
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 11
+const CACHE_VERSION = 12
 const ARTIFACT_BYTES = 512 * 1024 * 1024
 const ARTIFACT_LINE_BYTES = 16 * 1024 * 1024
 const RESTART_LOG_BYTES = 1024 * 1024
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
+const DURABLE_RECORD_KEYS = ['title', 'isArchived', 'isStarred']
+const recordSnapshot = record => Object.fromEntries(['sessionId', 'cliSessionId', 'cwd', 'originCwd', ...DURABLE_RECORD_KEYS].filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]))
 const REMOTE_TAGS = new Set(['remote-control-sdk', 'remote-control-repl'])
 const HELP = `claude-transplant   move Claude Code history between accounts
 
@@ -55,6 +59,75 @@ const HELP = `claude-transplant   move Claude Code history between accounts
 `
 
 const sha = (data) => createHash('sha256').update(data).digest('hex')
+const memoryTarget = total => Math.floor(total * 0.2)
+export const menubarHeapMiB = (total = os.totalmem(), heap = getHeapStatistics().heap_size_limit) => Math.max(Math.ceil(heap / 1024 / 1024), Math.floor(memoryTarget(total) * 0.65 / 1024 / 1024))
+const memoryErrorCode = error => error.code === 'ERR_STRING_TOO_LONG' || error instanceof RangeError && error.message === 'Invalid string length' ? 'CLOUD_PARSER_LIMIT' : error.code
+export function memoryBudget(io = {}) {
+  const limit = memoryTarget(io.total ?? os.totalmem())
+  const heap = io.heap ?? getHeapStatistics().heap_size_limit
+  const usage = io.usage ?? (() => process.memoryUsage())
+  const available = io.available ?? (() => process.availableMemory?.() ?? os.freemem())
+  const platform = io.platform ?? process.platform, now = io.now ?? Date.now
+  const probe = io.pressure ?? (() => {
+    const result = spawnSync('/usr/sbin/sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], { encoding: 'utf8', timeout: 1000, maxBuffer: 1024 })
+    return result.status === 0 ? Number(result.stdout.trim()) : null
+  })
+  let sampledAt = -Infinity, level = null
+  const pressure = () => {
+    if (platform !== 'darwin') return null
+    const at = now()
+    if (at < sampledAt || at - sampledAt >= 1000) {
+      sampledAt = at
+      try { const value = probe(); level = [1, 2, 4].includes(value) ? value : null } catch { level = null }
+      sampledAt = now()
+    }
+    return level
+  }
+  let reserved = 0
+  const remaining = () => {
+    const { rss, heapUsed } = usage()
+    return Math.max(0, Math.min(limit - rss, heap - heapUsed) * 0.8 - reserved)
+  }
+  const check = (bytes = 0) => {
+    const level = pressure()
+    if (level === 4 || level === null && bytes >= Math.max(0, available() * 0.8 - reserved)) throw Object.assign(new Error('Waiting for memory to verify history'), { code: 'CLOUD_MEMORY_PRESSURE' })
+    const room = remaining()
+    if (bytes > room || room === 0) throw Object.assign(new Error('This operation exceeded its memory budget'), { code: 'CLOUD_MEMORY_BUDGET' })
+  }
+  return {
+    limit, heap, signature: `${limit}:${heap}:${process.versions.node}`, check,
+    parallel: () => {
+      const { rss, heapUsed } = usage()
+      const level = pressure(), used = Math.max((rss + reserved) / limit, (heapUsed + reserved) / heap)
+      if (level === 2 || level === 4 || platform === 'darwin' && level === null) return 1
+      return used < 0.5 && (level === 1 || available() > Math.min(512 * 1024 * 1024, limit / 4)) ? 8 : used < 0.75 ? 2 : 1
+    },
+    read: async response => {
+      const chunks = []
+      let bytes = 0
+      try {
+        check()
+        if (response.body) for await (const chunk of response.body) {
+          check(chunk.byteLength * 4)
+          reserved += chunk.byteLength * 4
+          bytes += chunk.byteLength
+          chunks.push(chunk)
+        }
+        const text = Buffer.concat(chunks, bytes).toString('utf8')
+        const value = text ? JSON.parse(text) : null
+        check()
+        return value
+      } catch (error) {
+        if (memoryErrorCode(error) === 'CLOUD_PARSER_LIMIT') error.code = 'CLOUD_PARSER_LIMIT'
+        throw error
+      } finally { reserved -= bytes * 4 }
+    }
+  }
+}
+let sharedMemory
+const operationMemory = () => sharedMemory ??= memoryBudget()
+const selectedMemory = options => options.memory ?? options.cloud?.memory ?? operationMemory()
+const memorySignature = memory => memory.signature ?? `${memory.limit ?? operationMemory().limit}:${memory.heap ?? operationMemory().heap}:${process.versions.node}`
 let artifactEngineHash
 const artifactEngine = () => artifactEngineHash ??= sha(readFileSync(fileURLToPath(import.meta.url)))
 const sortKeys = (v) => Array.isArray(v) ? v.map(sortKeys) : v && typeof v === 'object' ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, sortKeys(v[k])])) : v
@@ -84,7 +157,7 @@ const waitingSessions = (receipt) => [...new Map([
 const heldCount = (held = []) => new Set(held.flatMap(row => row.sources?.map(source => source.file ?? `${source.account}/${source.org}/${source.id}`) ?? [row.id])).size
 const cloudCancelToken = (file, check) => sha(stable({ file, account: check.account, org: check.org, sessionIds: check.sessionIds ? [...new Set(check.sessionIds)].sort() : null }))
 
-export function pendingPresentation(receipt, source, account, mode, table = [], scheduler = false, timeouts = new Map()) {
+export function pendingPresentation(receipt, source, account, mode, table = [], scheduler = false, timeouts = new Map(), identity = null) {
   const empty = { pendingState: null, pendingAction: null, pendingCount: null, pendingAutomatic: false }
   if (!source) return empty
   if (mode === 'recovery') return { ...empty, pendingState: 'interrupted', pendingAction: 'finish' }
@@ -106,12 +179,17 @@ export function pendingPresentation(receipt, source, account, mode, table = [], 
   const ids = [...new Set(pending.map(row => row.id).filter(Boolean))]
   const archived = new Set((receipt.remote ?? []).filter(row => sameAccount(row, source)).map(row => remoteId(row.id)))
   const count = failures.some(row => !row.id) ? null : ids.length || (source.sessionIds ? source.sessionIds.filter(id => !archived.has(remoteId(id))).length : null)
-  const state = failures.length && !waiting.length && failures.every(row => row.code === 'CLOUD_CONTENT_UNSUPPORTED') ? 'unsupported'
+  const state = historyLimited(source) ? failures.some(row => row.code === 'CLOUD_BUDGET_LIMIT') ? 'budget-limit' : failures.some(row => row.code === 'CLOUD_PARSER_LIMIT') ? 'parser-limit' : 'limit'
+    : failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING') ? 'login'
+    : failures.length && failures.every(row => row.code === 'CLOUD_MEMORY_PRESSURE') ? 'memory'
+    : failures.length && !waiting.length && failures.every(row => row.code === 'CLOUD_CONTENT_UNSUPPORTED') ? 'unsupported'
     : pending.length && pending.every(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'worker'
-      : failures.length || waiting.some(row => row.code === 'CLOUD_RESCUE_WORKER') ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
-  const action = state === 'unsupported' ? 'blocked' : !account.signedIn ? 'sign-in' : state === 'worker' ? 'wait'
+      : failures.length || waiting.some(row => ['CLOUD_RESCUE_WORKER', 'CLOUD_MEMORY_DEFERRED'].includes(row.code)) ? 'waiting' : waiting.length ? 'cloud-open' : 'cleanup'
+  const blocked = ['unsupported', 'limit', 'budget-limit', 'parser-limit'].includes(state)
+  const action = blocked ? 'blocked' : !account.signedIn ? 'sign-in' : state === 'worker' ? 'wait'
     : waiting.length && canRestartWaiting({ cloudChecks: [source] }, table) ? 'restart' : 'wait'
-  return { pendingState: state, pendingAction: action, pendingCount: count, pendingAutomatic: state !== 'unsupported' }
+  return { pendingState: state, pendingAction: action, pendingCount: count, pendingAutomatic: !blocked,
+    pendingRetryAt: account.signedIn && !blocked && !['worker', 'cloud-open'].includes(state) ? cloudRetryAt(receipt, source, identity) : null }
 }
 const legacyLocalFailures = (receipt) => receipt.localCancelledAt ? [] : (receipt.failed ?? []).filter(row => row.error === WORKER_OWNS && UUID.test(row.id ?? ''))
 const needsRecovery = (receipt) => Boolean(receipt.pending || receipt.retiring || receipt.finalizing || receipt.undoing || receipt.remotePending || receipt.remoteUndoing?.length)
@@ -394,7 +472,9 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
   const budget = io.budget ?? RESTART_BUDGET
   const reserve = io.reserve ?? REOPEN_RESERVE
   const started = now(), deadline = started + budget
-  const mutationDeadline = deadline - reserve
+  const moveBudget = restartMoveBudget(budget, reserve)
+  const shutdownDeadline = started + Math.max(0, Math.min(30_000, budget - reserve - moveBudget))
+  let mutationDeadline = deadline - reserve
   const file = path.join(paths.state, 'restart.json')
   const state = { at: stamp(), attemptId: randomUUID(), requestedAt: new Date().toISOString(), app: paths.claudeApp, desktop: plan.desktop, held: plan.held,
     deadline: new Date(Date.now() + budget).toISOString(), outcome: 'closing' }
@@ -424,12 +504,13 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!desktop || restartFingerprint(desktop, live) !== plan.fingerprint) throw Object.assign(new Error('Open Claude sessions changed. Review the restart plan again.'), { code: 'RESTART_PLAN_CHANGED' })
     if (plan.held.some((held) => live.some((row) => row.worker && row.desktopPid !== desktop.pid && ownsWorker(new Set(row.ids), held.id, held.recordId)))) throw Object.assign(new Error('An external worker now owns a held session. No restart was started.'), { code: 'RESTART_EXTERNAL_WORKER' })
     report('desktop', 'Closing Claude Desktop', { live: true })
-    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, mutationDeadline - now()))
-    const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), mutationDeadline, now, wait)
+    const quit = await run('/usr/bin/osascript', ['-e', `tell application ${JSON.stringify(paths.claudeApp)} to quit`], Math.max(0, shutdownDeadline - now()))
+    const gone = quit.status === 0 && await waitFor(() => !inspect().some((row) => plan.members.some((prior) => processIdentity(prior) === processIdentity(row))), shutdownDeadline, now, wait)
     if (!gone || quit.status !== 0) {
       state.outcome = quit.timedOut ? 'quit-timeout' : 'quit-not-confirmed'
       state.error = 'Claude Desktop did not confirm shutdown. Answer any native quit dialog yourself. Held records were not moved.'
     } else {
+      mutationDeadline = Math.min(deadline - reserve, now() + moveBudget)
       state.exitedAt = new Date().toISOString()
       state.outcome = 'moving'
       await save()
@@ -446,12 +527,13 @@ export async function withDesktopRestart(plan, paths, work, report = () => {}, i
     if (!remaining || !appProcess(paths, remaining)) {
       state.outcomeBeforeReopen = state.outcome
       state.outcome = 'reopening'
-      const remaining = deadline - now()
+      const reopenDeadline = Math.min(deadline, now() + reserve)
+      const remaining = reopenDeadline - now()
       if (remaining <= 0) state.error ??= 'Restart exceeded its deadline. Claude Desktop was still sent a reopen request.'
       const opening = (async () => run('/usr/bin/open', ['-g', '-a', paths.claudeApp], Math.max(1000, remaining)))()
       try { report('reopen', 'Opening Claude Desktop', { live: true }) } catch {}
       const opened = await opening.catch(() => ({ status: null }))
-      const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, deadline, now, wait)
+      const present = await waitFor(() => { const rows = safeInspect(); return rows && Boolean(appProcess(paths, rows)) }, reopenDeadline, now, wait)
       state.outcome = opened.status === 0 && present ? 'reopened' : 'reopen-failed'
       if (state.outcome === 'reopened') state.reopenedAt = new Date().toISOString()
       else state.error = 'Could not confirm Claude Desktop reopened. Reopen it manually.'
@@ -506,49 +588,79 @@ async function dirs(root) {
   return entries.filter((e) => e.isDirectory() && UUID.test(e.name)).map((e) => e.name).sort()
 }
 
-async function tree(root) {
+const mappedPath = async file => path.join(await realpath(path.dirname(file)), path.basename(file))
+const sameTree = (expected, current) => Boolean(current) && expected.fingerprint === current.fingerprint && (!expected.canonicalRoot || expected.canonicalRoot === current.canonicalRoot)
+
+async function tree(root, canonicalRoot) {
   const out = []
   const walk = async (dir) => {
+    const before = await lstat(dir, { bigint: true })
+    if (!before.isDirectory() || await realpath(dir) !== path.resolve(dir)) throw new Error(`unsupported entry ${path.join(root, path.relative(canonicalRoot, dir))}`)
     for (const e of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       const p = path.join(dir, e.name)
       if (e.isDirectory()) await walk(p)
-      else if (e.isFile()) out.push(p)
+      else if (e.isFile() || e.isSymbolicLink()) out.push(p)
       else throw new Error(`unsupported entry ${p}`)
     }
+    if (statIdentity(await lstat(dir, { bigint: true })) !== statIdentity(before) || await realpath(dir) !== path.resolve(dir)) throw new Error('sidecars changed while reading')
   }
-  if (await exists(root)) await walk(root)
+  const detail = await lstat(canonicalRoot).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+  if (detail) await walk(canonicalRoot)
+  if (await mappedPath(root) !== canonicalRoot) throw new Error('sidecar root mapping changed while reading')
   return out
 }
 
-async function treeFingerprint(root, cache = null) {
-  const files = await tree(root)
-  const dependencies = await Promise.all(files.map(async (file) => ({ rel: path.relative(root, file), fingerprint: await fingerprint(file, cache) })))
-  return { files, fingerprint: sha(stable(dependencies)) }
+async function treeFingerprint(root) {
+  const canonicalRoot = await mappedPath(root)
+  const files = await tree(root, canonicalRoot)
+  const signatures = new Map()
+  const dependencies = await Promise.all(files.map(async (file) => {
+    const detail = await lstat(file, { bigint: true })
+    if (!detail.isFile() && !detail.isSymbolicLink()) throw new Error(`unsupported entry ${file}`)
+    const identity = statIdentity(detail)
+    signatures.set(file, identity)
+    const fingerprint = detail.isSymbolicLink() ? `link:${identity}:${sha(await readlink(file, { encoding: 'buffer' }))}` : identity
+    if (statIdentity(await lstat(file, { bigint: true })) !== identity) throw new Error('sidecars changed while reading')
+    return { rel: path.relative(canonicalRoot, file), fingerprint }
+  }))
+  if (await mappedPath(root) !== canonicalRoot) throw new Error('sidecar root mapping changed while reading')
+  return { files, signatures, fingerprint: sha(stable(dependencies)), canonicalRoot }
 }
 
 async function manifest(root, cache = null) {
-  const before = await treeFingerprint(root, cache)
+  const before = await treeFingerprint(root)
   const { files } = before
-  const prior = cache ? cacheLookup(cache, 'manifests', root, before.fingerprint) : null
-  if (prior) return manifestOf(prior.rows, before.fingerprint)
-  const rows = []
-  for (const file of files) {
-    const data = await readFile(file)
-    rows.push({ rel: path.relative(root, file), bytes: data.length, sha: sha(data) })
+  const signature = sha(stable([before.fingerprint, before.canonicalRoot]))
+  const prior = cache ? cacheLookup(cache, 'manifests', root, signature) : null
+  const rows = prior?.rows ?? []
+  if (!prior) for (const file of files) {
+    const detail = await lstat(file, { bigint: true })
+    if (statIdentity(detail) !== before.signatures.get(file)) throw new Error('sidecars changed while reading')
+    const rel = path.relative(before.canonicalRoot, file)
+    if (detail.isSymbolicLink()) {
+      const data = await readlink(file, { encoding: 'buffer' })
+      rows.push({ rel, bytes: data.length, sha: sha(data), type: 'symlink', resolved: path.resolve(path.dirname(file), data.toString('utf8')) })
+    } else {
+      const data = await readRegular(file, before.signatures.get(file))
+      rows.push({ rel, bytes: data.length, sha: sha(data) })
+    }
   }
-  if (cache) cacheStore(cache, 'manifests', root, before.fingerprint, { rows })
-  else if ((await treeFingerprint(root)).fingerprint !== before.fingerprint) throw new Error('sidecars changed while reading')
-  return manifestOf(rows, before.fingerprint)
+  if (!sameTree(before, await treeFingerprint(root))) throw new Error('sidecars changed while reading')
+  if (cache && !prior) cacheStore(cache, 'manifests', root, signature, { rows })
+  return manifestOf(rows, before.fingerprint, before.canonicalRoot)
 }
 
-function manifestOf(rows, fingerprint = null) {
+const sidecarIdentity = row => row.type === 'symlink' ? `link:${row.sha}:${row.resolved}` : row.sha
+
+function manifestOf(rows, fingerprint = null, canonicalRoot = null) {
   return {
-    set: new Set(rows.map((row) => `${row.rel}:${row.sha}`)),
+    set: new Set(rows.map((row) => `${row.rel}:${sidecarIdentity(row)}`)),
     rows,
     count: rows.length,
     bytes: rows.reduce((sum, row) => sum + row.bytes, 0),
     sha: sha(stable(rows)),
-    fingerprint
+    fingerprint,
+    canonicalRoot
   }
 }
 
@@ -637,13 +749,16 @@ async function quarantine(items, dest) {
 async function locked(paths, work) {
   await mkdir(paths.state, { recursive: true })
   const lockFile = path.join(paths.state, 'lock')
-  const guard = spawn('/usr/bin/lockf', ['-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  const command = await exists('/usr/bin/lockf')
+    ? ['/usr/bin/lockf', '-k', '-s', '-w', '-t', '0', lockFile, '/bin/sh', '-c', 'printf ready; cat >/dev/null']
+    : ['/usr/bin/perl', '-MFcntl=:flock', '-e', 'open(my $lock, ">>", $ARGV[0]) or exit 73; flock($lock, LOCK_EX | LOCK_NB) or exit($!{EWOULDBLOCK} ? 75 : 73); $| = 1; print "ready"; 1 while <STDIN>;', lockFile]
+  const guard = spawn(command[0], command.slice(1), { stdio: ['pipe', 'pipe', 'pipe'] })
   await new Promise((resolve, reject) => {
     let ready = false
     guard.stdout.once('data', () => { ready = true; resolve() })
     guard.once('error', reject)
     guard.once('exit', (code) => {
-      if (!ready) reject(Object.assign(new Error(code === 75 ? 'another run holds the lock' : `lockf failed, exit ${code ?? 'unknown'}`), { code: code === 75 ? 'LOCK_BUSY' : 'LOCK_FAILED' }))
+      if (!ready) reject(Object.assign(new Error(code === 75 ? 'another run holds the lock' : `lock helper failed, exit ${code ?? 'unknown'}`), { code: code === 75 ? 'LOCK_BUSY' : 'LOCK_FAILED' }))
     })
   })
   try {
@@ -770,13 +885,15 @@ function taskFamilies(from, to, found) {
       const family = { key: `${account.account}/${account.org}/${seed}`, from: accountRef(account), to: accountRef(to),
         sourceFile: account.taskFile, targetFile: to.taskFile, ids, recordIds, files: members.map(row => row.file), links: members.map(row => taskLinks(row.record)),
         routes: tasks.filter(task => ids.includes(task.id)).map(task => [task.id, task.notifySessionId ?? null]) }
+      const historical = !family.routes.length && members.every(row => row.record.isArchived === true && row.record.scheduledTaskId && !row.record.notifySessionId) &&
+        TASK_STATE_KEYS.every(key => ids.every(id => !Object.hasOwn(account.taskSessions.registry?.[key] ?? {}, id) && !Object.hasOwn(to.taskSessions.registry?.[key] ?? {}, id)))
       const twins = (to.taskSessions.registry?.scheduledTasks ?? []).filter(task => ids.includes(task.id))
       const twinProblem = twins.map(twin => {
         const source = tasks.find(task => task.id === twin.id)
         return source ? staleTaskProblem(source, twin, { source: account.taskSessions.registry, target: to.taskSessions.registry }, (to.allSessions ?? to.sessions).map(row => row.record), to.unreadable.length) : 'target scheduled task collision'
       }).find(Boolean)
       family.error = account.taskError ?? to.taskError ?? (account.unreadable.length ? 'unreadable scheduled task family member' :
-        ids.some(id => !tasks.some(task => task.id === id)) || recordIds.length !== members.length ? 'scheduled task family member missing' :
+        (!historical && ids.some(id => !tasks.some(task => task.id === id))) || recordIds.length !== members.length ? 'scheduled task family member missing' :
         twinProblem ?? ((to.taskSessions.registry?.scheduledTasks ?? []).some(task => !ids.includes(task.id) && recordIds.includes(task.notifySessionId)) ? 'target scheduled task collision' :
         taskStateConflict(taskState(account.taskSessions.registry, ids), taskState(to.taskSessions.registry, ids)) ? 'target scheduled task state collision' : null))
       for (const row of members) row.taskFamily = family
@@ -955,7 +1072,7 @@ function desktopCookies(paths) {
     const value = plainHex ? Buffer.from(plainHex, 'hex').toString('utf8') : decryptCookie(host, Buffer.from(encryptedHex, 'hex'), key, version)
     if (value && !/[;\r\n]/.test(value)) values.set(name, value)
   }
-  if (!values.has('sessionKey')) throw new Error('Claude Desktop login cookie is missing')
+  if (!values.has('sessionKey')) throw Object.assign(new Error('Claude Desktop login is still updating'), { code: 'CLOUD_AUTH_PENDING' })
   return values
 }
 
@@ -969,6 +1086,7 @@ const remoteId = (id) => {
 }
 
 export async function cloudClient(paths, expected = null, io = {}) {
+  const memory = io.memory ?? operationMemory()
   const current = io.active ?? await signedIn(paths)
   if (current.state === 'logged-out') throw new Error('Claude Desktop is signed out')
   if (expected && current.state === 'known' && !sameLogin(expected, current)) throw new Error(`sign Claude Desktop into ${loginLabel(expected)}`)
@@ -986,24 +1104,24 @@ export async function cloudClient(paths, expected = null, io = {}) {
     'anthropic-beta': 'oauth-2025-04-20'
   }
   const raw = async (endpoint, options = {}, org = null) => {
+    memory.check()
     const response = await fetch(`https://claude.ai${endpoint}`, {
       ...options,
       headers: { ...baseHeaders, ...(org ? { 'x-organization-uuid': org } : {}), ...(options.headers ?? {}) },
       redirect: 'error',
       signal: options.signal ?? AbortSignal.timeout(15_000)
     })
-    if (!response.ok) throw new Error(`Claude ${endpoint.split('?')[0]} returned ${response.status}`)
+    if (!response.ok) throw Object.assign(new Error(`Claude ${endpoint.split('?')[0]} returned ${response.status}`), { code: response.status === 401 ? 'CLOUD_AUTH_PENDING' : 'CLOUD_HTTP_ERROR' })
     if (org && endpoint.startsWith('/v1/code/')) {
       const responseOrg = response.headers.get('anthropic-organization-id')
       if (responseOrg !== org) throw new Error('Claude Remote Control organization changed')
     }
     if (response.status === 204) return null
-    const text = await response.text()
-    return text ? JSON.parse(text) : null
+    return memory.read(response)
   }
   const account = await raw('/api/account')
   if (!UUID.test(account?.uuid ?? '')) throw new Error('Claude Desktop account could not be verified')
-  if (selected?.account && account.uuid !== selected.account) throw new Error(expected ? `sign Claude Desktop into ${loginLabel(expected)}` : 'Claude Desktop login is still updating. Try again in a moment.')
+  if (selected?.account && account.uuid !== selected.account) throw Object.assign(new Error(expected && !sameLogin(selected, current) ? `sign Claude Desktop into ${loginLabel(expected)}` : 'Claude Desktop login is still updating. Try again in a moment.'), { code: sameLogin(selected, current) ? 'CLOUD_AUTH_PENDING' : 'CLOUD_ACCOUNT_MISMATCH' })
   const organizations = await raw('/api/organizations')
   const preferredOrg = selected?.org ?? cookies.get('lastActiveOrg')
   const organization = Array.isArray(organizations) ? organizations.find((item) => item.uuid === preferredOrg) : null
@@ -1021,12 +1139,13 @@ export async function cloudClient(paths, expected = null, io = {}) {
     let cursor = null
     let lastSequence = null
     const seen = new Set()
-    for (let page = 0; page < 20; page++) {
+    for (let page = 0; page <= 2000; page++) {
       const query = new URLSearchParams({ limit: '500', sort_order: 'asc' })
       if (cursor) query.set('cursor', cursor)
       const body = await request(`/v1/code/sessions/${wireRemoteId(id)}/events?${query}`)
-      if (!Array.isArray(body?.data)) throw new Error('Remote Control history response changed')
+      if (!Array.isArray(body?.data) || body.data.length > 500) throw new Error('Remote Control history response changed')
       const data = body.data
+      if (out.length + data.length > 1_000_000) throw Object.assign(new Error('Remote Control history exceeded 1,000,000 events'), { code: 'CLOUD_HISTORY_LIMIT' })
       if (data.some((event) => !event || typeof event !== 'object' || typeof event.event_type !== 'string' || !event.payload || typeof event.payload !== 'object')) throw new Error('Remote Control event response changed')
       for (const event of data) {
         const sequence = typeof event.sequence_num === 'number' && Number.isSafeInteger(event.sequence_num) && event.sequence_num >= 0
@@ -1041,9 +1160,10 @@ export async function cloudClient(paths, expected = null, io = {}) {
       if (!cursor || seen.has(cursor)) throw new Error('Remote Control history cursor did not advance')
       seen.add(cursor)
     }
-    throw new Error('Remote Control history exceeded 10,000 events')
+    throw Object.assign(new Error('Remote Control history exceeded 1,000,000 events'), { code: 'CLOUD_HISTORY_LIMIT' })
   }
   return {
+    memory,
     account: account.uuid,
     org,
     list: async () => {
@@ -1280,8 +1400,8 @@ async function sidecars(transcript, id, cache = null) {
 }
 
 const sidecarsAgree = (a, b) => {
-  const files = new Map(a.rows.map((row) => [row.rel, row.sha]))
-  return b.rows.every((row) => !files.has(row.rel) || files.get(row.rel) === row.sha)
+  const files = new Map(a.rows.map((row) => [row.rel, sidecarIdentity(row)]))
+  return b.rows.every((row) => !files.has(row.rel) || files.get(row.rel) === sidecarIdentity(row))
 }
 
 async function origins(id, ctx, cwd = '') {
@@ -1320,12 +1440,90 @@ const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && detailInclude
 
 const messageHash = (type, value) => sha(stable({ type, message: without(value, MESSAGE_RUNTIME_KEYS) }))
 const rescueTitle = (title) => `${(title || 'Untitled session').replace(/(?: · from Remote Control)+$/, '')} · from Remote Control`
+const queuedContent = (content, hash = messageHash('user', { role: 'user', content })) => {
+  if (typeof content === 'string') return { hash, textHash: hash }
+  if (Array.isArray(content) && content.length > 1 && content.every(block => block?.type === 'image' && block.source && typeof block.source === 'object' && !Array.isArray(block.source) ||
+    block?.type === 'text' && typeof block.text === 'string' && Object.keys(block).every(key => ['type', 'text'].includes(key)))) {
+    const text = content.filter(block => block.type === 'text')
+    if (text.length === 1) return { hash, textHash: messageHash('user', { role: 'user', content: text[0].text }), richHash: hash }
+  }
+  return { hash }
+}
+const queuedContentAgrees = (a, b) => (!a.hash || !b.hash || a.hash === b.hash || a.textHash && a.textHash === b.textHash) && (!a.richHash || !b.richHash || a.richHash === b.richHash)
+const uniqueBridgeOwners = owners => [...new Map(owners.map(owner => [stable(owner), owner])).values()]
 
-const conversation = (entries) => entries.flatMap((entry) => {
-  if (entry && ['user', 'assistant'].includes(entry.type) && entry.message) return [messageHash(entry.type, entry.message)]
-  if (entry?.type === 'attachment' && typeof entry.attachment?.prompt === 'string') return [messageHash('user', { role: 'user', content: entry.attachment.prompt })]
-  return []
-})
+export function conversation(entries, sessionId = null) {
+  const aliases = new Map(), output = [], unidentified = new Set(), consumedHashes = new Set()
+  const identity = value => typeof value === 'string' && value.length ? value : null
+  const root = node => {
+    let found = node
+    while (found.parent) found = found.parent
+    while (node.parent) { const next = node.parent; node.parent = found; node = next }
+    return found
+  }
+  const merge = (a, b) => {
+    if (a === b) return a
+    b.parent = a
+    a.bad ||= b.bad || !queuedContentAgrees(a, b) || Boolean(a.userHash && b.userHash && a.userHash !== b.userHash) || Boolean(a.consumedHash && b.consumedHash && a.consumedHash !== b.consumedHash) || Boolean(a.command && b.command && a.command !== b.command) || Boolean(a.delivery && b.delivery && a.delivery !== b.delivery)
+    a.mixed ||= b.mixed || Boolean(a.hash && b.hash && a.hash !== b.hash)
+    a.textHash ??= b.textHash
+    a.richHash ??= b.richHash
+    a.userHash ??= b.userHash
+    a.userFirst = Math.min(a.userFirst, b.userFirst)
+    a.consumedHash ??= b.consumedHash
+    a.hash ??= b.hash
+    a.command ??= b.command
+    a.delivery ??= b.delivery
+    a.first = Math.min(a.first, b.first)
+    return a
+  }
+  for (const entry of entries) {
+    let hash = null, command = null, delivery = null, eligible = false, bad = false, consumed = false, shape = {}
+    if (entry && ['user', 'assistant'].includes(entry.type) && entry.message) {
+      hash = messageHash(entry.type, entry.message)
+      eligible = true
+      if (entry.type === 'user') {
+        command = identity(entry.commandUuid) ?? identity(entry.uuid)
+        delivery = identity(entry.deliveryId)
+        if (entry.message.role === 'user' && Object.keys(entry.message).every(key => ['role', 'content', ...MESSAGE_RUNTIME_KEYS].includes(key))) shape = queuedContent(entry.message.content, hash)
+      }
+    } else if (entry?.type === 'attachment' && (typeof entry.attachment?.prompt === 'string' || sessionId && entry.attachment?.type === 'queued_command')) {
+      const prompt = entry.attachment.prompt
+      if (typeof prompt === 'string' || Array.isArray(prompt)) { shape = queuedContent(prompt); hash = shape.hash }
+      command = identity(entry.attachment.commandUuid) ?? identity(entry.attachment.source_uuid)
+      delivery = identity(entry.attachment.delivery_id)
+      eligible = typeof prompt === 'string'
+      bad = !hash
+    } else if (sessionId && entry?.type === 'queue-operation' && entry.sessionId === sessionId) {
+      command = identity(entry.commandUuid)
+      delivery = identity(entry.deliveryId)
+      consumed = entry.operation === 'remove' && entry.reason === 'absorbed_mid_turn'
+      if (typeof entry.content === 'string' || Array.isArray(entry.content)) { shape = queuedContent(entry.content); hash = shape.hash }
+      eligible = consumed && Boolean(hash) && Boolean(command || delivery)
+      if (eligible) consumedHashes.add(hash)
+      bad = consumed && Object.hasOwn(entry, 'content') && !hash || entry.operation === 'remove' && !consumed || ['cancel', 'dequeue'].includes(entry.operation)
+    } else continue
+    const own = entry.sessionId ?? sessionId
+    if (!sessionId || !command && !delivery) {
+      if (eligible) {
+        if (sessionId && own === sessionId && entry.type !== 'assistant') unidentified.add(output.length)
+        output.push(hash)
+      }
+      continue
+    }
+    const keys = [command && stable([own, 'command', command]), delivery && stable([own, 'delivery', delivery])].filter(Boolean)
+    let node = { ...shape, hash, command, delivery, bad, userHash: entry.type === 'user' ? hash : null, userFirst: entry.type === 'user' ? output.length : Infinity,
+      consumedHash: consumed && eligible ? hash : null, first: eligible ? output.length : Infinity }
+    for (const key of keys) if (aliases.has(key)) node = merge(root(aliases.get(key)), node)
+    for (const key of keys) aliases.set(key, node)
+    output.push(node)
+  }
+  return output.flatMap((item, at) => {
+    if (typeof item === 'string') return unidentified.has(at) && consumedHashes.has(item) ? [] : [item]
+    const group = root(item)
+    return !group.bad && (!group.mixed || group.userHash || group.consumedHash) && (group.userHash ? group.userFirst : group.first) === at ? [group.userHash ?? group.consumedHash ?? group.hash] : []
+  })
+}
 
 const conversationFromRows = (rows) => {
   const messages = rows.filter((row) => ['user', 'assistant'].includes(row.event_type))
@@ -1351,14 +1549,29 @@ const multisetConversation = (source, target) => {
   return true
 }
 
-const conversationLcs = (source, target) => {
-  let prior = new Uint16Array(target.length + 1)
-  for (const event of source) {
-    const next = new Uint16Array(target.length + 1)
-    for (let at = 1; at <= target.length; at++) next[at] = event === target[at - 1] ? prior[at - 1] + 1 : Math.max(prior[at], next[at - 1])
-    prior = next
+const nearOrderedConversation = (source, target, tolerance) => {
+  const positions = new Map()
+  for (let at = 0; at < target.length; at++) {
+    if (!positions.has(target[at])) positions.set(target[at], [])
+    positions.get(target[at]).push(at)
   }
-  return prior[target.length]
+  const frontier = Array(tolerance + 1).fill(Infinity)
+  frontier[0] = 0
+  for (const event of source) {
+    const matches = positions.get(event) ?? []
+    for (let skipped = tolerance; skipped >= 0; skipped--) {
+      const start = frontier[skipped]
+      let low = 0, high = matches.length
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2)
+        if (matches[mid] < start) low = mid + 1
+        else high = mid
+      }
+      frontier[skipped] = Math.min(low < matches.length ? matches[low] + 1 : Infinity, skipped ? frontier[skipped - 1] : Infinity)
+    }
+    if (frontier.every(value => value === Infinity)) return false
+  }
+  return frontier.some(value => value !== Infinity)
 }
 
 const conversationAnchored = (source, target, needed) => {
@@ -1370,12 +1583,12 @@ const conversationAnchored = (source, target, needed) => {
   return false
 }
 
-const conversationMatch = (source, target) => {
+export const conversationMatch = (source, target) => {
   if (!Array.isArray(source) || !Array.isArray(target) || !source.length) return null
   if (orderedConversation(source, target)) return 'ordered'
   const tolerance = Math.min(8, Math.floor(source.length / 100))
   if (!tolerance || !multisetConversation(source, target)) return null
-  return source.length - conversationLcs(source, target) <= tolerance ? 'equivalent' : null
+  return nearOrderedConversation(source, target, tolerance) ? 'equivalent' : null
 }
 
 const artifactError = (text, code = 'CLOUD_ARTIFACT_UNCERTAIN') => Object.assign(new Error(`Supplemental cloud coverage is uncertain: ${text}`), { code })
@@ -1391,6 +1604,18 @@ const eventAgrees = (a, b) => a.uuid === b.uuid && a.type === b.type && a.role =
 const agentName = (value) => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value)
 const statIdentity = (detail) => [detail.dev, detail.ino, detail.size, detail.mtimeNs, detail.ctimeNs].join(':')
 
+async function readRegular(file, signature = null) {
+  const before = await lstat(file, { bigint: true })
+  if (!before.isFile() || signature && statIdentity(before) !== signature) throw new Error(`regular file changed before reading: ${file}`)
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    if (statIdentity(await handle.stat({ bigint: true })) !== statIdentity(before)) throw new Error(`regular file changed before reading: ${file}`)
+    const data = await handle.readFile()
+    if (statIdentity(await handle.stat({ bigint: true })) !== statIdentity(before) || statIdentity(await lstat(file, { bigint: true })) !== statIdentity(before)) throw new Error(`regular file changed while reading: ${file}`)
+    return data
+  } finally { await handle.close() }
+}
+
 async function artifactStat(file) {
   const detail = await lstat(file, { bigint: true })
   if (!detail.isFile() || await realpath(file) !== file) throw artifactError('artifact is not a regular file within its session root')
@@ -1400,6 +1625,7 @@ async function artifactStat(file) {
 async function artifactInputs(row) {
   if (!UUID.test(row.id) || path.basename(row.transcript) !== `${row.id}.jsonl` || desktopRecordOf(row).cliSessionId !== row.id) throw artifactError('the linked parent identity is not established')
   const project = await realpath(path.dirname(row.transcript)), transcript = path.join(project, `${row.id}.jsonl`)
+  if (row.sidecar?.canonicalRoot && path.join(project, row.id) !== row.sidecar.canonicalRoot) throw artifactError('session root mapping changed')
   const { signature } = await artifactStat(transcript), root = path.join(project, row.id), directory = path.join(root, 'subagents')
   const fingerprints = [[transcript, signature]], files = []
   for (const dir of [root, directory]) {
@@ -1435,7 +1661,7 @@ async function artifactIndex(file, kind, budget) {
         if (bytesRead !== length) throw artifactError('artifact changed while reading')
         return buffer
       }
-      const result = { main: [], events: [], queued: [], removed: [] }
+      const result = { main: [], events: [], queued: [], operations: [] }
       if (kind === 'header') {
         const data = await read(Math.min(Number(detail.size), 4096), 0)
         const first = data.subarray(0, data.indexOf(10) < 0 ? data.length : data.indexOf(10)).toString('utf8')
@@ -1457,9 +1683,12 @@ async function artifactIndex(file, kind, budget) {
           } else if (row.type === 'attachment' && row.attachment?.type === 'queued_command') {
             const item = row.attachment, prompt = item.prompt
             result.queued.push({ uuid: item.source_uuid, delivery: item.delivery_id, type: 'user', role: 'user', sessionId: row.sessionId, isSidechain: row.isSidechain,
-              hash: typeof prompt === 'string' || Array.isArray(prompt) ? messageHash('user', { role: 'user', content: prompt }) : null })
-          } else if (row.type === 'queue-operation' && row.operation === 'remove' && row.reason === 'absorbed_mid_turn') {
-            result.removed.push({ uuid: row.commandUuid, delivery: row.deliveryId, sessionId: row.sessionId })
+              ...(typeof prompt === 'string' || Array.isArray(prompt) ? queuedContent(prompt) : { hash: null }) })
+          } else if (row.type === 'queue-operation') {
+            const consumed = row.operation === 'remove' && row.reason === 'absorbed_mid_turn'
+            result.operations.push({ uuid: row.commandUuid, delivery: row.deliveryId, sessionId: row.sessionId, consumed,
+              cancelled: row.operation === 'remove' && !consumed || ['cancel', 'dequeue'].includes(row.operation), hasContent: Object.hasOwn(row, 'content'),
+              ...(typeof row.content === 'string' || Array.isArray(row.content) ? queuedContent(row.content) : { hash: null }) })
           } else if (['user', 'assistant'].includes(row.type)) throw artifactError('artifact message is unreadable')
         }
         for (let position = 0; position < Number(detail.size);) {
@@ -1496,6 +1725,7 @@ async function supplementalCoverage(events, row, budget, inputs = null) {
   inputs ??= await artifactInputs(row)
   const local = await artifactIndex(inputs.transcript, 'main', budget)
   const main = Map.groupBy(local.main, event => event.uuid)
+  const commands = Map.groupBy(local.operations, item => item.uuid), deliveries = Map.groupBy(local.operations, item => item.delivery)
   const queues = new Map()
   for (const item of local.queued) {
     const prior = queues.get(item.uuid)
@@ -1512,7 +1742,12 @@ async function supplementalCoverage(events, row, budget, inputs = null) {
       counts.main++
     } else if (queues.has(event.uuid)) {
       const item = queues.get(event.uuid)
-      if (!eventAgrees(item, event) || event.isSidechain === true || event.agentId !== undefined || consumed.has(event.uuid) || !local.removed.some(remove => remove.uuid === item.uuid && remove.delivery === item.delivery && remove.sessionId === row.id)) throw artifactError('queued prompt delivery is not proven')
+      const copies = [...new Set([...(commands.get(item.uuid) ?? []), ...(deliveries.get(item.delivery) ?? [])])]
+      const delivered = copies.filter(copy => copy.consumed && copy.hasContent)
+      if (copies.some(copy => copy.cancelled || copy.sessionId !== row.id || copy.uuid !== undefined && copy.uuid !== item.uuid || copy.delivery !== undefined && copy.delivery !== item.delivery || copy.hasContent && (!copy.hash || !queuedContentAgrees(copy, item))) ||
+        new Set(delivered.map(copy => copy.hash)).size > 1 || new Set([item, ...copies].map(copy => copy.richHash).filter(Boolean)).size > 1) throw artifactError('queued prompt operation copies disagree')
+      const witness = { ...item, hash: delivered[0]?.hash ?? item.hash }
+      if (!eventAgrees(witness, event) || event.isSidechain === true || event.agentId !== undefined || consumed.has(event.uuid) || !copies.some(copy => copy.consumed && copy.uuid === item.uuid && copy.delivery === item.delivery && copy.sessionId === row.id)) throw artifactError('queued prompt delivery is not proven')
       consumed.add(event.uuid)
       queuedIds.push(event.uuid)
       counts.queued++
@@ -1558,6 +1793,7 @@ async function supplementalCoverage(events, row, budget, inputs = null) {
     const current = await lstat(file, { bigint: true }).catch(error => { if (error.code === 'ENOENT') return null; throw error })
     if ((current ? statIdentity(current) : null) !== signature || current && await realpath(file) !== file) throw artifactError('session artifacts changed during coverage analysis')
   }
+  if (await mappedPath(row.transcript) !== inputs.transcript) throw artifactError('session root mapping changed during coverage analysis')
   if (counts.subagent !== pending.length) return null
   return { matchMode: 'artifacts', artifactCounts: counts, artifactSignature: sha(stable(events)) }
 }
@@ -1573,7 +1809,7 @@ async function priorHistory(cache, key) {
       if (sha(stable(current)) === item.signature) {
         cache.stats.historyHits++
         const events = new Map(encoded.events)
-        return { ...encoded, events, roots: new Set(events.keys()) }
+        return { ...encoded, bridgeOwners: uniqueBridgeOwners(encoded.bridgeOwners), events, roots: new Set(events.keys()) }
       }
     } catch {}
   }
@@ -1609,8 +1845,8 @@ async function history(id, transcript, ctx, cwd = '') {
   const comparable = data.invalid === 0 && conflicts === 0 && roots.size > 0
   const bridges = data.entries.filter((entry) => entry.type === 'bridge-session')
   const bridgeIds = [...new Set(bridges.map((entry) => entry.bridgeSessionId ?? entry.bridge_session_id).filter((value) => typeof value === 'string'))]
-  const bridgeOwners = bridges.map(entry => ({ id: remoteId(entry.bridgeSessionId ?? entry.bridge_session_id), account: entry.ownerAccountUuid ?? null, org: entry.ownerOrganizationUuid ?? null }))
-  const result = { roots, events, conversation: conversation(normalized.entries), forks: ctx.scans.get(transcript)?.forked.size ?? 0, state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
+  const bridgeOwners = uniqueBridgeOwners(bridges.map(entry => ({ id: remoteId(entry.bridgeSessionId ?? entry.bridge_session_id), sessionId: entry.sessionId ?? null, account: entry.ownerAccountUuid ?? null, org: entry.ownerOrganizationUuid ?? null })))
+  const result = { roots, events, conversation: conversation(normalized.entries, id), forks: ctx.scans.get(transcript)?.forked.size ?? 0, state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
   if (ctx.cache) {
     const encoded = { ...result, roots: undefined, events: [...events] }
     cacheStore(ctx.cache, 'histories', cacheKey, sha(stable(dependencyRows)), { dependencies: dependencyRows, result: encoded })
@@ -1677,12 +1913,15 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
     return {
       checked: true,
       matches: [],
-      blocked: [{ id: null, title: 'Remote Control', account, error: `cloud check failed: ${error.message}` }],
+      blocked: [{ id: null, title: 'Remote Control', account, error: `cloud check failed: ${error.message}`, code: memoryErrorCode(error) }],
       later: [],
       client: cloud,
       account: cloud.account,
       org: cloud.org,
-      source: account
+      source: account,
+      serial: Boolean(options.serial),
+      isolatedId: options.budgetRetry ? null : undefined,
+      memory: selectedMemory({ ...options, cloud })
     }
   }
   const blocked = []
@@ -1694,7 +1933,9 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
     const value = cache.data.remote[id]?.value?.artifactDeferred
     return Number.isSafeInteger(value) && value > 0 ? value : Infinity
   }
-  const sessions = listed.filter((session) =>
+  const priority = new Map((options.budgetRetry ?? []).map((id, index) => [id, index]))
+  const retryOrder = id => priority.get(remoteId(id)) ?? Infinity
+  const eligibleSessions = listed.filter((session) =>
     !excludedIds.has(remoteId(session?.id)) &&
     (!sessionIds || sessionIds.has(remoteId(session?.id))) &&
     session?.environment_kind === 'bridge' &&
@@ -1710,7 +1951,9 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
     if (createdAt >= 0) return true
     blocked.push({ id: session.id ?? null, title: session.title ?? 'Remote Control', account, error: 'Remote Control creation time is missing, check refused to widen the original move' })
     return false
-  }).sort((a, b) => deferredOrder(a.id) - deferredOrder(b.id))
+  }).sort((a, b) => retryOrder(a.id) - retryOrder(b.id) || deferredOrder(a.id) - deferredOrder(b.id))
+  const sessions = options.budgetRetry ? eligibleSessions.slice(0, 1) : eligibleSessions
+  if (options.budgetRetry) for (const session of eligibleSessions.slice(1)) waiting.push({ id: session.id, title: session.title || 'Untitled session', localId: null, code: 'CLOUD_MEMORY_DEFERRED' })
   const matches = []
   const artifacts = artifactBudget(options.artifactLimit)
   let completed = 0
@@ -1750,7 +1993,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       const findCovered = (items) => items.flatMap((candidate) => {
         const matchMode = conversationMatch(remoteConversation, candidate.conversation)
         if (matchMode) return [{ ...candidate, matchMode }]
-        const retained = candidate.row.retainedHistories?.find(history => history.bridgeIds.includes(sessionId) && conversationMatch(remoteConversation, history.conversation))
+        const retained = candidate.row.retainedHistories?.find(history => history.bindings.some(owner => owner.id === sessionId && sameAccount(owner, account)) && conversationMatch(remoteConversation, history.conversation))
         return retained ? [{ ...candidate, matchMode: conversationMatch(remoteConversation, retained.conversation), retained }] : []
       })
       const eligible = remoteConversation.length >= 4 ? candidates : [...new Set([...named, ...linked])]
@@ -1801,21 +2044,23 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       rescuePayloads(rows)
       return { match: { session, target: { kind: 'rescue', base, id: null, title: rescueTitle(session.title), matchMode: 'rescue' }, conversationSha: sha(stable(remoteConversation)), account } }
     } catch (error) {
-      return { blocked: { id: session.id, title: session.title, account, code: error.code, error: `Remote Control history unreadable: ${error.message}` } }
+      return { blocked: { id: session.id, title: session.title, account, code: memoryErrorCode(error), error: `Remote Control history unreadable: ${error.message}` } }
     } finally {
       release()
       progress(report, 'cloud scan', ++completed, sessions.length)
     }
   }
-  for (let at = 0; at < sessions.length; at += 8) {
-    const batch = await Promise.all(sessions.slice(at, at + 8).map(analyze))
+  for (let at = 0; at < sessions.length;) {
+    const batch = await Promise.all(sessions.slice(at, at + (options.serial ? 1 : selectedMemory({ ...options, cloud }).parallel())).map(analyze))
+    at += batch.length
     for (const result of batch) {
       if (result.match) matches.push(result.match)
       else if (result.waiting) waiting.push(result.waiting)
       else blocked.push(result.blocked)
     }
   }
-  return { checked: true, matches, blocked, waiting, later, client: cloud, account: cloud.account, org: cloud.org, source: account, artifacts }
+  return { checked: true, matches, blocked, waiting, later, client: cloud, account: cloud.account, org: cloud.org, source: account, artifacts, serial: Boolean(options.serial),
+    isolatedId: options.budgetRetry ? remoteId(sessions[0]?.id) : undefined, memory: selectedMemory({ ...options, cloud }) }
 }
 
 const rehomeReason = (source, to, targetIds, targetNames) => {
@@ -1887,8 +2132,36 @@ function localPlan(pending, to) {
   return { move, blocked }
 }
 
+async function retainedHistories(target, ctx, options, owners, enabled) {
+  target.artifactBridgeIds = [...new Set([...remoteIdsOf(target), ...(options.cloudBridgeIds?.get(target.id) ?? []).map(remoteId).filter(Boolean)])]
+  if (!enabled) return
+  const prior = desktopRecordOf(target).priorCliSessionIds
+  const priorIds = Array.isArray(prior) ? [...new Set(prior.filter(id => typeof id === 'string' && UUID.test(id) && id !== target.id))] : []
+  const remembered = [target.id, ...priorIds].flatMap(id => options.cloudBridgeIds?.get(id) ?? [])
+  if (remembered.length) target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...remembered.map(remoteId).filter(Boolean)])]
+  for (const id of priorIds) {
+    const transcript = path.join(path.dirname(target.transcript), `${id}.jsonl`)
+    if (!ctx.index.get(id)?.includes(transcript)) continue
+    try {
+      const canonicalTranscript = await mappedPath(transcript)
+      const before = await artifactStat(canonicalTranscript)
+      const detail = await history(id, transcript, ctx, desktopRecordOf(target).cwd)
+      if (!detail.comparable || (await artifactStat(canonicalTranscript)).signature !== before.signature || sha(await readRegular(canonicalTranscript, before.signature)) !== detail.contentSha || await mappedPath(transcript) !== canonicalTranscript) continue
+      const native = [...Map.groupBy(detail.bridgeOwners, owner => owner.id).values()].flatMap(copies => {
+        const owner = copies[0]
+        return copies.length === 1 && owner.id && owner.sessionId === id && owners.some(source => sameAccount(owner, source)) ? [owner] : []
+      })
+      const bindings = [...native, ...(options.cloudBridgeIds?.get(id) ?? []).map(remoteId).filter(Boolean).map(id => ({ id, account: options.cloud?.account, org: options.cloud?.org }))]
+      const bridgeIds = [...new Set(bindings.map(owner => owner.id))]
+      if (!bridgeIds.length) continue
+      target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...bridgeIds])]
+      ;(target.retainedHistories ??= []).push({ transcript, canonicalTranscript, fingerprint: before.signature, contentSha: detail.contentSha, conversation: detail.conversation, bindings })
+    } catch {}
+  }
+}
+
 export async function inventory(from, to, paths, report = () => {}, options = {}) {
-  const check = options.check ?? (() => {})
+  const check = () => { options.check?.(); selectedMemory(options).check() }
   check()
   const requestedAt = options.requestedAt ?? new Date().toISOString()
   const cloudRequested = options.cloudRequested === true || Boolean(options.cloud)
@@ -1923,8 +2196,10 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
           }
           if (!detail.roots.size && !detail.invalid) { missing.push(s); continue }
           const source = { ...s, account, transcript, ...detail, taskOwned: account.taskSessions.has(s.record.sessionId), worker: ownsWorker(ctx.workers, s.id, s.record.sessionId), recordSha: sha(await readFile(s.file)), recordSemantic: recordSemantic(s.record) }
-          if (validDesktopRecord(source)) found.push(source)
-          else rejected.push({ ...s, account, error: 'Desktop record identity is invalid' })
+          if (validDesktopRecord(source)) {
+            await retainedHistories(source, ctx, options, [account], cloudRequested)
+            found.push(source)
+          } else rejected.push({ ...s, account, error: 'Desktop record identity is invalid' })
         } catch (error) {
           rejected.push({ ...s, account, error: error.message })
         }
@@ -1967,8 +2242,10 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
         const detail = transcript ? await history(s.id, transcript, ctx, s.cwd) : null
         if (detail?.roots.size) {
           const target = { record: s.record.sessionId, id: s.id, ...detail, session: s, account: to, taskOwned: to.taskSessions.has(s.record.sessionId), worker: ownsWorker(ctx.workers, s.id, s.record.sessionId), transcript, transcriptFingerprint: await fingerprint(transcript, cache), sidecar: await sidecars(transcript, s.id, cache), recordSha: sha(await readFile(s.file)), recordSemantic: recordSemantic(s.record) }
-          if (validDesktopRecord(target)) targets.push(target)
-          else rejected.push({ id: s.id, title: s.title, account: to, target: true, error: 'Desktop record identity is invalid' })
+          if (validDesktopRecord(target)) {
+            await retainedHistories(target, ctx, options, options.cloud ? [options.cloud] : from, cloudRequested)
+            targets.push(target)
+          } else rejected.push({ id: s.id, title: s.title, account: to, target: true, error: 'Desktop record identity is invalid' })
         }
       } catch (error) {
         rejected.push({ id: s.id, title: s.title, account: to, target: true, error: error.message })
@@ -1976,21 +2253,6 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     } finally {
       progress(report, 'scan', ++completed, workTotal)
       check()
-    }
-  }
-  for (const target of targets) {
-    target.artifactBridgeIds = [...new Set([...remoteIdsOf(target), ...(options.cloudBridgeIds?.get(target.id) ?? []).map(remoteId).filter(Boolean)])]
-    const prior = target.session.record.priorCliSessionIds
-    const priorIds = Array.isArray(prior) ? prior.filter(id => UUID.test(id) && options.cloudBridgeIds?.has(id)) : []
-    const remembered = [target.id, ...priorIds].flatMap(id => options.cloudBridgeIds?.get(id) ?? [])
-    if (remembered.length) target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...remembered.map(remoteId).filter(Boolean)])]
-    for (const id of priorIds) {
-      const transcript = locate(ctx.index, id, target.session.cwd)
-      if (!transcript) continue
-      try {
-        const detail = await history(id, transcript, ctx, target.session.cwd)
-        if (detail.comparable) (target.retainedHistories ??= []).push({ transcript, fingerprint: await fingerprint(transcript, cache), contentSha: detail.contentSha, conversation: detail.conversation, bridgeIds: options.cloudBridgeIds.get(id).map(remoteId).filter(Boolean) })
-      } catch {}
     }
   }
   const covering = (s) => targets.find((target) => target.record && s.members.every((member) => included(member, target) && (!requiredParents.has(member.record.sessionId) || target.record === member.record.sessionId))) ?? null
@@ -2022,9 +2284,17 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     const sessionIds = linkedCloudIds(links, account)
     return sessionIds.length ? [{ ...accountRef(account), sessionIds }] : []
   })
-  check()
-  await saveAnalysisCache(cache)
-  check()
+  try {
+    check()
+    await saveAnalysisCache(cache)
+    check()
+  } catch (error) {
+    if (error.code === 'CLOUD_MEMORY_BUDGET' && cloudPlan.isolatedId && (cloudPlan.matches.some(match => remoteId(match.session.id) === cloudPlan.isolatedId) ||
+      cloudPlan.blocked.some(row => row.code === 'CLOUD_MEMORY_BUDGET' && remoteId(row.id) === cloudPlan.isolatedId))) {
+      error.budgetWork = { id: cloudPlan.isolatedId, waiting: cloudPlan.waiting }
+    }
+    throw error
+  }
   return {
     total,
     missing,
@@ -2060,9 +2330,9 @@ async function rehomeOne(s, to, journal, guard) {
   if (!s.contentSha || sourceSha !== s.contentSha) throw new Error('source changed since inventory')
   if (!s.snapshot) throw new Error('source analysis unavailable')
   const sidecarRoot = path.join(path.dirname(s.transcript), s.id)
-  const sidecarFingerprint = (await treeFingerprint(sidecarRoot)).fingerprint
-  if (!s.sidecar.fingerprint || sidecarFingerprint !== s.sidecar.fingerprint) throw new Error('source sidecars changed since inventory')
-  const sourceSidecars = { ...s.sidecar, fingerprint: sidecarFingerprint }
+  const sidecarTree = await treeFingerprint(sidecarRoot)
+  if (!s.sidecar.fingerprint || !sameTree(s.sidecar, sidecarTree)) throw new Error('source sidecars changed since inventory')
+  const sourceSidecars = { ...s.sidecar, fingerprint: sidecarTree.fingerprint, canonicalRoot: sidecarTree.canonicalRoot }
   const sourceRecord = await readFile(s.file, 'utf8')
   const current = JSON.parse(sourceRecord)
   if (current.cliSessionId !== s.id || !validDesktopRecord({ file: s.file, record: current })) throw new Error('source Desktop record changed identity')
@@ -2092,7 +2362,7 @@ async function rehomeOne(s, to, journal, guard) {
   ])
   if (afterTranscriptFingerprint !== transcriptFingerprint) throw new Error('source changed during move')
   if (sha(afterRecord) !== sourceRecordSha) throw new Error('source Desktop record changed during move')
-  if (afterSidecars.fingerprint !== sourceSidecars.fingerprint) throw new Error('source sidecars changed during move')
+  if (!sameTree(sourceSidecars, afterSidecars)) throw new Error('source sidecars changed during move')
   guard.check?.()
   for (const member of s.members ?? [s]) {
     member.strategy = 'rehome'
@@ -2110,14 +2380,14 @@ async function rehomeOne(s, to, journal, guard) {
     targetDir: sourceSidecars.count ? path.join(path.dirname(s.transcript), s.id) : null,
     record,
     recordSha,
-    recordSnapshot: placed,
+    recordSnapshot: recordSnapshot(placed),
     recordSemantic: recordSemantic(placed),
     targetRecordId: current.sessionId,
     taskFile: to.taskFile,
     taskOwned: false,
     ...(s.taskFamily ? { taskFamily: s.taskFamily.key } : {}),
     transcriptFingerprint,
-    sidecars: { count: sourceSidecars.count, bytes: sourceSidecars.bytes, fingerprint: sourceSidecars.fingerprint },
+    sidecars: { count: sourceSidecars.count, bytes: sourceSidecars.bytes, fingerprint: sourceSidecars.fingerprint, canonicalRoot: sourceSidecars.canonicalRoot },
     events: s.roots.size
   }
 }
@@ -2250,7 +2520,7 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
     const targetDir = row.targetDir ?? path.join(path.dirname(row.targetTranscript), row.targetId)
     const sidecarsExist = !row.sidecars?.count || await exists(targetDir)
     if (!sidecarsExist) changes.push('sidecars missing')
-    else if (checkShared && row.sidecars?.fingerprint && (await treeFingerprint(targetDir).catch(() => null))?.fingerprint !== row.sidecars.fingerprint) {
+    else if (row.sidecars?.canonicalRoot && await mappedPath(targetDir).catch(() => null) !== row.sidecars.canonicalRoot || checkShared && row.sidecars?.fingerprint && !sameTree(row.sidecars, await treeFingerprint(targetDir).catch(() => null))) {
       changes.push('sidecars')
     }
   } else {
@@ -2346,7 +2616,7 @@ async function verify(rows, report = () => {}, check = () => {}) {
       const targetDir = r.targetDir ?? path.join(path.dirname(r.targetTranscript), r.targetId)
       const currentFingerprint = await fingerprint(r.targetTranscript).catch(() => null)
       if (!currentFingerprint || currentFingerprint !== r.transcriptFingerprint) flag('transcript', r)
-      if ((await treeFingerprint(targetDir).catch(() => null))?.fingerprint !== r.sidecars.fingerprint) flag('sidecars', r)
+      if (!sameTree(r.sidecars, await treeFingerprint(targetDir).catch(() => null))) flag('sidecars', r)
       const raw = await readFile(r.record, 'utf8').catch(() => null)
       if (!raw || sha(raw) !== r.recordSha) flag('desktop', r)
       check()
@@ -2413,24 +2683,45 @@ const saveText = async (file, text, before = () => {}) => {
 
 const saveJson = (file, value, spacing = 2) => saveText(file, jsonText(value, spacing))
 
-async function readReceipt(file) {
+export async function readReceipt(file) {
   const receipt = await readJson(file)
-  const text = await readFile(`${file}.journal`, 'utf8').catch((error) => {
-    if (error.code === 'ENOENT') return ''
+  const trim = row => {
+    if (row?.recordSnapshot && typeof row.recordSnapshot === 'object' && !Array.isArray(row.recordSnapshot)) row.recordSnapshot = recordSnapshot(row.recordSnapshot)
+    return row
+  }
+  for (const key of ['sessions', 'failed', 'retained']) if (Array.isArray(receipt[key])) receipt[key].forEach(trim)
+  trim(receipt.pending)
+  const handle = await open(`${file}.journal`, 'r').catch((error) => {
+    if (error.code === 'ENOENT') return null
     throw error
   })
-  for (const line of text.split('\n').slice(0, -1)) {
+  if (!handle) return receipt
+  const apply = line => {
     const patch = JSON.parse(line)
     if (!Number.isSafeInteger(patch.sequence) || patch.sequence < 1) throw new Error('Invalid move journal sequence')
-    if (patch.sequence <= (receipt.journalSequence ?? 0)) continue
+    if (patch.sequence <= (receipt.journalSequence ?? 0)) return
     if (patch.sequence !== (receipt.journalSequence ?? 0) + 1) throw new Error('Incomplete move journal')
     for (const key of ['sessions', 'failed', 'retained']) {
       if (!Array.isArray(patch[key])) throw new Error('Invalid move journal entries')
-      if (patch[key].length) (receipt[key] ??= []).push(...patch[key])
+      for (const row of patch[key]) (receipt[key] ??= []).push(trim(row))
     }
-    receipt.pending = patch.pending
+    receipt.pending = trim(patch.pending)
     receipt.journalSequence = patch.sequence
   }
+  try {
+    let parts = [], length = 0
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      let start = 0
+      for (let end = chunk.indexOf(10); end >= 0; end = chunk.indexOf(10, start)) {
+        const part = chunk.subarray(start, end)
+        apply((parts.length ? Buffer.concat([...parts, part], length + part.length) : part).toString('utf8'))
+        parts = []
+        length = 0
+        start = end + 1
+      }
+      if (start < chunk.length) { parts.push(chunk.subarray(start)); length += chunk.length - start }
+    }
+  } finally { await handle.close() }
   return receipt
 }
 
@@ -2898,12 +3189,12 @@ async function witnessed(row, liveWorkers, checkShared = true) {
       treeFingerprint(sidecarRoot).catch(() => null)
     ])
     const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has(desktopRecordOf(row).sessionId) === row.taskOwned
-    const shared = Boolean(currentTranscript) && (!expectedSidecars.count || await exists(sidecarRoot)) && (!checkShared || (currentTranscript === row.transcriptFingerprint && currentSidecars?.fingerprint === expectedSidecars.fingerprint))
+    const shared = Boolean(currentTranscript) && (!expectedSidecars.count || await exists(sidecarRoot)) && (!expectedSidecars.canonicalRoot || currentSidecars?.canonicalRoot === expectedSidecars.canonicalRoot) && (!checkShared || (currentTranscript === row.transcriptFingerprint && sameTree(expectedSidecars, currentSidecars)))
     return shared && sameTask && !ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId)
   }
   const now = await sidecars(row.transcript, row.id).catch(() => null)
   const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has(desktopRecordOf(row).sessionId) === row.taskOwned
-  if (!now || now.sha !== row.sidecar.sha || !sameTask || ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId)) return false
+  if (!now || now.sha !== row.sidecar.sha || row.sidecar.canonicalRoot && now.canonicalRoot !== row.sidecar.canonicalRoot || !sameTask || ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId)) return false
   return await exists(row.transcript) && !(await changed(row.transcript, row.id, { semantic: row.snapshot, semanticVersion: SEMANTIC_VERSION, bridge: row.bridge }))
 }
 
@@ -3113,7 +3404,15 @@ const remoteOpen = (session) => session?.connection_status === 'connected' || Ar
 const remoteBusy = (session) => session?.connection_status !== 'disconnected' ||
   !Array.isArray(session?.client_presence) || session.client_presence.length > 0 ||
   !REMOTE_IDLE.has(session?.worker_status)
-const remoteStateSha = (rows) => sha(stable(rows.filter((row) => ['user', 'assistant'].includes(row.event_type) || row.event_type.startsWith('control_'))))
+const remoteStateSha = (rows) => {
+  const hash = createHash('sha256').update('[')
+  let separator = ''
+  for (const row of rows) if (['user', 'assistant'].includes(row.event_type) || row.event_type.startsWith('control_')) {
+    hash.update(separator).update(stable(row))
+    separator = ','
+  }
+  return hash.update(']').digest('hex')
+}
 
 function remoteActionsPending(session) {
   const metadata = session.external_metadata
@@ -3263,7 +3562,7 @@ async function rescueRemote(match, to, cloud, journal) {
   await writeNew(targetTranscript, transcriptText)
   await writeNew(record, recordText)
   const sidecarRoot = path.join(path.dirname(targetTranscript), targetId)
-  const sidecarFingerprint = (await treeFingerprint(sidecarRoot)).fingerprint
+  const sidecarTree = await treeFingerprint(sidecarRoot)
   const remoteEventSha = sha(stable(rows.map((row) => ({ eventType: row.event_type, payload: row.payload, sequence: row.sequence_num }))))
   return {
     strategy: 'remote',
@@ -3279,7 +3578,7 @@ async function rescueRemote(match, to, cloud, journal) {
     targetDir: null,
     record,
     recordSha: sha(recordText),
-    recordSnapshot: placed,
+    recordSnapshot: recordSnapshot(placed),
     recordSemantic: recordSemantic(placed),
     targetRecordId: placed.sessionId,
     taskFile: to.taskFile,
@@ -3287,7 +3586,7 @@ async function rescueRemote(match, to, cloud, journal) {
     transcriptFingerprint: await fingerprint(targetTranscript),
     targetSemantic,
     targetSemanticVersion: SEMANTIC_VERSION,
-    sidecars: { count: 0, bytes: 0, sha: sha(stable([])), fingerprint: sidecarFingerprint },
+    sidecars: { count: 0, bytes: 0, sha: sha(stable([])), fingerprint: sidecarTree.fingerprint, canonicalRoot: sidecarTree.canonicalRoot },
     events: remoteHistory.length,
     remoteEvents: rows.length,
     remoteEventSha
@@ -3336,7 +3635,7 @@ async function applyActivation(activation, row) {
   await saveText(activation.record, jsonText(activation.after))
   if (sha(await readFile(activation.record)) !== activation.afterSha) throw new Error('local target activation verification failed')
   row.recordSha = activation.afterSha
-  row.recordSnapshot = structuredClone(activation.after)
+  row.recordSnapshot = recordSnapshot(activation.after)
   row.recordSemantic = activation.afterSemantic
   row.archived = false
   if (row.session) {
@@ -3385,7 +3684,7 @@ async function rollbackActivation(activation, row = null) {
   if (semantic === activation.afterSemantic) await saveText(activation.record, text)
   if (row) {
     row.recordSha = sha(text)
-    row.recordSnapshot = structuredClone(restored)
+    row.recordSnapshot = recordSnapshot(restored)
     row.recordSemantic = recordSemantic(restored)
     row.archived = true
     if (row.session) {
@@ -3399,8 +3698,8 @@ function receiptCloudCheck(receipt, cloud) {
   return (receipt.cloudChecks ?? []).find((check) => sameAccount(check, cloud)) ?? null
 }
 
-function clearCloudAttempt(receipt, cloud) {
-  receipt.failed = (receipt.failed ?? []).filter((failure) => !cloudTagged(failure, cloud) || failure.blockedByLocal?.length)
+function clearCloudAttempt(receipt, cloud, retain = () => false) {
+  receipt.failed = (receipt.failed ?? []).filter((failure) => !cloudTagged(failure, cloud) || failure.blockedByLocal?.length || retain(failure))
   receipt.cloudError = null
   if (receipt.verification) {
     const retried = (receipt.verification.problems ?? []).some(problem => cloudTagged(problem, cloud))
@@ -3426,14 +3725,27 @@ function addCloudFailure(receipt, cloud, failure) {
   } else receipt.failed.push(taggedCloudFailure(cloud, failure))
 }
 
-function finishCloudAttempt(receipt, cloud, later = [], waiting = []) {
+function finishCloudAttempt(receipt, cloud, later = [], waiting = [], options = {}) {
   const check = receiptCloudCheck(receipt, cloud)
   if (!check) return null
   const failures = receipt.failed.filter((failure) => cloudTagged(failure, cloud))
+  const budget = memorySignature(options.memory ?? cloud.memory ?? operationMemory())
+  const isolatedId = Object.hasOwn(options, 'isolatedId') ? options.isolatedId : cloud.isolatedId
+  for (const failure of failures) {
+    if (failure.code === 'CLOUD_MEMORY_BUDGET' && isolatedId !== undefined && remoteId(failure.id) === isolatedId) failure.code = 'CLOUD_BUDGET_LIMIT'
+    if (['CLOUD_MEMORY_BUDGET', 'CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT'].includes(failure.code)) {
+      failure.limitEngine ??= artifactEngine()
+      if (failure.code !== 'CLOUD_HISTORY_LIMIT') failure.limitBudget ??= budget
+    }
+  }
+  check.attemptEngine = artifactEngine()
+  check.attemptBudget = budget
+  if (failures.length && failures.every(row => row.code === 'CLOUD_AUTH_PENDING')) check.authRetries = (check.authRetries ?? 0) + 1
+  else delete check.authRetries
   check.waiting = [...new Map([...(check.waiting ?? []), ...waiting].map(row => [row.id, row])).values()]
   check.status = failures.length ? failures.every(row => row.blockedByLocal?.length) && !check.waiting.length ? 'blocked-local' : 'failed' : check.waiting.length ? 'waiting' : 'complete'
   check.checkedAt = new Date().toISOString()
-  if (failures.length) check.failures = failures.map(({ id, title, error, code }) => ({ id, title, error, ...(code ? { code } : {}) }))
+  if (failures.length) check.failures = failures.map(({ id, title, error, code, limitEngine, limitBudget }) => ({ id, title, error, ...(code ? { code } : {}), ...(limitEngine ? { limitEngine } : {}), ...(limitBudget ? { limitBudget } : {}) }))
   else delete check.failures
   if (later.length) check.later = later
   else delete check.later
@@ -3463,8 +3775,10 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
     }
     const liveWorkers = workers()
     const retained = match.target.retained
-    const retainedUnchanged = async () => !retained || await fingerprint(retained.transcript).catch(() => null) === retained.fingerprint &&
-      await readFile(retained.transcript).then(sha).catch(() => null) === retained.contentSha
+    const retainedUnchanged = async () => !retained || await mappedPath(retained.transcript).catch(() => null) === retained.canonicalTranscript &&
+      await artifactStat(retained.canonicalTranscript).then(value => value.signature).catch(() => null) === retained.fingerprint &&
+      await readRegular(retained.canonicalTranscript, retained.fingerprint).then(sha).catch(() => null) === retained.contentSha &&
+      await mappedPath(retained.transcript).catch(() => null) === retained.canonicalTranscript
     const targetOkay = row?.targetId
       ? !(await targetChanges(row, liveWorkers, true)).length
       : row ? await untouched(row, liveWorkers) : false
@@ -3481,7 +3795,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       const currentConversation = conversationFromRows(current.rows)
       if (sha(stable(currentConversation)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
     } catch (error) {
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code, localId: match.target.id })
+      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: memoryErrorCode(error), localId: match.target.id })
       progress(report, 'cloud', ++archived, matches.length, cloudProgress(receipt, inv.cloud))
       continue
     }
@@ -3489,7 +3803,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
     try {
       activation = await targetActivation(row, match.target.kind === 'existing' && receipt.sessions.some(session => session.record === row.session?.file && !session.archived))
     } catch (error) {
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code, localId: match.target.id })
+      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: memoryErrorCode(error), localId: match.target.id })
       progress(report, 'cloud', ++archived, matches.length, cloudProgress(receipt, inv.cloud))
       continue
     }
@@ -3503,7 +3817,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       const current = await stableRemoteRows(cloud, pending.id)
       if (current.marker !== pending.lastEventAt) throw new Error('Remote Control history changed before archival')
       if (current.stateSha !== pending.stateSha) throw new Error('Remote Control history or input changed before archival')
-      if (retained && (!await retainedUnchanged() || !await untouched(row, workers()))) throw new Error('Retained local history changed before Remote Control archival')
+      if (retained && (!await retainedUnchanged() || (row?.targetId ? (await targetChanges(row, workers(), true)).length : !await untouched(row, workers())))) throw new Error('Retained local history changed before Remote Control archival')
       if (match.target.matchMode === 'artifacts') {
         const events = remoteEvents(current.rows)
         if (sha(stable(events)) !== match.target.artifactSignature) throw artifactError('remote event identities changed before archival')
@@ -3529,7 +3843,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
           rolledBack = true
         } catch {}
       }
-      addCloudFailure(receipt, inv.cloud, { id: pending.id, title: pending.title, error: error.message, code: error.code, localId: match.target.id })
+      addCloudFailure(receipt, inv.cloud, { id: pending.id, title: pending.title, error: error.message, code: memoryErrorCode(error), localId: match.target.id })
       if (!rolledBack) {
         for (const skipped of matches.slice(index + 1)) addCloudFailure(receipt, inv.cloud, { id: skipped.session.id, title: skipped.session.title, error: 'not attempted while Remote Control recovery is pending' })
       }
@@ -3558,7 +3872,7 @@ async function rescueCloud(inv, receipt, to, paths, save, report = () => {}) {
       events += row.events
     } catch (error) {
       await quarantine(receipt.pending.made ?? [], path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code, localId: error.localId, recordId: error.recordId })
+      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: memoryErrorCode(error), localId: error.localId, recordId: error.recordId })
       match.target.failed = true
     }
     receipt.pending = null
@@ -3576,6 +3890,21 @@ const cloudScope = (supplied, source) => !supplied || typeof supplied === 'funct
 const cloudAttemptAt = (receipt, source) => {
   const key = `${source.account}/${source.org}`, at = receipt.cloudAttempts?.[key] ?? (receipt.automaticCloudAttempt?.key === key ? receipt.automaticCloudAttempt.at : 0)
   return Number.isFinite(at) && at >= 0 ? at : 0
+}
+const unchangedLimit = (source, row, memory) => source.attemptEngine === artifactEngine() && (row.limitEngine ?? source.attemptEngine) === artifactEngine() &&
+  (row.code === 'CLOUD_HISTORY_LIMIT' || source.attemptBudget === memorySignature(memory) && (row.limitBudget ?? source.attemptBudget) === memorySignature(memory))
+const limitedFailure = (source, row, memory) => ['CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT'].includes(row.code) && unchangedLimit(source, row, memory)
+const budgetRetryRows = (source, memory) => [
+  ...(source.waiting ?? []).filter(row => row.code === 'CLOUD_MEMORY_DEFERRED'),
+  ...(source.failures ?? []).filter(row => row.code === 'CLOUD_MEMORY_BUDGET' && unchangedLimit(source, row, memory))
+]
+const historyLimited = (source, memory = operationMemory()) => !source?.waiting?.length && source?.failures?.length && source.failures.every(row => limitedFailure(source, row, memory))
+const cloudRetryAt = (receipt, source, active, now = Date.now(), memory = operationMemory()) => {
+  if (historyLimited(source, memory)) return null
+  const last = cloudAttemptAt(receipt, source)
+  const auth = source.failures?.length && source.failures.every(row => row.code === 'CLOUD_AUTH_PENDING')
+  if (!last || last > now || auth && sameLogin(source, active) && active?.at && source.loginAt !== active.at) return now
+  return last + (auth && (source.authRetries ?? 0) <= 2 ? 15_000 : 60_000)
 }
 
 async function sourceCloud(paths, source, supplied) {
@@ -3952,20 +4281,26 @@ export function finishPending(paths, options = {}) {
         notMoved: nothing ? [] : (receipt.failed ?? []).filter(row => !row.cloudAccount), problems: receipt.verification?.problems ?? [],
         reason: receipt.verification?.ok === false && !receipt.verification.problems?.length ? 'The previous move failed verification' : undefined }
     }
-    const active = await cloudIdentity(paths, options), now = Date.now()
+    const active = await cloudIdentity(paths, options), now = Date.now(), memory = selectedMemory(options)
     const table = options.automatic ? options.processes ?? processTable(paths.claudeApp) : []
     const eligible = outstanding.filter(source => sameLogin(source, active) && cloudScope(options.cloud, source))
     const check = eligible.filter(source => !options.automatic ||
       (typeof options.automatic !== 'object' || sameAccount(source, options.automatic)) &&
-      (now - cloudAttemptAt(receipt, source) >= 60_000 || cloudAttemptAt(receipt, source) > now) &&
-      !canRestartWaiting({ cloudChecks: [source] }, table)).sort((a, b) => cloudAttemptAt(receipt, a) - cloudAttemptAt(receipt, b))[0]
+      cloudRetryAt(receipt, source, active, now, memory) !== null && now >= cloudRetryAt(receipt, source, active, now, memory) &&
+      (!canRestartWaiting({ cloudChecks: [source] }, table) || budgetRetryRows(source, memory).length)).sort((a, b) => cloudAttemptAt(receipt, a) - cloudAttemptAt(receipt, b))[0]
     if (!check) {
       if (options.automatic || eligible.length || outstanding.some(source => sameLogin(source, active))) return { pending: true, ok: true, complete: false }
       throw new Error(`sign Claude Desktop into ${[...new Set(outstanding.map(loginLabel))].join(' or ')}`)
     }
     const report = (stage, text, extra = {}) => options.report?.(stage, text, { ...sourceProgress(check), ...extra })
+    const retryRows = options.automatic ? budgetRetryRows(check, memory) : []
+    const budgetRetry = retryRows.length ? [...new Set(retryRows.map(row => remoteId(row.id)).filter(Boolean))] : null
+    const serial = Boolean(budgetRetry)
+    const preserved = new Set(options.automatic ? receipt.failed.filter(row => cloudTagged(row, check) && limitedFailure(check, row, memory)) : [])
+    if (active.at && check.loginAt !== active.at) check.authRetries = 0
+    check.loginAt = active.at ?? null
     receipt.cloudAttempts = { ...receipt.cloudAttempts, [`${check.account}/${check.org}`]: now }
-    clearCloudAttempt(receipt, check)
+    clearCloudAttempt(receipt, check, row => preserved.has(row))
     await saveJson(file, receipt)
     let cloud, to, inv
     try {
@@ -3981,11 +4316,11 @@ export function finishPending(paths, options = {}) {
       for (const row of links) {
         cloudBridgeIds.set(row.targetId, [...new Set([...(cloudBridgeIds.get(row.targetId) ?? []), ...row.bridgeIds])])
       }
-      const cloudExcludedIds = new Set(receipt.failed.filter(row => cloudTagged(row, cloud) && row.blockedByLocal?.length).map(row => remoteId(row.id)))
-      inv = await inventory([cloudSource], to, paths, report, { cloud, cloudRequested: true, cloudTargetOnly: true, cloudCutoff: receipt.startedAt, cloudBridgeIds, cloudSessionIds: check.sessionIds ? new Set(check.sessionIds) : null, cloudExcludedIds, writeCache: true, automatic: Boolean(options.automatic), artifactLimit: options.artifactLimit, processes: options.processes })
+      const cloudExcludedIds = new Set(receipt.failed.filter(row => cloudTagged(row, cloud) && (row.blockedByLocal?.length || preserved.has(row))).map(row => remoteId(row.id)).filter(Boolean))
+      inv = await inventory([cloudSource], to, paths, report, { cloud, memory, serial, budgetRetry, cloudRequested: true, cloudTargetOnly: true, cloudCutoff: receipt.startedAt, cloudBridgeIds, cloudSessionIds: check.sessionIds ? new Set(check.sessionIds) : null, cloudExcludedIds, writeCache: true, automatic: Boolean(options.automatic), artifactLimit: options.artifactLimit, processes: options.processes })
     } catch (error) {
-      addCloudFailure(receipt, check, { id: null, title: check.label, error: error.message, code: error.code })
-      finishCloudAttempt(receipt, check)
+      addCloudFailure(receipt, check, { id: error.budgetWork?.id ?? null, title: check.label, error: error.message, code: memoryErrorCode(error) })
+      finishCloudAttempt(receipt, check, [], error.budgetWork?.waiting ?? [], { memory, isolatedId: error.budgetWork?.id ?? (budgetRetry ? null : undefined) })
       await saveJson(file, receipt)
       const failed = receipt.failed.filter(failure => actionableCloudFailure(receipt, failure))
       return { file, receipt, summary: receiptSummary(receipt), ok: false, complete: false, pendingCloud: openCloudChecks(receipt).length, pendingLabels: cloudCheckLabels(receipt), failed }
@@ -4001,7 +4336,7 @@ export function finishPending(paths, options = {}) {
     receipt.verification.problems = [...(receipt.verification.problems ?? []), ...verification.problems.map((problem) => taggedCloudFailure(inv.cloud, problem))]
     await save()
     await archiveCloud(inv, receipt, save, report)
-    finishCloudAttempt(receipt, cloud, inv.cloud.later, inv.cloud.waiting)
+    finishCloudAttempt(receipt, cloud, inv.cloud.later, inv.cloud.waiting, { memory, isolatedId: inv.cloud.isolatedId })
     await projectLocalFailures(receipt, paths)
     await save()
     const completedRemote = receipt.remote.slice(beforeRemote)
@@ -4236,7 +4571,7 @@ export function executeMove(from, to, paths, options = {}) {
         const active = options.cloud ?? await signedIn(paths)
         const proposal = { version: 1, ...plan, kind, resume: Boolean(existing), receiptFile, finishAccount: options.finishAccount ?? null, selection: chosen, requestedAt, createdAt: new Date().toISOString(), nonce: randomUUID(),
           deferredCloudSources: options.cloudRequested ? chosen?.from.filter((source) => (!active.account || source.account === active.account) && (!active.org || source.org === active.org)).map(accountRef) ?? [] : [] }
-        if (initial) proposal.capacity = restartCapacity(initial.inv, plan, preparationMs, (options.io?.budget ?? RESTART_BUDGET) - (options.io?.reserve ?? REOPEN_RESERVE))
+        if (initial) proposal.capacity = restartCapacity(initial.inv, plan, preparationMs, restartMoveBudget(options.io?.budget, options.io?.reserve))
         proposal.token = sha(stable(proposal))
         await saveJson(planFile, proposal)
         return { plan: proposal, ok: proposal.capacity?.fits !== false, code: proposal.capacity?.code ?? undefined }
@@ -4272,7 +4607,7 @@ export function executeMove(from, to, paths, options = {}) {
         }
       }
       const budget = (options.io?.budget ?? RESTART_BUDGET) - (now() - approvedAt)
-      const capacity = plan.capacity?.fits === false ? plan.capacity : initial ? restartCapacity(initial.inv, pendingPlan, preparationMs, budget - (options.io?.reserve ?? REOPEN_RESERVE), sample) : null
+      const capacity = plan.capacity?.fits === false ? plan.capacity : initial ? restartCapacity(initial.inv, pendingPlan, preparationMs, restartMoveBudget(budget, options.io?.reserve), sample) : null
       if (budget <= (options.io?.reserve ?? REOPEN_RESERVE) || capacity?.fits === false) return { ...prepared, ok: false, capacity, code: 'RESTART_CAPACITY', reason: 'The remaining move is not expected to fit this restart budget. Claude was left running.' }
       const restarted = await withDesktopRestart({ ...pendingPlan, receiptFile: existing?.file ?? plan.receiptFile }, paths, async (context) => {
         await unlink(planFile)
@@ -4388,7 +4723,6 @@ export async function finishWorkflow(paths, options = {}) {
   return result
 }
 
-const DURABLE_RECORD_KEYS = ['title', 'isArchived', 'isStarred']
 const observedRecord = (record) => Object.fromEntries(DURABLE_RECORD_KEYS.map((key) => [key, record?.[key]]))
 
 async function inspectPlaced(paths) {
@@ -4682,7 +5016,8 @@ async function menubar(paths, remove, snapshot) {
   }
   const script = path.join(app, 'Contents/Resources/transplant.js')
   await copyFile(path.join(HERE, 'transplant.js'), script)
-  const config = jsonText({ node: process.execPath, script })
+  await writeFile(path.join(app, 'Contents/Resources/package.json'), jsonText({ type: 'module', version: (await readJson(path.join(HERE, 'package.json'))).version }))
+  const config = jsonText({ node: process.execPath, script, nodeArgs: [`--max-old-space-size=${menubarHeapMiB()}`] })
   await writeFile(path.join(paths.state, 'menubar.json'), config)
   await writeFile(path.join(app, 'Contents/Resources/menubar.json'), config)
   stop()
@@ -4959,6 +5294,7 @@ async function main(argv) {
         return null
       })
       const table = deferred ? processTable(paths.claudeApp) : []
+      const identity = deferred ? await signedIn(paths, table) : null
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
       return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
@@ -4969,7 +5305,7 @@ async function main(argv) {
         const current = all.find(row => row.active), scheduler = table.some(row => desktopExecutable(row.executable)) &&
           (!current || [source, deferred?.receipt.toAccount].some(row => sameAccount(row, current))) &&
           (deferred?.receipt.held ?? []).some(row => row.release !== 'worker')
-        const presentation = pendingPresentation(deferred?.receipt ?? {}, source, { active, signedIn }, deferred?.mode, table, scheduler, timeouts)
+        const presentation = pendingPresentation(deferred?.receipt ?? {}, source, { active, signedIn }, deferred?.mode, table, scheduler, timeouts, identity)
         return {
           account,
           org,
