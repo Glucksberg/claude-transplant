@@ -2,7 +2,7 @@
 import { spawn, spawnSync } from 'node:child_process'
 import { createDecipheriv, createHash, pbkdf2Sync, randomUUID } from 'node:crypto'
 import { constants, createReadStream, readFileSync, readdirSync, realpathSync } from 'node:fs'
-import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
+import { copyFile, link, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, realpath, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import readline from 'node:readline'
@@ -28,13 +28,15 @@ const REOPEN_RESERVE = 8_000
 const restartMoveBudget = (budget = RESTART_BUDGET, reserve = REOPEN_RESERVE) => Math.max(0, Math.min(22_000, (budget - reserve) / 2))
 const LABEL = 'io.github.vitaliyhayda.claude-transplant'
 const SEMANTIC_VERSION = 3
-const CACHE_VERSION = 11
+const CACHE_VERSION = 12
 const ARTIFACT_BYTES = 512 * 1024 * 1024
 const ARTIFACT_LINE_BYTES = 16 * 1024 * 1024
 const RESTART_LOG_BYTES = 1024 * 1024
 const RUNTIME_KEYS = ['slug', 'promptId', 'parentUuid', 'version', 'cwd', 'gitBranch']
 const MESSAGE_RUNTIME_KEYS = ['id', 'usage', 'diagnostics', 'stop_reason', 'stop_sequence', 'stop_details']
 const RECORD_RUNTIME_KEYS = ['lastActivityAt', 'lastFocusedAt', 'completedTurns', 'error', 'errorAt', 'priorErrorMark', 'lastSpawnRootDetected', 'promptAppendSnapshot', 'reportFindingsCard', 'scratchPromptRecents', 'writtenBranches', 'prs']
+const DURABLE_RECORD_KEYS = ['title', 'isArchived', 'isStarred']
+const recordSnapshot = record => Object.fromEntries(['sessionId', 'cliSessionId', 'cwd', 'originCwd', ...DURABLE_RECORD_KEYS].filter(key => Object.hasOwn(record, key)).map(key => [key, record[key]]))
 const REMOTE_TAGS = new Set(['remote-control-sdk', 'remote-control-repl'])
 const HELP = `claude-transplant   move Claude Code history between accounts
 
@@ -561,41 +563,63 @@ async function dirs(root) {
 async function tree(root) {
   const out = []
   const walk = async (dir) => {
+    const before = await lstat(dir, { bigint: true })
+    if (!before.isDirectory() || await realpath(dir) !== path.resolve(dir)) throw new Error(`unsupported entry ${dir}`)
     for (const e of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
       const p = path.join(dir, e.name)
       if (e.isDirectory()) await walk(p)
-      else if (e.isFile()) out.push(p)
+      else if (e.isFile() || e.isSymbolicLink()) out.push(p)
       else throw new Error(`unsupported entry ${p}`)
     }
+    if (statIdentity(await lstat(dir, { bigint: true })) !== statIdentity(before) || await realpath(dir) !== path.resolve(dir)) throw new Error('sidecars changed while reading')
   }
-  if (await exists(root)) await walk(root)
+  const detail = await lstat(root).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+  if (detail) await walk(root)
   return out
 }
 
-async function treeFingerprint(root, cache = null) {
+async function treeFingerprint(root) {
   const files = await tree(root)
-  const dependencies = await Promise.all(files.map(async (file) => ({ rel: path.relative(root, file), fingerprint: await fingerprint(file, cache) })))
-  return { files, fingerprint: sha(stable(dependencies)) }
+  const signatures = new Map()
+  const dependencies = await Promise.all(files.map(async (file) => {
+    const detail = await lstat(file, { bigint: true })
+    if (!detail.isFile() && !detail.isSymbolicLink()) throw new Error(`unsupported entry ${file}`)
+    const identity = statIdentity(detail)
+    signatures.set(file, identity)
+    const fingerprint = detail.isSymbolicLink() ? `link:${identity}:${sha(await readlink(file, { encoding: 'buffer' }))}` : identity
+    if (statIdentity(await lstat(file, { bigint: true })) !== identity) throw new Error('sidecars changed while reading')
+    return { rel: path.relative(root, file), fingerprint }
+  }))
+  return { files, signatures, fingerprint: sha(stable(dependencies)) }
 }
 
 async function manifest(root, cache = null) {
-  const before = await treeFingerprint(root, cache)
+  const before = await treeFingerprint(root)
   const { files } = before
   const prior = cache ? cacheLookup(cache, 'manifests', root, before.fingerprint) : null
-  if (prior) return manifestOf(prior.rows, before.fingerprint)
-  const rows = []
-  for (const file of files) {
-    const data = await readFile(file)
-    rows.push({ rel: path.relative(root, file), bytes: data.length, sha: sha(data) })
+  const rows = prior?.rows ?? []
+  if (!prior) for (const file of files) {
+    const detail = await lstat(file, { bigint: true })
+    if (statIdentity(detail) !== before.signatures.get(file)) throw new Error('sidecars changed while reading')
+    const rel = path.relative(root, file)
+    if (detail.isSymbolicLink()) {
+      const data = await readlink(file, { encoding: 'buffer' })
+      rows.push({ rel, bytes: data.length, sha: sha(data), type: 'symlink', resolved: path.resolve(path.dirname(file), data.toString('utf8')) })
+    } else {
+      const data = await readRegular(file, before.signatures.get(file))
+      rows.push({ rel, bytes: data.length, sha: sha(data) })
+    }
   }
-  if (cache) cacheStore(cache, 'manifests', root, before.fingerprint, { rows })
-  else if ((await treeFingerprint(root)).fingerprint !== before.fingerprint) throw new Error('sidecars changed while reading')
+  if ((await treeFingerprint(root)).fingerprint !== before.fingerprint) throw new Error('sidecars changed while reading')
+  if (cache && !prior) cacheStore(cache, 'manifests', root, before.fingerprint, { rows })
   return manifestOf(rows, before.fingerprint)
 }
 
+const sidecarIdentity = row => row.type === 'symlink' ? `link:${row.sha}:${row.resolved}` : row.sha
+
 function manifestOf(rows, fingerprint = null) {
   return {
-    set: new Set(rows.map((row) => `${row.rel}:${row.sha}`)),
+    set: new Set(rows.map((row) => `${row.rel}:${sidecarIdentity(row)}`)),
     rows,
     count: rows.length,
     bytes: rows.reduce((sum, row) => sum + row.bytes, 0),
@@ -1340,8 +1364,8 @@ async function sidecars(transcript, id, cache = null) {
 }
 
 const sidecarsAgree = (a, b) => {
-  const files = new Map(a.rows.map((row) => [row.rel, row.sha]))
-  return b.rows.every((row) => !files.has(row.rel) || files.get(row.rel) === row.sha)
+  const files = new Map(a.rows.map((row) => [row.rel, sidecarIdentity(row)]))
+  return b.rows.every((row) => !files.has(row.rel) || files.get(row.rel) === sidecarIdentity(row))
 }
 
 async function origins(id, ctx, cwd = '') {
@@ -1380,12 +1404,90 @@ const eventIncluded = (a, b) => Boolean(b) && a.base === b.base && detailInclude
 
 const messageHash = (type, value) => sha(stable({ type, message: without(value, MESSAGE_RUNTIME_KEYS) }))
 const rescueTitle = (title) => `${(title || 'Untitled session').replace(/(?: · from Remote Control)+$/, '')} · from Remote Control`
+const queuedContent = (content, hash = messageHash('user', { role: 'user', content })) => {
+  if (typeof content === 'string') return { hash, textHash: hash }
+  if (Array.isArray(content) && content.length > 1 && content.every(block => block?.type === 'image' && block.source && typeof block.source === 'object' && !Array.isArray(block.source) ||
+    block?.type === 'text' && typeof block.text === 'string' && Object.keys(block).every(key => ['type', 'text'].includes(key)))) {
+    const text = content.filter(block => block.type === 'text')
+    if (text.length === 1) return { hash, textHash: messageHash('user', { role: 'user', content: text[0].text }), richHash: hash }
+  }
+  return { hash }
+}
+const queuedContentAgrees = (a, b) => (!a.hash || !b.hash || a.hash === b.hash || a.textHash && a.textHash === b.textHash) && (!a.richHash || !b.richHash || a.richHash === b.richHash)
+const uniqueBridgeOwners = owners => [...new Map(owners.map(owner => [stable(owner), owner])).values()]
 
-const conversation = (entries) => entries.flatMap((entry) => {
-  if (entry && ['user', 'assistant'].includes(entry.type) && entry.message) return [messageHash(entry.type, entry.message)]
-  if (entry?.type === 'attachment' && typeof entry.attachment?.prompt === 'string') return [messageHash('user', { role: 'user', content: entry.attachment.prompt })]
-  return []
-})
+export function conversation(entries, sessionId = null) {
+  const aliases = new Map(), output = [], unidentified = new Set(), consumedHashes = new Set()
+  const identity = value => typeof value === 'string' && value.length ? value : null
+  const root = node => {
+    let found = node
+    while (found.parent) found = found.parent
+    while (node.parent) { const next = node.parent; node.parent = found; node = next }
+    return found
+  }
+  const merge = (a, b) => {
+    if (a === b) return a
+    b.parent = a
+    a.bad ||= b.bad || !queuedContentAgrees(a, b) || Boolean(a.userHash && b.userHash && a.userHash !== b.userHash) || Boolean(a.consumedHash && b.consumedHash && a.consumedHash !== b.consumedHash) || Boolean(a.command && b.command && a.command !== b.command) || Boolean(a.delivery && b.delivery && a.delivery !== b.delivery)
+    a.mixed ||= b.mixed || Boolean(a.hash && b.hash && a.hash !== b.hash)
+    a.textHash ??= b.textHash
+    a.richHash ??= b.richHash
+    a.userHash ??= b.userHash
+    a.userFirst = Math.min(a.userFirst, b.userFirst)
+    a.consumedHash ??= b.consumedHash
+    a.hash ??= b.hash
+    a.command ??= b.command
+    a.delivery ??= b.delivery
+    a.first = Math.min(a.first, b.first)
+    return a
+  }
+  for (const entry of entries) {
+    let hash = null, command = null, delivery = null, eligible = false, bad = false, consumed = false, shape = {}
+    if (entry && ['user', 'assistant'].includes(entry.type) && entry.message) {
+      hash = messageHash(entry.type, entry.message)
+      eligible = true
+      if (entry.type === 'user') {
+        command = identity(entry.commandUuid) ?? identity(entry.uuid)
+        delivery = identity(entry.deliveryId)
+        if (entry.message.role === 'user' && Object.keys(entry.message).every(key => ['role', 'content', ...MESSAGE_RUNTIME_KEYS].includes(key))) shape = queuedContent(entry.message.content, hash)
+      }
+    } else if (entry?.type === 'attachment' && (typeof entry.attachment?.prompt === 'string' || sessionId && entry.attachment?.type === 'queued_command')) {
+      const prompt = entry.attachment.prompt
+      if (typeof prompt === 'string' || Array.isArray(prompt)) { shape = queuedContent(prompt); hash = shape.hash }
+      command = identity(entry.attachment.commandUuid) ?? identity(entry.attachment.source_uuid)
+      delivery = identity(entry.attachment.delivery_id)
+      eligible = typeof prompt === 'string'
+      bad = !hash
+    } else if (sessionId && entry?.type === 'queue-operation' && entry.sessionId === sessionId) {
+      command = identity(entry.commandUuid)
+      delivery = identity(entry.deliveryId)
+      consumed = entry.operation === 'remove' && entry.reason === 'absorbed_mid_turn'
+      if (typeof entry.content === 'string' || Array.isArray(entry.content)) { shape = queuedContent(entry.content); hash = shape.hash }
+      eligible = consumed && Boolean(hash) && Boolean(command || delivery)
+      if (eligible) consumedHashes.add(hash)
+      bad = consumed && Object.hasOwn(entry, 'content') && !hash || entry.operation === 'remove' && !consumed || ['cancel', 'dequeue'].includes(entry.operation)
+    } else continue
+    const own = entry.sessionId ?? sessionId
+    if (!sessionId || !command && !delivery) {
+      if (eligible) {
+        if (sessionId && own === sessionId && entry.type !== 'assistant') unidentified.add(output.length)
+        output.push(hash)
+      }
+      continue
+    }
+    const keys = [command && stable([own, 'command', command]), delivery && stable([own, 'delivery', delivery])].filter(Boolean)
+    let node = { ...shape, hash, command, delivery, bad, userHash: entry.type === 'user' ? hash : null, userFirst: entry.type === 'user' ? output.length : Infinity,
+      consumedHash: consumed && eligible ? hash : null, first: eligible ? output.length : Infinity }
+    for (const key of keys) if (aliases.has(key)) node = merge(root(aliases.get(key)), node)
+    for (const key of keys) aliases.set(key, node)
+    output.push(node)
+  }
+  return output.flatMap((item, at) => {
+    if (typeof item === 'string') return unidentified.has(at) && consumedHashes.has(item) ? [] : [item]
+    const group = root(item)
+    return !group.bad && (!group.mixed || group.userHash || group.consumedHash) && (group.userHash ? group.userFirst : group.first) === at ? [group.userHash ?? group.consumedHash ?? group.hash] : []
+  })
+}
 
 const conversationFromRows = (rows) => {
   const messages = rows.filter((row) => ['user', 'assistant'].includes(row.event_type))
@@ -1411,14 +1513,29 @@ const multisetConversation = (source, target) => {
   return true
 }
 
-const conversationLcs = (source, target) => {
-  let prior = new Uint16Array(target.length + 1)
-  for (const event of source) {
-    const next = new Uint16Array(target.length + 1)
-    for (let at = 1; at <= target.length; at++) next[at] = event === target[at - 1] ? prior[at - 1] + 1 : Math.max(prior[at], next[at - 1])
-    prior = next
+const nearOrderedConversation = (source, target, tolerance) => {
+  const positions = new Map()
+  for (let at = 0; at < target.length; at++) {
+    if (!positions.has(target[at])) positions.set(target[at], [])
+    positions.get(target[at]).push(at)
   }
-  return prior[target.length]
+  const frontier = Array(tolerance + 1).fill(Infinity)
+  frontier[0] = 0
+  for (const event of source) {
+    const matches = positions.get(event) ?? []
+    for (let skipped = tolerance; skipped >= 0; skipped--) {
+      const start = frontier[skipped]
+      let low = 0, high = matches.length
+      while (low < high) {
+        const mid = Math.floor((low + high) / 2)
+        if (matches[mid] < start) low = mid + 1
+        else high = mid
+      }
+      frontier[skipped] = Math.min(low < matches.length ? matches[low] + 1 : Infinity, skipped ? frontier[skipped - 1] : Infinity)
+    }
+    if (frontier.every(value => value === Infinity)) return false
+  }
+  return frontier.some(value => value !== Infinity)
 }
 
 const conversationAnchored = (source, target, needed) => {
@@ -1430,12 +1547,12 @@ const conversationAnchored = (source, target, needed) => {
   return false
 }
 
-const conversationMatch = (source, target) => {
+export const conversationMatch = (source, target) => {
   if (!Array.isArray(source) || !Array.isArray(target) || !source.length) return null
   if (orderedConversation(source, target)) return 'ordered'
   const tolerance = Math.min(8, Math.floor(source.length / 100))
   if (!tolerance || !multisetConversation(source, target)) return null
-  return source.length - conversationLcs(source, target) <= tolerance ? 'equivalent' : null
+  return nearOrderedConversation(source, target, tolerance) ? 'equivalent' : null
 }
 
 const artifactError = (text, code = 'CLOUD_ARTIFACT_UNCERTAIN') => Object.assign(new Error(`Supplemental cloud coverage is uncertain: ${text}`), { code })
@@ -1450,6 +1567,18 @@ const remoteEvents = (rows) => rows.filter(row => ['user', 'assistant'].includes
 const eventAgrees = (a, b) => a.uuid === b.uuid && a.type === b.type && a.role === b.role && a.hash === b.hash
 const agentName = (value) => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(value)
 const statIdentity = (detail) => [detail.dev, detail.ino, detail.size, detail.mtimeNs, detail.ctimeNs].join(':')
+
+async function readRegular(file, signature = null) {
+  const before = await lstat(file, { bigint: true })
+  if (!before.isFile() || signature && statIdentity(before) !== signature) throw new Error(`regular file changed before reading: ${file}`)
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try {
+    if (statIdentity(await handle.stat({ bigint: true })) !== statIdentity(before)) throw new Error(`regular file changed before reading: ${file}`)
+    const data = await handle.readFile()
+    if (statIdentity(await handle.stat({ bigint: true })) !== statIdentity(before) || statIdentity(await lstat(file, { bigint: true })) !== statIdentity(before)) throw new Error(`regular file changed while reading: ${file}`)
+    return data
+  } finally { await handle.close() }
+}
 
 async function artifactStat(file) {
   const detail = await lstat(file, { bigint: true })
@@ -1495,7 +1624,7 @@ async function artifactIndex(file, kind, budget) {
         if (bytesRead !== length) throw artifactError('artifact changed while reading')
         return buffer
       }
-      const result = { main: [], events: [], queued: [], removed: [] }
+      const result = { main: [], events: [], queued: [], operations: [] }
       if (kind === 'header') {
         const data = await read(Math.min(Number(detail.size), 4096), 0)
         const first = data.subarray(0, data.indexOf(10) < 0 ? data.length : data.indexOf(10)).toString('utf8')
@@ -1517,9 +1646,12 @@ async function artifactIndex(file, kind, budget) {
           } else if (row.type === 'attachment' && row.attachment?.type === 'queued_command') {
             const item = row.attachment, prompt = item.prompt
             result.queued.push({ uuid: item.source_uuid, delivery: item.delivery_id, type: 'user', role: 'user', sessionId: row.sessionId, isSidechain: row.isSidechain,
-              hash: typeof prompt === 'string' || Array.isArray(prompt) ? messageHash('user', { role: 'user', content: prompt }) : null })
-          } else if (row.type === 'queue-operation' && row.operation === 'remove' && row.reason === 'absorbed_mid_turn') {
-            result.removed.push({ uuid: row.commandUuid, delivery: row.deliveryId, sessionId: row.sessionId })
+              ...(typeof prompt === 'string' || Array.isArray(prompt) ? queuedContent(prompt) : { hash: null }) })
+          } else if (row.type === 'queue-operation') {
+            const consumed = row.operation === 'remove' && row.reason === 'absorbed_mid_turn'
+            result.operations.push({ uuid: row.commandUuid, delivery: row.deliveryId, sessionId: row.sessionId, consumed,
+              cancelled: row.operation === 'remove' && !consumed || ['cancel', 'dequeue'].includes(row.operation), hasContent: Object.hasOwn(row, 'content'),
+              ...(typeof row.content === 'string' || Array.isArray(row.content) ? queuedContent(row.content) : { hash: null }) })
           } else if (['user', 'assistant'].includes(row.type)) throw artifactError('artifact message is unreadable')
         }
         for (let position = 0; position < Number(detail.size);) {
@@ -1556,6 +1688,7 @@ async function supplementalCoverage(events, row, budget, inputs = null) {
   inputs ??= await artifactInputs(row)
   const local = await artifactIndex(inputs.transcript, 'main', budget)
   const main = Map.groupBy(local.main, event => event.uuid)
+  const commands = Map.groupBy(local.operations, item => item.uuid), deliveries = Map.groupBy(local.operations, item => item.delivery)
   const queues = new Map()
   for (const item of local.queued) {
     const prior = queues.get(item.uuid)
@@ -1572,7 +1705,12 @@ async function supplementalCoverage(events, row, budget, inputs = null) {
       counts.main++
     } else if (queues.has(event.uuid)) {
       const item = queues.get(event.uuid)
-      if (!eventAgrees(item, event) || event.isSidechain === true || event.agentId !== undefined || consumed.has(event.uuid) || !local.removed.some(remove => remove.uuid === item.uuid && remove.delivery === item.delivery && remove.sessionId === row.id)) throw artifactError('queued prompt delivery is not proven')
+      const copies = [...new Set([...(commands.get(item.uuid) ?? []), ...(deliveries.get(item.delivery) ?? [])])]
+      const delivered = copies.filter(copy => copy.consumed && copy.hasContent)
+      if (copies.some(copy => copy.cancelled || copy.sessionId !== row.id || copy.uuid !== undefined && copy.uuid !== item.uuid || copy.delivery !== undefined && copy.delivery !== item.delivery || copy.hasContent && (!copy.hash || !queuedContentAgrees(copy, item))) ||
+        new Set(delivered.map(copy => copy.hash)).size > 1 || new Set([item, ...copies].map(copy => copy.richHash).filter(Boolean)).size > 1) throw artifactError('queued prompt operation copies disagree')
+      const witness = { ...item, hash: delivered[0]?.hash ?? item.hash }
+      if (!eventAgrees(witness, event) || event.isSidechain === true || event.agentId !== undefined || consumed.has(event.uuid) || !copies.some(copy => copy.consumed && copy.uuid === item.uuid && copy.delivery === item.delivery && copy.sessionId === row.id)) throw artifactError('queued prompt delivery is not proven')
       consumed.add(event.uuid)
       queuedIds.push(event.uuid)
       counts.queued++
@@ -1633,7 +1771,7 @@ async function priorHistory(cache, key) {
       if (sha(stable(current)) === item.signature) {
         cache.stats.historyHits++
         const events = new Map(encoded.events)
-        return { ...encoded, events, roots: new Set(events.keys()) }
+        return { ...encoded, bridgeOwners: uniqueBridgeOwners(encoded.bridgeOwners), events, roots: new Set(events.keys()) }
       }
     } catch {}
   }
@@ -1669,8 +1807,8 @@ async function history(id, transcript, ctx, cwd = '') {
   const comparable = data.invalid === 0 && conflicts === 0 && roots.size > 0
   const bridges = data.entries.filter((entry) => entry.type === 'bridge-session')
   const bridgeIds = [...new Set(bridges.map((entry) => entry.bridgeSessionId ?? entry.bridge_session_id).filter((value) => typeof value === 'string'))]
-  const bridgeOwners = bridges.map(entry => ({ id: remoteId(entry.bridgeSessionId ?? entry.bridge_session_id), account: entry.ownerAccountUuid ?? null, org: entry.ownerOrganizationUuid ?? null }))
-  const result = { roots, events, conversation: conversation(normalized.entries), forks: ctx.scans.get(transcript)?.forked.size ?? 0, state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
+  const bridgeOwners = uniqueBridgeOwners(bridges.map(entry => ({ id: remoteId(entry.bridgeSessionId ?? entry.bridge_session_id), sessionId: entry.sessionId ?? null, account: entry.ownerAccountUuid ?? null, org: entry.ownerOrganizationUuid ?? null })))
+  const result = { roots, events, conversation: conversation(normalized.entries, id), forks: ctx.scans.get(transcript)?.forked.size ?? 0, state, bridge: bridges.length > 0, bridgeIds, bridgeOwners, invalid: data.invalid, conflicts, comparable, snapshot: semantic(data.entries, id, data.invalid), contentSha: data.sha }
   if (ctx.cache) {
     const encoded = { ...result, roots: undefined, events: [...events] }
     cacheStore(ctx.cache, 'histories', cacheKey, sha(stable(dependencyRows)), { dependencies: dependencyRows, result: encoded })
@@ -1810,7 +1948,7 @@ async function cloudInventory(cloud, from, targets, move, cache, report, cutoff 
       const findCovered = (items) => items.flatMap((candidate) => {
         const matchMode = conversationMatch(remoteConversation, candidate.conversation)
         if (matchMode) return [{ ...candidate, matchMode }]
-        const retained = candidate.row.retainedHistories?.find(history => history.bridgeIds.includes(sessionId) && conversationMatch(remoteConversation, history.conversation))
+        const retained = candidate.row.retainedHistories?.find(history => history.bindings.some(owner => owner.id === sessionId && sameAccount(owner, account)) && conversationMatch(remoteConversation, history.conversation))
         return retained ? [{ ...candidate, matchMode: conversationMatch(remoteConversation, retained.conversation), retained }] : []
       })
       const eligible = remoteConversation.length >= 4 ? candidates : [...new Set([...named, ...linked])]
@@ -1948,6 +2086,33 @@ function localPlan(pending, to) {
   return { move, blocked }
 }
 
+async function retainedHistories(target, ctx, options, owners, enabled) {
+  target.artifactBridgeIds = [...new Set([...remoteIdsOf(target), ...(options.cloudBridgeIds?.get(target.id) ?? []).map(remoteId).filter(Boolean)])]
+  if (!enabled) return
+  const prior = desktopRecordOf(target).priorCliSessionIds
+  const priorIds = Array.isArray(prior) ? [...new Set(prior.filter(id => typeof id === 'string' && UUID.test(id) && id !== target.id))] : []
+  const remembered = [target.id, ...priorIds].flatMap(id => options.cloudBridgeIds?.get(id) ?? [])
+  if (remembered.length) target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...remembered.map(remoteId).filter(Boolean)])]
+  for (const id of priorIds) {
+    const transcript = path.join(path.dirname(target.transcript), `${id}.jsonl`)
+    if (!ctx.index.get(id)?.includes(transcript)) continue
+    try {
+      const before = await artifactStat(transcript)
+      const detail = await history(id, transcript, ctx, desktopRecordOf(target).cwd)
+      if (!detail.comparable || (await artifactStat(transcript)).signature !== before.signature || sha(await readRegular(transcript, before.signature)) !== detail.contentSha) continue
+      const native = [...Map.groupBy(detail.bridgeOwners, owner => owner.id).values()].flatMap(copies => {
+        const owner = copies[0]
+        return copies.length === 1 && owner.id && owner.sessionId === id && owners.some(source => sameAccount(owner, source)) ? [owner] : []
+      })
+      const bindings = [...native, ...(options.cloudBridgeIds?.get(id) ?? []).map(remoteId).filter(Boolean).map(id => ({ id, account: options.cloud?.account, org: options.cloud?.org }))]
+      const bridgeIds = [...new Set(bindings.map(owner => owner.id))]
+      if (!bridgeIds.length) continue
+      target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...bridgeIds])]
+      ;(target.retainedHistories ??= []).push({ transcript, fingerprint: before.signature, contentSha: detail.contentSha, conversation: detail.conversation, bindings })
+    } catch {}
+  }
+}
+
 export async function inventory(from, to, paths, report = () => {}, options = {}) {
   const check = () => { options.check?.(); (options.cloud?.memory ?? operationMemory()).check() }
   check()
@@ -1984,8 +2149,10 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
           }
           if (!detail.roots.size && !detail.invalid) { missing.push(s); continue }
           const source = { ...s, account, transcript, ...detail, taskOwned: account.taskSessions.has(s.record.sessionId), worker: ownsWorker(ctx.workers, s.id, s.record.sessionId), recordSha: sha(await readFile(s.file)), recordSemantic: recordSemantic(s.record) }
-          if (validDesktopRecord(source)) found.push(source)
-          else rejected.push({ ...s, account, error: 'Desktop record identity is invalid' })
+          if (validDesktopRecord(source)) {
+            await retainedHistories(source, ctx, options, [account], cloudRequested)
+            found.push(source)
+          } else rejected.push({ ...s, account, error: 'Desktop record identity is invalid' })
         } catch (error) {
           rejected.push({ ...s, account, error: error.message })
         }
@@ -2028,8 +2195,10 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
         const detail = transcript ? await history(s.id, transcript, ctx, s.cwd) : null
         if (detail?.roots.size) {
           const target = { record: s.record.sessionId, id: s.id, ...detail, session: s, account: to, taskOwned: to.taskSessions.has(s.record.sessionId), worker: ownsWorker(ctx.workers, s.id, s.record.sessionId), transcript, transcriptFingerprint: await fingerprint(transcript, cache), sidecar: await sidecars(transcript, s.id, cache), recordSha: sha(await readFile(s.file)), recordSemantic: recordSemantic(s.record) }
-          if (validDesktopRecord(target)) targets.push(target)
-          else rejected.push({ id: s.id, title: s.title, account: to, target: true, error: 'Desktop record identity is invalid' })
+          if (validDesktopRecord(target)) {
+            await retainedHistories(target, ctx, options, options.cloud ? [options.cloud] : from, cloudRequested)
+            targets.push(target)
+          } else rejected.push({ id: s.id, title: s.title, account: to, target: true, error: 'Desktop record identity is invalid' })
         }
       } catch (error) {
         rejected.push({ id: s.id, title: s.title, account: to, target: true, error: error.message })
@@ -2037,21 +2206,6 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     } finally {
       progress(report, 'scan', ++completed, workTotal)
       check()
-    }
-  }
-  for (const target of targets) {
-    target.artifactBridgeIds = [...new Set([...remoteIdsOf(target), ...(options.cloudBridgeIds?.get(target.id) ?? []).map(remoteId).filter(Boolean)])]
-    const prior = target.session.record.priorCliSessionIds
-    const priorIds = Array.isArray(prior) ? prior.filter(id => UUID.test(id) && options.cloudBridgeIds?.has(id)) : []
-    const remembered = [target.id, ...priorIds].flatMap(id => options.cloudBridgeIds?.get(id) ?? [])
-    if (remembered.length) target.bridgeIds = [...new Set([...(target.bridgeIds ?? []), ...remembered.map(remoteId).filter(Boolean)])]
-    for (const id of priorIds) {
-      const transcript = locate(ctx.index, id, target.session.cwd)
-      if (!transcript) continue
-      try {
-        const detail = await history(id, transcript, ctx, target.session.cwd)
-        if (detail.comparable) (target.retainedHistories ??= []).push({ transcript, fingerprint: await fingerprint(transcript, cache), contentSha: detail.contentSha, conversation: detail.conversation, bridgeIds: options.cloudBridgeIds.get(id).map(remoteId).filter(Boolean) })
-      } catch {}
     }
   }
   const covering = (s) => targets.find((target) => target.record && s.members.every((member) => included(member, target) && (!requiredParents.has(member.record.sessionId) || target.record === member.record.sessionId))) ?? null
@@ -2171,7 +2325,7 @@ async function rehomeOne(s, to, journal, guard) {
     targetDir: sourceSidecars.count ? path.join(path.dirname(s.transcript), s.id) : null,
     record,
     recordSha,
-    recordSnapshot: placed,
+    recordSnapshot: recordSnapshot(placed),
     recordSemantic: recordSemantic(placed),
     targetRecordId: current.sessionId,
     taskFile: to.taskFile,
@@ -2474,24 +2628,45 @@ const saveText = async (file, text, before = () => {}) => {
 
 const saveJson = (file, value, spacing = 2) => saveText(file, jsonText(value, spacing))
 
-async function readReceipt(file) {
+export async function readReceipt(file) {
   const receipt = await readJson(file)
-  const text = await readFile(`${file}.journal`, 'utf8').catch((error) => {
-    if (error.code === 'ENOENT') return ''
+  const trim = row => {
+    if (row?.recordSnapshot && typeof row.recordSnapshot === 'object' && !Array.isArray(row.recordSnapshot)) row.recordSnapshot = recordSnapshot(row.recordSnapshot)
+    return row
+  }
+  for (const key of ['sessions', 'failed', 'retained']) if (Array.isArray(receipt[key])) receipt[key].forEach(trim)
+  trim(receipt.pending)
+  const handle = await open(`${file}.journal`, 'r').catch((error) => {
+    if (error.code === 'ENOENT') return null
     throw error
   })
-  for (const line of text.split('\n').slice(0, -1)) {
+  if (!handle) return receipt
+  const apply = line => {
     const patch = JSON.parse(line)
     if (!Number.isSafeInteger(patch.sequence) || patch.sequence < 1) throw new Error('Invalid move journal sequence')
-    if (patch.sequence <= (receipt.journalSequence ?? 0)) continue
+    if (patch.sequence <= (receipt.journalSequence ?? 0)) return
     if (patch.sequence !== (receipt.journalSequence ?? 0) + 1) throw new Error('Incomplete move journal')
     for (const key of ['sessions', 'failed', 'retained']) {
       if (!Array.isArray(patch[key])) throw new Error('Invalid move journal entries')
-      if (patch[key].length) (receipt[key] ??= []).push(...patch[key])
+      for (const row of patch[key]) (receipt[key] ??= []).push(trim(row))
     }
-    receipt.pending = patch.pending
+    receipt.pending = trim(patch.pending)
     receipt.journalSequence = patch.sequence
   }
+  try {
+    let parts = [], length = 0
+    for await (const chunk of handle.createReadStream({ autoClose: false })) {
+      let start = 0
+      for (let end = chunk.indexOf(10); end >= 0; end = chunk.indexOf(10, start)) {
+        const part = chunk.subarray(start, end)
+        apply((parts.length ? Buffer.concat([...parts, part], length + part.length) : part).toString('utf8'))
+        parts = []
+        length = 0
+        start = end + 1
+      }
+      if (start < chunk.length) { parts.push(chunk.subarray(start)); length += chunk.length - start }
+    }
+  } finally { await handle.close() }
   return receipt
 }
 
@@ -3348,7 +3523,7 @@ async function rescueRemote(match, to, cloud, journal) {
     targetDir: null,
     record,
     recordSha: sha(recordText),
-    recordSnapshot: placed,
+    recordSnapshot: recordSnapshot(placed),
     recordSemantic: recordSemantic(placed),
     targetRecordId: placed.sessionId,
     taskFile: to.taskFile,
@@ -3405,7 +3580,7 @@ async function applyActivation(activation, row) {
   await saveText(activation.record, jsonText(activation.after))
   if (sha(await readFile(activation.record)) !== activation.afterSha) throw new Error('local target activation verification failed')
   row.recordSha = activation.afterSha
-  row.recordSnapshot = structuredClone(activation.after)
+  row.recordSnapshot = recordSnapshot(activation.after)
   row.recordSemantic = activation.afterSemantic
   row.archived = false
   if (row.session) {
@@ -3454,7 +3629,7 @@ async function rollbackActivation(activation, row = null) {
   if (semantic === activation.afterSemantic) await saveText(activation.record, text)
   if (row) {
     row.recordSha = sha(text)
-    row.recordSnapshot = structuredClone(restored)
+    row.recordSnapshot = recordSnapshot(restored)
     row.recordSemantic = recordSemantic(restored)
     row.archived = true
     if (row.session) {
@@ -3535,8 +3710,8 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
     }
     const liveWorkers = workers()
     const retained = match.target.retained
-    const retainedUnchanged = async () => !retained || await fingerprint(retained.transcript).catch(() => null) === retained.fingerprint &&
-      await readFile(retained.transcript).then(sha).catch(() => null) === retained.contentSha
+    const retainedUnchanged = async () => !retained || await artifactStat(retained.transcript).then(value => value.signature).catch(() => null) === retained.fingerprint &&
+      await readRegular(retained.transcript, retained.fingerprint).then(sha).catch(() => null) === retained.contentSha
     const targetOkay = row?.targetId
       ? !(await targetChanges(row, liveWorkers, true)).length
       : row ? await untouched(row, liveWorkers) : false
@@ -3575,7 +3750,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       const current = await stableRemoteRows(cloud, pending.id)
       if (current.marker !== pending.lastEventAt) throw new Error('Remote Control history changed before archival')
       if (current.stateSha !== pending.stateSha) throw new Error('Remote Control history or input changed before archival')
-      if (retained && (!await retainedUnchanged() || !await untouched(row, workers()))) throw new Error('Retained local history changed before Remote Control archival')
+      if (retained && (!await retainedUnchanged() || (row?.targetId ? (await targetChanges(row, workers(), true)).length : !await untouched(row, workers())))) throw new Error('Retained local history changed before Remote Control archival')
       if (match.target.matchMode === 'artifacts') {
         const events = remoteEvents(current.rows)
         if (sha(stable(events)) !== match.target.artifactSignature) throw artifactError('remote event identities changed before archival')
@@ -4470,7 +4645,6 @@ export async function finishWorkflow(paths, options = {}) {
   return result
 }
 
-const DURABLE_RECORD_KEYS = ['title', 'isArchived', 'isStarred']
 const observedRecord = (record) => Object.fromEntries(DURABLE_RECORD_KEYS.map((key) => [key, record?.[key]]))
 
 async function inspectPlaced(paths) {
@@ -4764,6 +4938,7 @@ async function menubar(paths, remove, snapshot) {
   }
   const script = path.join(app, 'Contents/Resources/transplant.js')
   await copyFile(path.join(HERE, 'transplant.js'), script)
+  await writeFile(path.join(app, 'Contents/Resources/package.json'), jsonText({ type: 'module', version: (await readJson(path.join(HERE, 'package.json'))).version }))
   const config = jsonText({ node: process.execPath, script, nodeArgs: [`--max-old-space-size=${Math.max(64, Math.floor(os.totalmem() * 0.2 * 0.65 / 1024 / 1024))}`] })
   await writeFile(path.join(paths.state, 'menubar.json'), config)
   await writeFile(path.join(app, 'Contents/Resources/menubar.json'), config)

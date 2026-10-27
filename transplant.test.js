@@ -3,19 +3,19 @@ import childProcess, { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import fsSync, { appendFileSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import fs, { appendFile, mkdir, mkdtemp, open, readdir, readFile, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
+import fs, { appendFile, lstat, mkdir, mkdtemp, open, readdir, readFile, readlink, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, move, normalize, parseProcesses, pendingPresentation, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
   if (file === '/usr/bin/security') return { status: 1, stdout: '', stderr: 'fixture login unavailable' }
-  if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl'].includes(file)) throw new Error('fixture native command requires a mock')
+  if (['/usr/bin/osascript', '/usr/bin/open', '/bin/launchctl', 'launchctl', 'pkill'].includes(file)) throw new Error('fixture native command requires a mock')
   return run(file, ...args)
 }
 childProcess.spawnSync = fixtureCommand(childProcess.spawnSync)
@@ -26,6 +26,9 @@ const MESSAGES = new Set(['user', 'assistant', 'attachment', 'system'])
 const id = (k) => `00000000-0000-4000-8000-${String(k).padStart(12, '0')}`
 const rehomeRecord = (extra = {}) => ({ forkedFromSessionId: null, ...extra })
 const lines = (text) => text.split('\n').filter((l) => l.trim()).flatMap((l) => { try { return [JSON.parse(l)] } catch { return [] } })
+const mutatingOpen = flags => typeof flags === 'number'
+  ? Boolean(flags & (fsSync.constants.O_WRONLY | fsSync.constants.O_RDWR | fsSync.constants.O_CREAT | fsSync.constants.O_TRUNC | fsSync.constants.O_APPEND))
+  : typeof flags === 'string' && /[wa+]/.test(flags)
 const fixture = async (name) => lines(await readFile(path.join(here, 'fixtures', name), 'utf8'))
 const entry = (type, k, parent, session, extra = {}) => ({
   type,
@@ -1695,7 +1698,7 @@ test('unsupported sidecar entries name the path instead of looking like drift', 
   await h.write(id(984), [entry('user', 984, null, id(984))])
   const dir = path.join(h.project, id(984))
   await mkdir(dir, { recursive: true })
-  await symlink('/tmp', path.join(dir, 'linked'))
+  await promisify(execFile)('/usr/bin/mkfifo', [path.join(dir, 'linked')])
   await h.record('P', id(984))
   const by = Object.fromEntries((await accounts(h.paths)).map((a) => [a.account, a]))
   const inv = await inventory([by[h.acct.P]], by[h.acct.Z], h.paths)
@@ -3865,7 +3868,7 @@ test('artifact coverage archives all 470 events through explicit links or task t
 })
 
 test('artifact coverage refuses ownership, identity, order, multiplicity and delivery failures', async () => {
-  for (const change of ['parent', 'agent', 'collision', 'conflicting copy', 'main identity', 'order', 'changed', 'duplicate event', 'replay', 'delivery', 'undelivered', 'empty']) {
+  for (const change of ['parent', 'agent', 'collision', 'conflicting copy', 'main identity', 'order', 'changed', 'duplicate event', 'replay', 'delivery', 'undelivered', 'remove content', 'cancelled copy', 'empty']) {
     const f = await artifactFixture()
     if (change === 'parent') f.agents[0][0].sessionId = id(999)
     if (change === 'agent') f.agents[0][0].agentId = 'another'
@@ -3877,6 +3880,8 @@ test('artifact coverage refuses ownership, identity, order, multiplicity and del
     if (change === 'duplicate event') f.remote.push(f.remote[365])
     if (change === 'delivery') f.removal.deliveryId = 'another-delivery'
     if (change === 'undelivered') f.removal.reason = 'cancelled'
+    if (change === 'remove content') f.removal.content = 'Conflicting consumed prompt'
+    if (change === 'cancelled copy') f.extra.push({ ...f.removal, reason: 'cancelled' })
     if (change === 'empty') f.remote = []
     await f.write()
     if (change === 'replay') await appendFile(path.join(f.h.project, `${SOURCE}.jsonl`), JSON.stringify({ ...f.queued, attachment: { ...f.queued.attachment, prompt: 'Conflicting replay' } }) + '\n')
@@ -3971,7 +3976,7 @@ test('artifact legacy cache upgrades preserve warm history and manifest hits', a
   assert.ok(indexed.every(file => path.basename(file) === `${SOURCE}.jsonl` || path.basename(path.dirname(path.dirname(file))) === SOURCE))
   const saved = JSON.parse(await readFile(file))
   assert.deepEqual(saved.histories, cache.histories)
-  assert.equal(saved.version, 11)
+  assert.equal(saved.version, 12)
   assert.equal(saved.semanticVersion, 3)
   f.remote = f.main
   f.updated = '2026-09-02T00:00:00.000Z'
@@ -5390,6 +5395,13 @@ test('task recovery scopes validation, restart and accounts to the unfinished fa
   }
 })
 
+test('mutation spies distinguish read-only and mutating open flags', () => {
+  for (const flags of [undefined, 'r', 'rs', 'sr', fsSync.constants.O_RDONLY, fsSync.constants.O_RDONLY | fsSync.constants.O_NOFOLLOW]) assert.equal(mutatingOpen(flags), false, String(flags))
+  for (const flags of ['r+', 'rs+', 'sr+', 'w', 'wx', 'w+', 'wx+', 'a', 'ax', 'a+', 'ax+', 'as', 'as+',
+    fsSync.constants.O_WRONLY, fsSync.constants.O_RDWR, fsSync.constants.O_CREAT, fsSync.constants.O_TRUNC, fsSync.constants.O_APPEND,
+    fsSync.constants.O_RDWR | fsSync.constants.O_NOFOLLOW, fsSync.constants.O_CREAT | fsSync.constants.O_EXCL]) assert.equal(mutatingOpen(flags), true, String(flags))
+})
+
 test('task checkpoint integrity refuses corruption before recovery writes or restart', async t => {
   const checkpoints = [
     ['inconsistent zero', { taskTransfers: 0 }],
@@ -5423,7 +5435,7 @@ test('task checkpoint integrity refuses corruption before recovery writes or res
       await writeFile(file, JSON.stringify({ ...interrupted, appendCheckpoint: { ...checkpoint, ...patch } }))
       const before = await fixtureSnapshot(h), writes = []
       const originals = new Map(['writeFile', 'appendFile', 'open', 'rename', 'link', 'unlink', 'rm'].map(key => [key, fs[key]]))
-      for (const [key, original] of originals) fs[key] = async (...args) => { writes.push(key); return original(...args) }
+      for (const [key, original] of originals) fs[key] = async (...args) => { if (key !== 'open' || mutatingOpen(args[1])) writes.push(key); return original(...args) }
       syncBuiltinESMExports()
       try {
         await assert.rejects(finishWorkflow(h.paths, options), /invalid append checkpoint/)
@@ -6434,7 +6446,7 @@ test('pre-quit expiry preserves the journal and stops later mutations until reco
       return result
     }
     fs.open = async (...args) => {
-      if (expired) afterExpiry.push({ name: 'open', file: String(args[0]) })
+      if (expired && mutatingOpen(args[1])) afterExpiry.push({ name: 'open', file: String(args[0]) })
       const handle = await native.open(...args)
       if (String(args[0]).endsWith('.journal')) {
         const write = handle.writeFile.bind(handle)
@@ -7894,7 +7906,7 @@ test('corrupt and legacy planning caches refresh replay analysis', async () => {
     assert.equal(inv.cacheStats.historyHits, 0)
     assert.ok(inv.cacheStats.historyMisses > 0)
     const refreshed = JSON.parse(await readFile(file))
-    assert.equal(refreshed.version, 11)
+    assert.equal(refreshed.version, 12)
     assert.equal(refreshed.semanticVersion, 3)
     assert.ok(Object.values(refreshed.histories).every(row => row.value.result.conflicts === 0 && row.value.result.comparable))
     const warm = await inventory([from], to, h.paths, () => {}, { processes: [] })
@@ -9093,7 +9105,15 @@ async function swiftFixtureSource() {
 
 ` + source.slice(promptEnd)
   return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
-    .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)') + String.raw`
+    .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)')
+    .replaceAll('UserDefaults.standard', 'fixtureDefaults') + String.raw`
+@MainActor final class FixtureDefaults {
+    var values: [String: Any] = [:]
+    func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
+    func dictionary(forKey key: String) -> [String: Any]? { values[key] as? [String: Any] }
+    func set(_ value: Any?, forKey key: String) { values[key] = value }
+}
+@MainActor let fixtureDefaults = FixtureDefaults()
 @MainActor var requests: [([String], (String) -> Void, (Int32, String) -> Void)] = []
 @MainActor var automaticRefreshFixture = false
 @MainActor var restartDialogs: [RestartPrompt] = []
@@ -9317,6 +9337,10 @@ struct StateChecks {
                 precondition(textHeight == nil || rows == textHeight)
                 textHeight = rows
             }
+        }
+        for symbol in ["info.circle", "exclamationmark.triangle", "checkmark"] {
+            let image = MenuLabel(symbol: symbol, badge: "").image
+            precondition(image.size == menuSize && image.isTemplate && image.tiffRepresentation != nil)
         }
         var progress = MoveProgress(now: 0)
         var previous = 0
@@ -9711,14 +9735,36 @@ struct StateChecks {
             requests[1].2(0, "")
             if outcome.contains("\"restart\":true") {
                 precondition(item.restartAvailable && item.note == "Moved 12 more sessions. Restart Claude to see them.")
+                precondition(item.symbol == "info.circle" && item.badge.isEmpty && !item.running)
                 refreshReply(item, wordingAccounts("01-done"))
                 precondition(item.restartAvailable && item.note.contains("Moved 12 more sessions"))
+                precondition(item.symbol == "info.circle")
+                sweepReply(item, #"{"swept":true,"ok":true,"complete":true,"issues":0}"#)
+                precondition(item.restartAvailable && item.symbol == "info.circle")
                 item.selectTarget("work/personal")
                 precondition(item.primaryTitle == "Move")
+                precondition(!item.restartAvailable && item.symbol == "arrow.left.arrow.right")
             } else {
                 precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
                 if outcome.contains("Incomplete bounded check") { precondition(item.detailLines.contains { $0.1.contains("Incomplete bounded check") }) }
             }
+        }
+        for failed in [false, true] {
+            requests = []
+            let item = Model(demo: Demo.accounts)
+            item.selectTarget(Demo.accounts[2].id)
+            let selected = item.to, sources = item.from
+            item.panelVisibility(false)
+            if failed { item.symbol = "exclamationmark.triangle" }
+            sweepReply(item, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":1}"#)
+            precondition(item.restartAvailable && item.symbol == (failed ? "exclamationmark.triangle" : "info.circle"))
+            precondition(item.to == selected && item.from == sources && !item.running)
+            let count = requests.count
+            sweepReply(item, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true}"#)
+            precondition(requests.count == count + 1 && requests.last!.0 == ["sweep", "--json"])
+            precondition(item.symbol == (failed ? "exclamationmark.triangle" : "info.circle"))
+            sweepReply(item, #"{"swept":true,"ok":false,"error":"Synthetic failure"}"#)
+            precondition(item.symbol == "exclamationmark.triangle")
         }
         requests = []
         let login = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("12-undo-pending").utf8)))
@@ -9912,6 +9958,23 @@ struct StateChecks {
             failed.primary()
             precondition(requests.count == count + 1 && requests.last!.0 == ["finish", "--json"])
         }
+        requests = []
+        let delayed = Model(demo: Demo.accounts)
+        delayed.handle(#"{"done":true,"ok":true,"complete":true,"moved":1}"#)
+        delayed.checkFinish(0)
+        sweepReply(delayed, #"{"swept":true,"ok":true,"complete":true,"issues":0,"restart":true}"#)
+        precondition(delayed.symbol == "info.circle" && delayed.badge.isEmpty)
+        let failedWithoutRestart = Model(demo: Demo.accounts)
+        failedWithoutRestart.checkFinish(1)
+        let failedWithRestart = Model(demo: Demo.accounts)
+        failedWithRestart.checkFinish(1)
+        sweepReply(failedWithRestart, #"{"swept":true,"ok":true,"complete":true,"issues":0,"restart":true}"#)
+        precondition(failedWithoutRestart.symbol == "exclamationmark.triangle" && !failedWithoutRestart.restartAvailable)
+        precondition(failedWithRestart.symbol == "exclamationmark.triangle" && failedWithRestart.restartAvailable)
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 4.1))
+        precondition(delayed.restartAvailable && delayed.symbol == "info.circle" && delayed.badge.isEmpty)
+        precondition(failedWithoutRestart.symbol == "arrow.left.arrow.right" && failedWithoutRestart.badge.isEmpty)
+        precondition(failedWithRestart.symbol == "exclamationmark.triangle" && failedWithRestart.badge.isEmpty)
         print("Swift queue and metadata states passed")
     }
 }
@@ -9955,4 +10018,672 @@ test('missing and unreadable moved records remain distinct from informational fi
   assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['record unavailable'])
   await writeFile(file, '{')
   assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['record unavailable'])
+})
+
+test('consumed queue prompts preserve exact content and command multiplicity', () => {
+  const content = '  Synthetic queued prompt\nwith exact spacing  '
+  const consumed = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: SOURCE, commandUuid: id(8000), deliveryId: 'delivery-1', content }
+  const user = entry('user', 8000, null, SOURCE, { message: { role: 'user', content } })
+  const attachment = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: id(8000), delivery_id: 'delivery-1', prompt: content } }
+  const expected = conversation([user])
+  for (const copies of [[consumed], [consumed, consumed], [user, consumed], [attachment, consumed], [user, attachment, consumed], [consumed, attachment, user]]) {
+    assert.deepEqual(conversation(copies, SOURCE), expected)
+  }
+  for (const unused of [
+    { ...consumed, operation: 'enqueue' }, { ...consumed, reason: 'cancelled' }, { ...consumed, operation: 'dequeue' },
+    { ...consumed, reason: 'unrelated' }, { ...consumed, sessionId: id(2) }, { ...consumed, sessionId: undefined },
+    { ...consumed, commandUuid: undefined, deliveryId: undefined }
+  ]) assert.deepEqual(conversation([unused], SOURCE), [])
+  for (const conflict of [
+    { ...consumed, content: `${content}!` }, { ...consumed, deliveryId: 'different-delivery' },
+    { ...consumed, commandUuid: id(8001) }, { ...consumed, reason: 'cancelled' },
+    { ...attachment, attachment: { ...attachment.attachment, prompt: 'different' } },
+    { ...user, message: { role: 'user', content: content.trim() } }
+  ]) assert.deepEqual(conversation([consumed, conflict], SOURCE), [])
+  assert.deepEqual(conversation([consumed, { ...consumed, commandUuid: id(8001), deliveryId: 'delivery-2' }], SOURCE), [...expected, ...expected])
+  assert.deepEqual(conversation([consumed, { ...consumed, commandUuid: undefined }], SOURCE), expected)
+  assert.deepEqual(conversation([consumed, { ...consumed, deliveryId: undefined }], SOURCE), expected)
+  const unidentified = { ...attachment, attachment: { prompt: content } }
+  assert.deepEqual(conversation([unidentified, consumed], SOURCE), expected)
+  assert.deepEqual(conversation([user, unidentified, consumed], SOURCE), expected)
+  assert.deepEqual(conversation([{ ...user, uuid: id(8001) }, consumed], SOURCE), [...expected, ...expected])
+  assert.deepEqual(conversation([{ ...unidentified, attachment: { prompt: content + ' different' } }, consumed], SOURCE).length, 2)
+  const blocks = [{ type: 'text', text: content }, { type: 'image', source: { type: 'base64', data: 'YWJj', media_type: 'image/png' } }]
+  assert.deepEqual(conversation([{ ...consumed, content: blocks }], SOURCE), conversation([{ ...user, message: { role: 'user', content: blocks } }]))
+  assert.deepEqual(conversation([consumed, { ...attachment, attachment: { ...attachment.attachment, prompt: blocks } }], SOURCE), expected)
+})
+
+const queuedImagePrompt = text => [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'c3ludGhldGljLWltYWdl' } }, { type: 'text', text }]
+
+test('canonical user messages keep their exact hash and order beside richer previews and consumed copies', () => {
+  const text = 'Synthetic text', blocks = [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'YWJj' } }, { type: 'text', text }]
+  const user = { type: 'user', uuid: id(8000), sessionId: SOURCE, message: { role: 'user', content: text } }
+  const attachment = { type: 'attachment', sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: user.uuid, delivery_id: 'delivery', prompt: blocks } }
+  const removed = { type: 'queue-operation', sessionId: SOURCE, operation: 'remove', reason: 'absorbed_mid_turn', commandUuid: user.uuid, deliveryId: 'delivery' }
+  for (const rows of [[user, attachment, removed], [removed, attachment, user], [attachment, removed, user], [user, attachment, removed, user, removed]]) {
+    const before = JSON.stringify(rows)
+    assert.deepEqual(conversation(rows, SOURCE), conversation([user]))
+    assert.equal(JSON.stringify(rows), before)
+  }
+  const preceding = entry('assistant', 8010, null, SOURCE), following = entry('assistant', 8011, null, SOURCE)
+  for (const reverse of [false, true]) {
+    const canonical = { ...user, message: { role: 'user', content: reverse ? blocks : text } }
+    const consumed = { ...removed, content: reverse ? text : blocks }
+    const expected = conversation([canonical])
+    for (const rows of [[canonical, attachment, consumed], [consumed, attachment, canonical], [attachment, consumed, canonical, consumed]]) {
+      assert.deepEqual(conversation(rows, SOURCE), expected)
+    }
+    assert.deepEqual(conversation([attachment, consumed, preceding, canonical, following], SOURCE), conversation([preceding, canonical, following]))
+    assert.deepEqual(conversation([preceding, canonical, following, attachment, consumed], SOURCE), conversation([preceding, canonical, following]))
+    const conflictingUser = { ...canonical, message: { role: 'user', content: reverse ? text : blocks } }
+    assert.deepEqual(conversation([canonical, attachment, consumed, conflictingUser], SOURCE), [])
+    assert.deepEqual(conversation([conflictingUser, attachment, consumed, canonical], SOURCE), [])
+    assert.deepEqual(conversation([canonical, attachment, consumed, { ...consumed, content: canonical.message.content }], SOURCE), [])
+    assert.deepEqual(conversation([canonical, attachment, { ...consumed, deliveryId: 'different' }], SOURCE), [])
+    assert.deepEqual(conversation([canonical, { ...attachment, attachment: { ...attachment.attachment, prompt: queuedImagePrompt(text + ' changed') } }, consumed], SOURCE), [])
+  }
+  const differentImage = [{ ...blocks[0], source: { ...blocks[0].source, data: 'ZGlmZmVyZW50' } }, blocks[1]]
+  assert.deepEqual(conversation([user, attachment, removed, { ...attachment, attachment: { ...attachment.attachment, prompt: differentImage } }], SOURCE), [])
+  const second = { ...user, uuid: id(8001) }
+  assert.deepEqual(conversation([user, attachment, removed, second, user], SOURCE), conversation([user, second]))
+})
+
+test('queued text and image copies use the exact consumed payload without losing command multiplicity', () => {
+  const text = '  Synthetic image question\nwith exact spacing  ', blocks = queuedImagePrompt(text)
+  for (const reverse of [false, true]) {
+    const payload = reverse ? blocks : text
+    const consumed = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: SOURCE, commandUuid: id(8000), deliveryId: 'delivery-1', content: payload }
+    const attachment = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: consumed.commandUuid, delivery_id: consumed.deliveryId, prompt: reverse ? text : blocks } }
+    const user = entry('user', 8000, null, SOURCE, { message: { role: 'user', content: payload } })
+    const expected = conversation([user])
+    for (const copies of [[attachment, consumed], [consumed, attachment], [attachment, attachment, consumed, consumed], [user, attachment, consumed], [attachment, user, consumed]]) {
+      const before = JSON.stringify(copies)
+      assert.deepEqual(conversation(copies, SOURCE), expected)
+      assert.equal(JSON.stringify(copies), before)
+    }
+    const second = { ...consumed, commandUuid: id(8001), deliveryId: 'delivery-2' }
+    const secondAttachment = { ...attachment, uuid: id(8101), attachment: { ...attachment.attachment, source_uuid: second.commandUuid, delivery_id: second.deliveryId } }
+    assert.deepEqual(conversation([attachment, consumed, secondAttachment, second, consumed, secondAttachment], SOURCE), [...expected, ...expected])
+    assert.deepEqual(conversation([attachment, consumed, { ...consumed, content: reverse ? text : blocks }], SOURCE), [])
+    assert.deepEqual(conversation([attachment, consumed, { ...consumed, deliveryId: 'conflicting-delivery' }], SOURCE), [])
+    const different = reverse ? text + ' changed' : queuedImagePrompt(text + ' changed')
+    assert.deepEqual(conversation([{ ...attachment, attachment: { ...attachment.attachment, prompt: different } }, consumed], SOURCE), [])
+    assert.deepEqual(conversation([attachment, { ...consumed, sessionId: id(2) }], SOURCE), reverse ? conversation([{ ...user, message: { role: 'user', content: text } }]) : [])
+  }
+  const consumed = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: SOURCE, commandUuid: id(8000), deliveryId: 'delivery-1', content: text }
+  const attachment = { type: 'attachment', uuid: id(8100), sessionId: SOURCE, attachment: { type: 'queued_command', source_uuid: id(8000), delivery_id: 'delivery-1', prompt: blocks } }
+  const differentImage = [{ ...blocks[0], source: { ...blocks[0].source, data: 'ZGlmZmVyZW50' } }, blocks[1]]
+  assert.deepEqual(conversation([attachment, consumed, { ...attachment, uuid: id(8101), attachment: { ...attachment.attachment, prompt: differentImage } }], SOURCE), [])
+  for (const incompatible of [
+    [...blocks, { type: 'text', text: '' }], [{ type: 'document', source: blocks[0].source }, blocks[1]],
+    [blocks[0], { ...blocks[1], otherFilledValue: 'different representation' }]
+  ]) assert.deepEqual(conversation([consumed, { ...attachment, attachment: { ...attachment.attachment, prompt: incompatible } }], SOURCE), [])
+  assert.deepEqual(conversation([attachment, { ...attachment, uuid: id(8101), attachment: { ...attachment.attachment, prompt: text } }], SOURCE), [])
+})
+
+test('consumed queue-only messages prove cloud containment without changing transcript semantics', async () => {
+  for (const operation of ['consumed', 'enqueue', 'cancelled']) {
+    const h = await home(), entries = branchEntries(4, SOURCE, 1), prompt = entry('user', 8000, 4, SOURCE)
+    const queue = { type: 'queue-operation', sessionId: SOURCE, commandUuid: prompt.uuid, deliveryId: 'delivery', content: prompt.message.content,
+      operation: operation === 'enqueue' ? 'enqueue' : 'remove', reason: operation === 'cancelled' ? 'cancelled' : 'absorbed_mid_turn' }
+    await h.write(SOURCE, [...entries, queue, queue])
+    await h.record('Z', SOURCE, rehomeRecord({ title: 'Local synthetic title' }))
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const cloud = cloudFixture(h, { list: async () => [remoteSession({ id: 'cse_queue', title: 'Different remote title' })], eventRows: async () => remoteRows([...entries, prompt]) })
+    const inv = await inventory([from], to, h.paths, () => {}, { cloud, processes: [] })
+    assert.equal(inv.cloud.matches.length, operation === 'consumed' ? 1 : 0, operation)
+    if (operation === 'consumed') assert.equal(inv.cloud.matches[0].target.matchMode, 'ordered')
+    assert.equal(semantic([...entries, queue, queue], SOURCE), semantic(entries, SOURCE))
+  }
+})
+
+test('bounded near-order matching agrees with reference LCS and exact multiplicities', () => {
+  const reference = (source, target) => {
+    if (!source.length) return null
+    const counts = new Map()
+    for (const value of target) counts.set(value, (counts.get(value) ?? 0) + 1)
+    for (const value of source) {
+      if (!counts.get(value)) return null
+      counts.set(value, counts.get(value) - 1)
+    }
+    let previous = Array(target.length + 1).fill(0)
+    for (const value of source) {
+      const next = [0]
+      for (let at = 1; at <= target.length; at++) next[at] = value === target[at - 1] ? previous[at - 1] + 1 : Math.max(previous[at], next[at - 1])
+      previous = next
+    }
+    const missing = source.length - previous[target.length]
+    return !missing ? 'ordered' : missing <= Math.min(8, Math.floor(source.length / 100)) ? 'equivalent' : null
+  }
+  for (const length of [0, 1, 99, 100, 199, 200, 799, 800, 1000]) {
+    const source = Array.from({ length }, (_, i) => i)
+    for (let swaps = 0; swaps <= 9 && swaps * 2 <= length; swaps++) {
+      const target = [...source]
+      for (let i = 0; i < swaps * 2; i += 2) [target[i], target[i + 1]] = [target[i + 1], target[i]]
+      assert.equal(conversationMatch(source, target), reference(source, target), `${length}/${swaps}`)
+    }
+  }
+  let seed = 123456
+  const random = limit => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed % limit }
+  for (let trial = 0; trial < 350; trial++) {
+    const source = Array.from({ length: random(230) + 1 }, () => random(7)), target = [...source]
+    for (let swaps = random(10); swaps > 0; swaps--) {
+      const a = random(target.length), b = random(target.length)
+      ;[target[a], target[b]] = [target[b], target[a]]
+    }
+    if (trial % 3 === 0) target.splice(random(target.length), 1)
+    if (trial % 5 === 0) target.splice(random(target.length), 0, random(7))
+    assert.equal(conversationMatch(source, target), reference(source, target), `random case ${trial}`)
+  }
+  assert.equal(conversationMatch(Array(100).fill('same'), [...Array(99).fill('same'), 'other']), null)
+})
+
+test('bounded near-order matching handles large histories without quadratic work or counter overflow', async t => {
+  const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict'
+    import { conversationMatch } from ${JSON.stringify(path.join(here, 'transplant.js'))}
+    const started = performance.now(), source = Array.from({ length: 100_000 }, (_, i) => i), target = [...source]
+    for (let i = 0; i < 16; i += 2) [target[i], target[i + 1]] = [target[i + 1], target[i]]
+    assert.equal(conversationMatch(source, target), 'equivalent')
+    ;[target[16], target[17]] = [target[17], target[16]]
+    assert.equal(conversationMatch(source, target), null)
+    assert.equal(conversationMatch(source, [...source.slice(1), source[0]]), 'equivalent')
+    assert.equal(conversationMatch([...source, source[0]], target), null)
+    console.log(Math.ceil(performance.now() - started))
+  `], { timeout: 15_000 })
+  t.diagnostic(`Four 100k-message comparisons completed in ${stdout.trim()}ms`)
+})
+
+async function nativePriorFixture(scenario = 'valid') {
+  const h = await home(), prior = id(8200), other = id(8201), remote = branchEntries(200, prior, 1000)
+  const local = structuredClone(remote)
+  for (const at of [80, 180]) local[at] = { type: 'queue-operation', operation: 'remove', reason: 'absorbed_mid_turn', sessionId: prior,
+    commandUuid: remote[at].uuid, deliveryId: `delivery-${at}`, content: remote[at].message.content }
+  ;[local[20], local[21]] = [local[21], local[20]]
+  const bridge = { type: 'bridge-session', sessionId: prior, bridgeSessionId: 'session_native_prior', ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+  if (scenario === 'wrong owner') bridge.ownerAccountUuid = h.acct.T
+  if (scenario === 'wrong org') bridge.ownerOrganizationUuid = h.org.T
+  if (scenario === 'wrong session') bridge.sessionId = SOURCE
+  if (scenario === 'wrong mirror') bridge.bridgeSessionId = 'session_foreign'
+  await h.write(SOURCE, branchEntries(4, SOURCE, 5000))
+  await h.write(prior, [...local, bridge, ...(scenario === 'conflicting bridge' ? [{ ...bridge, ownerAccountUuid: h.acct.T }] : [])])
+  const priorFile = path.join(h.project, `${prior}.jsonl`)
+  if (scenario === 'symlink') {
+    await rename(priorFile, `${priorFile}.saved`)
+    await symlink(`${priorFile}.saved`, priorFile)
+  }
+  if (scenario === 'other project') {
+    const project = path.join(h.paths.pool, '-tmp-other')
+    await mkdir(project)
+    await rename(priorFile, path.join(project, `${prior}.jsonl`))
+  }
+  if (scenario === 'split priors') {
+    await h.write(prior, [...local.slice(0, 100), bridge])
+    await h.write(other, [...local.slice(100).map(row => ({ ...row, sessionId: other })), { ...bridge, sessionId: other }])
+  }
+  if (scenario === 'invalid prior') await appendFile(priorFile, '{broken}\n')
+  await h.record('P', SOURCE, rehomeRecord({ title: 'Current generation', priorCliSessionIds: scenario === 'unrecorded' ? [] : scenario === 'split priors' ? [prior, other] : [prior] }))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const f = { h, from, to, prior, priorFile, status: 'active', archives: 0, reads: 0, remote }
+  f.cloud = cloudFixture(h, {
+    list: async () => [remoteSession({ id: 'cse_native_prior', title: 'Old generation', status: f.status, ...(scenario === 'after cutoff' ? { created_at: '2099-01-01T00:00:00.000Z' } : {}) })],
+    eventRows: async () => { f.reads++; return remoteRows(remote) }, session: async () => remoteState(f.status),
+    archive: async () => { f.archives++; f.status = 'archived' }, unarchive: async () => { f.status = 'active' }
+  })
+  return f
+}
+
+test('native bridge retained history covers immediate and deferred moves without a prior receipt target', async () => {
+  for (const deferred of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f
+    const before = await Promise.all([readFile(f.priorFile), readFile(path.join(h.project, `${SOURCE}.jsonl`))])
+    const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [], writeCache: true })
+    assert.equal(inv.move[0].retainedHistories.length, 1)
+    if (!deferred) assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+    const moved = await move(inv, f.to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.deepEqual(moved.receipt.cloudLinks.map(row => row.targetId), [SOURCE])
+    if (deferred) {
+      assert.equal(moved.pendingCloud, 1)
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.ok, true, JSON.stringify(finished.failed))
+      assert.equal(finished.complete, true)
+      assert.equal(finished.rescued, 0)
+      assert.equal(finished.receipt.remote[0].matchMode, 'equivalent')
+    }
+    assert.equal(f.archives, 1)
+    assert.deepEqual(await Promise.all([readFile(f.priorFile), readFile(path.join(h.project, `${SOURCE}.jsonl`))]), before)
+    assert.ok((await undo(h.paths, { cloud: f.cloud, processes: [] })).dest)
+    assert.equal(f.status, 'active')
+  }
+})
+
+test('native bridge retained history refuses foreign, ambiguous and incomplete generations', async () => {
+  for (const scenario of ['wrong owner', 'wrong org', 'wrong session', 'wrong mirror', 'conflicting bridge', 'unrecorded', 'symlink', 'other project', 'split priors', 'invalid prior', 'after cutoff']) {
+    const f = await nativePriorFixture(scenario)
+    const inv = await inventory([f.from], f.to, f.h.paths, () => {}, { cloud: f.cloud, processes: [] })
+    assert.ok(inv.cloud.matches.every(match => match.target.kind === 'rescue' && !match.target.retained), scenario)
+    assert.equal(f.archives, 0)
+  }
+})
+
+test('native bridge retained history rechecks post-plan content and respects cancelled deferred checks', async () => {
+  for (const scenario of ['changed', 'replaced link', 'deferred changed', 'cancelled']) {
+    const f = await nativePriorFixture(), { h } = f
+    const deferred = scenario.startsWith('deferred') || scenario === 'cancelled'
+    const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [] })
+    if (scenario === 'changed') await appendFile(f.priorFile, '{}\n')
+    if (scenario === 'replaced link') {
+      await rename(f.priorFile, `${f.priorFile}.saved`)
+      await symlink(`${f.priorFile}.saved`, f.priorFile)
+    }
+    const moved = await move(inv, f.to, h.paths)
+    if (!deferred) assert.equal(moved.ok, false)
+    else if (scenario === 'cancelled') {
+      await keepLocal(h.paths)
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.receipt.cloudChecks[0].status, 'cancelled')
+      assert.equal(f.reads, 0)
+    } else {
+      f.cloud.eventRows = async () => { if (++f.reads === 3) await appendFile(f.priorFile, '{}\n'); return remoteRows(f.remote) }
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.ok, false)
+    }
+    assert.equal(f.archives, 0, scenario)
+  }
+})
+
+test('receipt snapshots omit tool metadata while Desktop records, drift and Undo retain their safeguards', async () => {
+  const h = await home(), metadata = { servers: [{ name: 'synthetic-mcp', tools: [{ name: 'synthetic-tool', schema: 'x'.repeat(1_000_000) }] }] }
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord({ toolSurfaceSnapshot: metadata, mcpServers: metadata, isStarred: true }))
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
+  assert.equal(moved.ok, true)
+  const row = moved.receipt.sessions[0], record = JSON.parse(await readFile(row.record))
+  assert.deepEqual(record.toolSurfaceSnapshot, metadata)
+  assert.deepEqual(record.mcpServers, metadata)
+  assert.deepEqual(Object.keys(row.recordSnapshot).sort(), ['sessionId', 'cliSessionId', 'cwd', 'originCwd', 'title', 'isArchived', 'isStarred'].sort())
+  assert.ok(JSON.stringify(row.recordSnapshot).length < 600)
+  assert.equal(row.recordSha, createHash('sha256').update(await readFile(row.record)).digest('hex'))
+  const changed = { ...record, title: 'Changed title', isStarred: false }
+  await writeFile(row.record, JSON.stringify(changed))
+  assert.deepEqual((await verifyPlaced(h.paths)).changed[0].fields, ['title', 'isStarred'])
+  assert.match((await undo(h.paths)).changed[0], /desktop record/)
+  await writeFile(row.record, JSON.stringify(record))
+  assert.ok((await undo(h.paths)).dest)
+  assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))).mcpServers, metadata)
+})
+
+test('incremental receipt journals compact legacy snapshots and preserve UTF-8, sequence and corruption rules', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-journal-')), file = path.join(root, 'receipt.json')
+  const snapshot = { sessionId: `local_${SOURCE}`, cliSessionId: SOURCE, cwd: '/tmp/fixture', originCwd: '/tmp/fixture', title: 'Synthetic \u96ea\ud83c\udf0b', isArchived: false, isStarred: true, mcp: 'x'.repeat(200_000) }
+  const row = { recordSnapshot: snapshot, recordSha: 'hash', recordSemantic: 'semantic', rollback: { bytes: 'keep' }, task: { prompt: 'keep task' } }
+  const base = { journalSequence: 1, sessions: [row], failed: [], retained: [], pending: { ...row }, futureField: { value: 'keep unknown' } }
+  const patch = { sequence: 2, sessions: [row], failed: [], retained: [{ ...row }], pending: row }
+  await writeFile(file, JSON.stringify(base))
+  const skipped = JSON.stringify({ sequence: 1, sessions: 'already applied' }) + '\n'
+  const padding = ' '.repeat(65535 - Buffer.byteLength(skipped) - 65536 * Math.floor((65535 - Buffer.byteLength(skipped)) / 65536))
+  await writeFile(`${file}.journal`, skipped + padding + JSON.stringify(patch) + '\n' + JSON.stringify({ sequence: 3 }) + '\u96ea')
+  const receipt = await readReceipt(file)
+  assert.equal(receipt.journalSequence, 2)
+  assert.equal(receipt.sessions.length, 2)
+  assert.deepEqual(receipt.futureField, base.futureField)
+  for (const saved of [...receipt.sessions, ...receipt.retained, receipt.pending]) {
+    assert.equal(saved.recordSnapshot.mcp, undefined)
+    assert.equal(saved.recordSnapshot.title, snapshot.title)
+    assert.equal(saved.recordSha, 'hash')
+    assert.deepEqual(saved.task, row.task)
+    assert.deepEqual(saved.rollback, row.rollback)
+  }
+  assert.equal(JSON.parse(await readFile(file)).sessions[0].recordSnapshot.mcp.length, 200_000)
+  const encoded = Buffer.from(JSON.stringify(patch) + '\n'), unicodeAt = encoded.indexOf(Buffer.from('\u96ea'))
+  for (const split of [1, 2, 3]) {
+    await writeFile(`${file}.journal`, Buffer.concat([Buffer.from(' '.repeat(65536 - unicodeAt - split)), encoded]))
+    assert.equal((await readReceipt(file)).sessions[1].recordSnapshot.title, snapshot.title)
+  }
+  for (const [text, error] of [
+    ['{broken}\n', /JSON|property|Expected/], ['\n', /JSON/], [JSON.stringify({ ...patch, sequence: 3 }) + '\n', /Incomplete move journal/],
+    [JSON.stringify({ ...patch, sequence: 0 }) + '\n', /Invalid move journal sequence/], [JSON.stringify({ ...patch, sessions: {} }) + '\n', /Invalid move journal entries/]
+  ]) {
+    await writeFile(`${file}.journal`, text)
+    await assert.rejects(readReceipt(file), error)
+  }
+})
+
+test('incremental receipt journal replay stays within a small heap for a large synthetic journal', { timeout: 30_000 }, async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-journal-heap-')), file = path.join(root, 'receipt.json')
+  await writeFile(file, JSON.stringify({ sessions: [], failed: [], retained: [] }))
+  for (let sequence = 1; sequence <= 256; sequence++) await appendFile(`${file}.journal`, JSON.stringify({ sequence, pending: null, failed: [], retained: [],
+    sessions: [{ recordSha: `sha-${sequence}`, recordSnapshot: { sessionId: `local_${SOURCE}`, cliSessionId: SOURCE, title: `Synthetic ${sequence}`, toolSurfaceSnapshot: 'x'.repeat(512 * 1024) } }] }) + '\n')
+  const bytes = (await stat(`${file}.journal`)).size
+  const { stdout } = await promisify(execFile)(process.execPath, ['--max-old-space-size=48', '--input-type=module', '-e', `
+    import assert from 'node:assert/strict'
+    import fs from 'node:fs/promises'
+    import { syncBuiltinESMExports } from 'node:module'
+    const original = fs.readFile
+    fs.readFile = (file, ...args) => { assert.ok(!String(file).endsWith('.journal')); return original(file, ...args) }
+    syncBuiltinESMExports()
+    const { readReceipt } = await import(${JSON.stringify(path.join(here, 'transplant.js'))})
+    const receipt = await readReceipt(${JSON.stringify(file)})
+    assert.equal(receipt.sessions.length, 256)
+    assert.equal(receipt.journalSequence, 256)
+    assert.ok(receipt.sessions.every(row => !Object.hasOwn(row.recordSnapshot, 'toolSurfaceSnapshot')))
+    console.log(JSON.stringify({ records: receipt.sessions.length, heapUsed: process.memoryUsage().heapUsed }))
+  `], { timeout: 25_000, env: { ...process.env, HOME: root } })
+  const result = JSON.parse(stdout)
+  assert.equal(result.records, 256)
+  assert.ok(bytes > 128 * 1024 * 1024)
+  t.diagnostic(`Replayed ${bytes} journal bytes with a 48 MiB heap limit, final heap ${result.heapUsed} bytes`)
+})
+
+test('sidecar link leaves survive parent and child moves and Undo without reading their targets', async () => {
+  const h = await home(), child = id(8300), external = path.join(h.root, 'external')
+  await mkdir(external)
+  await writeFile(path.join(external, 'secret'), 'synthetic unread target')
+  const links = []
+  for (const sid of [SOURCE, child]) {
+    await h.write(sid, [entry('user', sid === SOURCE ? 1 : 2, null, sid)])
+    await h.record('P', sid, rehomeRecord(sid === child ? { forkedFromSessionId: `local_${SOURCE}` } : {}))
+    const dir = path.join(h.project, sid, 'workflow')
+    await mkdir(dir, { recursive: true })
+    for (const [name, destination] of [['dangling', '../missing'], ['external', external], ['cycle', 'cycle'], ['regular-target', path.join(external, 'secret')]]) {
+      const file = path.join(dir, name)
+      await symlink(destination, file)
+      links.push({ file, destination, inode: (await lstat(file)).ino })
+    }
+  }
+  const originals = { readFile: fs.readFile, open: fs.open, readdir: fs.readdir }
+  for (const key of Object.keys(originals)) fs[key] = (file, ...args) => {
+    assert.ok(!String(file).startsWith(external), `external target ${key}`)
+    assert.ok(!links.some(link => link.file === String(file)), `link target ${key}`)
+    return originals[key](file, ...args)
+  }
+  syncBuiltinESMExports()
+  try {
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true }), to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.deepEqual(moved.receipt.sessions.map(row => row.id), [SOURCE, child])
+    assert.ok((await undo(h.paths)).dest)
+  } finally { Object.assign(fs, originals); syncBuiltinESMExports() }
+  for (const link of links) {
+    assert.equal(await readlink(link.file), link.destination)
+    assert.equal((await lstat(link.file)).ino, link.inode)
+  }
+})
+
+test('sidecar link changes invalidate plans and link targets cannot masquerade as regular sidecars', async () => {
+  for (const scenario of ['changed link', 'link replaced by file', 'relative roots', 'link vs file']) {
+    const h = await home(), other = id(8301), entries = branchEntries(4, SOURCE, 1)
+    await h.write(SOURCE, entries)
+    await h.record('P', SOURCE, rehomeRecord())
+    const dir = path.join(h.project, SOURCE), file = path.join(dir, 'snapshot')
+    await mkdir(dir)
+    await symlink('relative-destination', file)
+    if (['relative roots', 'link vs file'].includes(scenario)) {
+      await h.write(other, fork(entries, SOURCE, other, 'Synthetic other'))
+      await h.record('Z', other, rehomeRecord())
+      const second = path.join(h.project, other)
+      await mkdir(second)
+      if (scenario === 'relative roots') await symlink('relative-destination', path.join(second, 'snapshot'))
+      else await writeFile(path.join(second, 'snapshot'), 'relative-destination')
+    }
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true })
+    assert.equal(inv.move.length, 1)
+    assert.equal(inv.there.length, 0)
+    if (scenario.startsWith('changed') || scenario === 'link replaced by file') {
+      await unlink(file)
+      if (scenario === 'changed link') await symlink('different', file)
+      else await writeFile(file, 'relative-destination')
+      const moved = await move(inv, to, h.paths)
+      assert.equal(moved.ok, false, scenario)
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+    }
+  }
+})
+
+test('synthetic menubar installation reports the package version without invoking app actions', async () => {
+  const h = await home()
+  const setup = `
+    import { writeFileSync } from 'node:fs'
+    const syntheticSpawn = childProcess.spawnSync, syntheticAsync = childProcess.spawn
+    childProcess.spawnSync = (file, args, ...rest) => {
+      if (['launchctl', 'pkill'].includes(file)) return { status: 0, stdout: '', stderr: '' }
+      if (file === 'swiftc') { writeFileSync(args[args.indexOf('-o') + 1], 'synthetic binary'); return { status: 0, stdout: '', stderr: '' } }
+      if (String(file).includes('.app/') || ['/usr/bin/open', '/usr/bin/osascript'].includes(file)) throw new Error('unexpected app action')
+      return syntheticSpawn(file, args, ...rest)
+    }
+    childProcess.spawn = (file, ...args) => {
+      if (String(file).includes('.app/') || ['launchctl', 'pkill', '/bin/launchctl', '/usr/bin/open', '/usr/bin/osascript'].includes(file)) throw new Error('unexpected app spawn')
+      return syntheticAsync(file, ...args)
+    }
+  `
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await cli(h.root, ['menubar'], setup)
+    assert.equal(result.code, 0, result.stderr)
+    const script = path.join(h.paths.state, 'Claude Transplant.app/Contents/Resources/transplant.js')
+    const { stdout } = await promisify(execFile)(process.execPath, [script, '--version'], { env: { ...process.env, HOME: h.root } })
+    assert.equal(stdout.trim(), JSON.parse(await readFile(path.join(here, 'package.json'))).version)
+  }
+})
+
+test('regular sidecar hashes and fingerprints retain the existing receipt format', async () => {
+  const h = await home(), data = Buffer.from('unchanged synthetic sidecar\n'), dir = path.join(h.project, SOURCE), file = path.join(dir, 'snapshot')
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  await mkdir(dir)
+  await writeFile(file, data)
+  const digest = value => createHash('sha256').update(value).digest('hex')
+  const detail = await stat(file, { bigint: true }), signature = [detail.dev, detail.ino, detail.size, detail.mtimeNs, detail.ctimeNs].join(':')
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  assert.equal(inv.move[0].sidecar.sha, digest(JSON.stringify([{ bytes: data.length, rel: 'snapshot', sha: digest(data) }])))
+  assert.equal(inv.move[0].sidecar.fingerprint, digest(JSON.stringify([{ fingerprint: signature, rel: 'snapshot' }])))
+})
+
+test('sidecar link replacements are refused during regular reads and warm cache verification', async () => {
+  for (const warm of [false, true]) {
+    const h = await home(), dir = path.join(h.project, SOURCE), file = path.join(dir, 'snapshot'), external = path.join(h.root, 'synthetic-target')
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    await mkdir(dir)
+    await writeFile(file, 'original')
+    await writeFile(external, 'never read this synthetic target')
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    if (warm) await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true })
+    const originalOpen = fs.open, originalLstat = fs.lstat
+    let replaced = false
+    const replace = async () => { replaced = true; await unlink(file); await symlink(external, file) }
+    fs.open = async (name, flags, ...args) => {
+      assert.notEqual(name, external)
+      if (name === file && !warm && !replaced) {
+        assert.ok(flags & fsSync.constants.O_NOFOLLOW)
+        await replace()
+      }
+      return originalOpen(name, flags, ...args)
+    }
+    fs.lstat = async (name, ...args) => {
+      const detail = await originalLstat(name, ...args)
+      if (name === file && warm && !replaced) await replace()
+      return detail
+    }
+    syncBuiltinESMExports()
+    let inv
+    try { inv = await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true }) }
+    finally { fs.open = originalOpen; fs.lstat = originalLstat; syncBuiltinESMExports() }
+    assert.equal(replaced, true)
+    assert.equal(inv.move.length, 0)
+    assert.equal(inv.rejected.length, 1)
+  }
+})
+
+test('sidecar root links and symlinked ancestors refuse inventory without traversing targets or changing accounts', async () => {
+  for (const scenario of ['dangling root', 'live root', 'linked ancestor']) {
+    const h = await home(), dir = path.join(h.project, SOURCE), external = path.join(h.root, 'unrelated'), other = id(8302)
+    await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+    await h.record('P', SOURCE, rehomeRecord())
+    await h.write(other, [entry('user', 2, null, other)])
+    await h.record('Z', other, rehomeRecord())
+    if (scenario === 'linked ancestor') {
+      await mkdir(dir)
+      await writeFile(path.join(dir, 'unrelated.txt'), 'Synthetic target that the walker must not read')
+      await rename(h.project, external)
+      await symlink(external, h.project)
+    } else {
+      if (scenario === 'live root') {
+        await mkdir(external)
+        await writeFile(path.join(external, 'unrelated.txt'), 'Synthetic target that the walker must not read')
+      }
+      await symlink(external, dir)
+    }
+    const link = scenario === 'linked ancestor' ? h.project : dir, inode = (await lstat(link)).ino
+    const before = await fixtureSnapshot(h, [h.dir('P'), h.dir('Z')])
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const originals = { readdir: fs.readdir, readFile: fs.readFile, open: fs.open }
+    for (const key of Object.keys(originals)) fs[key] = (file, ...args) => {
+      const name = String(file)
+      assert.ok(name !== dir && !name.startsWith(dir + path.sep), `sidecar root target ${key}`)
+      assert.ok(name !== external && !name.startsWith(external + path.sep), `external target ${key}`)
+      return originals[key](file, ...args)
+    }
+    syncBuiltinESMExports()
+    let inv
+    try { inv = await inventory([from], to, h.paths, () => {}, { processes: [] }) }
+    finally { Object.assign(fs, originals); syncBuiltinESMExports() }
+    assert.equal(inv.move.length, 0, scenario)
+    assert.equal(inv.there.length, 0, scenario)
+    assert.equal(inv.rejected.length, 1, scenario)
+    assert.equal(inv.rejected[0].error, `unsupported entry ${dir}`, scenario)
+    assert.deepEqual(await fixtureSnapshot(h, [h.dir('P'), h.dir('Z')]), before, scenario)
+    assert.equal(await readlink(link), external)
+    assert.equal((await lstat(link)).ino, inode)
+    assert.equal(await lstat(h.paths.state).catch(() => null), null)
+  }
+})
+
+test('native prior bindings stay scoped to the source login when several accounts move together', async () => {
+  const f = await nativePriorFixture(), { h } = f
+  const secondRecord = path.join(h.dir('T'), `local_${SOURCE}.json`)
+  await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), secondRecord)
+  const rows = lines(await readFile(f.priorFile, 'utf8'))
+  rows.find(row => row.type === 'bridge-session').ownerAccountUuid = h.acct.T
+  rows.find(row => row.type === 'bridge-session').ownerOrganizationUuid = h.org.T
+  await h.write(f.prior, rows)
+  const all = await accounts(h.paths, []), other = all.find(row => row.account === h.acct.T)
+  const inv = await inventory([all.find(row => row.account === h.acct.P), other], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [] })
+  assert.ok(inv.move[0].retainedHistories.length)
+  assert.ok(inv.cloud.matches.every(match => !match.target.retained))
+  assert.equal(f.archives, 0)
+})
+
+test('retained image attachments and consumed text match existing targets immediately and after deferred cleanup', async () => {
+  for (const deferred of [false, true]) for (const reverse of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f
+    const rows = lines(await readFile(f.priorFile, 'utf8'))
+    const enriched = rows.flatMap((row, index) => {
+      if (row.type !== 'queue-operation') return [row]
+      const text = row.content, blocks = queuedImagePrompt(text), consumed = { ...row, content: reverse ? blocks : text }
+      f.remote.find(event => event.uuid === row.commandUuid).message.content = consumed.content
+      const attachment = { type: 'attachment', uuid: id(90000 + index), sessionId: f.prior,
+        attachment: { type: 'queued_command', source_uuid: row.commandUuid, delivery_id: row.deliveryId, prompt: reverse ? text : blocks } }
+      return [attachment, consumed, { ...attachment, uuid: id(91000 + index) }, { ...consumed }]
+    })
+    await h.write(f.prior, enriched)
+    const files = [f.priorFile, path.join(h.project, `${SOURCE}.jsonl`)], before = await Promise.all(files.map(file => readFile(file)))
+    const expectedHash = createHash('sha256').update(JSON.stringify(conversation(f.remote))).digest('hex')
+    if (!deferred) await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('Z'), `local_${SOURCE}.json`))
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const inv = await inventory([from], to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [], writeCache: true })
+    const prior = (deferred ? inv.move[0] : inv.targets[0]).retainedHistories[0]
+    assert.equal(prior.conversation.length, f.remote.length)
+    if (!deferred) {
+      assert.equal(inv.cloud.matches.length, 1)
+      assert.equal(inv.cloud.matches[0].target.kind, 'existing')
+      assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+      assert.equal(inv.cloud.matches[0].conversationSha, expectedHash)
+    }
+    const moved = await move(inv, to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    const result = deferred ? await finishPending(h.paths, { cloud: f.cloud, processes: [] }) : moved
+    assert.equal(result.ok, true, JSON.stringify(result.failed))
+    assert.equal(result.complete, true)
+    assert.equal(result.receipt.remote.length, 1)
+    assert.equal(result.receipt.remote[0].targetKind, 'existing')
+    assert.equal(result.receipt.remote[0].matchMode, 'equivalent')
+    assert.equal(result.receipt.remote[0].conversationSha, expectedHash)
+    assert.equal(result.receipt.sessions.some(row => row.strategy === 'remote'), false)
+    assert.equal(f.archives, 1)
+    assert.deepEqual(await Promise.all(files.map(file => readFile(file))), before)
+  }
+})
+
+test('retained image attachments with different text do not prove cloud containment', async () => {
+  const f = await nativePriorFixture(), { h } = f
+  const rows = lines(await readFile(f.priorFile, 'utf8')).flatMap((row, index) => row.type !== 'queue-operation' ? [row] : [
+    { type: 'attachment', uuid: id(90000 + index), sessionId: f.prior,
+      attachment: { type: 'queued_command', source_uuid: row.commandUuid, delivery_id: row.deliveryId, prompt: queuedImagePrompt(row.content + ' different text') } }, row
+  ])
+  await h.write(f.prior, rows)
+  const before = await readFile(f.priorFile)
+  const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [] })
+  assert.ok(inv.cloud.matches.every(match => match.target.kind === 'rescue' && !match.target.retained))
+  assert.equal(f.archives, 0)
+  assert.deepEqual(await readFile(f.priorFile), before)
+})
+
+test('supplemental queued text and image coverage keeps the consumed representation and rejects conflicting copies', async () => {
+  for (const scenario of ['consumed string', 'consumed array', 'conflicting consumed', 'conflicting image', 'different text']) {
+    const f = await artifactFixture(), text = 'Synthetic supplemental image question', blocks = queuedImagePrompt(text)
+    const reverse = scenario === 'consumed array'
+    f.queued.attachment.prompt = reverse ? text : blocks
+    f.removal.content = reverse ? blocks : text
+    f.remote.at(-1).message.content = f.removal.content
+    if (scenario === 'conflicting consumed') f.extra.push({ ...f.removal, content: blocks })
+    if (scenario === 'conflicting image') f.extra.push({ ...f.removal, operation: 'enqueue', content: [{ ...blocks[0], source: { ...blocks[0].source, data: 'ZGlmZmVyZW50' } }, blocks[1]] })
+    if (scenario === 'different text') f.queued.attachment.prompt = queuedImagePrompt(text + ' different')
+    await f.write()
+    const inv = await f.inventory()
+    if (scenario.startsWith('consumed')) {
+      assert.equal(inv.cloud.matches[0].target.matchMode, 'artifacts')
+      assert.deepEqual(inv.cloud.matches[0].target.artifactCounts, { main: 365, subagent: 104, queued: 1 })
+    } else {
+      assert.deepEqual(inv.cloud.matches, [])
+      assert.equal(inv.cloud.blocked[0].code, 'CLOUD_ARTIFACT_UNCERTAIN')
+    }
+  }
+})
+
+test('retained bridge bindings deduplicate exact repeats and keep a conflicting owner untrusted', async () => {
+  for (const conflict of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f, rows = lines(await readFile(f.priorFile, 'utf8'))
+    const bridge = rows.find(row => row.type === 'bridge-session')
+    const repeated = Array.from({ length: 1104 }, () => ({ ...bridge }))
+    if (conflict) repeated.splice(552, 0, { ...bridge, ownerAccountUuid: h.acct.T })
+    await h.write(f.prior, [...rows.filter(row => row.type !== 'bridge-session'), ...repeated])
+    const before = await readFile(f.priorFile)
+    const inspect = inv => {
+      if (conflict) {
+        assert.equal(inv.move[0].retainedHistories, undefined)
+        assert.ok(inv.cloud.matches.every(match => !match.target.retained))
+      } else {
+        assert.equal(inv.move[0].retainedHistories.length, 1)
+        assert.equal(inv.move[0].retainedHistories[0].bindings.length, 1)
+        assert.equal(inv.cloud.matches[0].target.matchMode, 'equivalent')
+      }
+    }
+    inspect(await inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [], writeCache: true }))
+    const file = path.join(h.paths.state, 'cache.json'), cache = JSON.parse(await readFile(file))
+    const stored = Object.values(cache.histories).find(item => item.value.dependencies.some(([file]) => file === f.priorFile)).value.result
+    assert.equal(stored.bridgeOwners.length, conflict ? 2 : 1)
+    const first = stored.bridgeOwners[0], other = stored.bridgeOwners[1]
+    stored.bridgeOwners = Array.from({ length: 1104 }, () => first)
+    if (other) stored.bridgeOwners.splice(552, 0, other)
+    await writeFile(file, JSON.stringify(cache))
+    const warm = await inventory([f.from], f.to, h.paths, () => {}, { cloud: f.cloud, processes: [] })
+    assert.equal(warm.cacheStats.historyMisses, 0)
+    inspect(warm)
+    assert.deepEqual(await readFile(f.priorFile), before)
+  }
 })

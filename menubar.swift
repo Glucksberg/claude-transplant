@@ -606,6 +606,7 @@ final class Model: ObservableObject {
         note = ""
         completion = nil
         companionTitles = []
+        if restartAvailable && symbol == "info.circle" { symbol = "arrow.left.arrow.right" }
         restartAvailable = false
         retryable = false
         stopped = false
@@ -999,6 +1000,10 @@ final class Model: ObservableObject {
             }
             if problem == nil, result?.restart == true, result?.changed?.contains(where: { $0.fields.contains("record unavailable") }) != true {
                 restartAvailable = true
+                if !running {
+                    badge = ""
+                    if symbol != "exclamationmark.triangle" { symbol = "info.circle" }
+                }
                 note = (result?.moved ?? 0) > 0 ? "Moved \(quantity(result!.moved!, "more session", "more sessions")). Restart Claude to see them." : "The source checks finished. Restart Claude to refresh the sidebar."
                 if result?.complete == true && !running { selectionComplete = true; from = []; to = nil }
             }
@@ -1074,7 +1079,7 @@ final class Model: ObservableObject {
         if status != 0, note.isEmpty { lines.append(("reason", error)); note = "\(operationName) stopped: the operation did not complete."; stopped = true; preserveNotice = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             guard let self, !self.running else { return }
-            self.symbol = "arrow.left.arrow.right"
+            if !self.restartAvailable || self.symbol != "exclamationmark.triangle" { self.symbol = self.restartAvailable ? "info.circle" : "arrow.left.arrow.right" }
             self.badge = ""
         }
         refresh()
