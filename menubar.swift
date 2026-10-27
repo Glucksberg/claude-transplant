@@ -357,6 +357,8 @@ final class Model: ObservableObject {
     private var selectionComplete = false
     private var panelOpen = false
     private var sweepNote: String?
+    private var sweepFailureReceipt: String?
+    private var restartNote: String?
     private var retryable = false
     private var stopped = false
     private var reviewRestart = false
@@ -448,8 +450,10 @@ final class Model: ObservableObject {
         }
         switch account.pendingState {
         case "login": return account.signedIn == true ? "Waiting for Claude to finish signing in." + retry : signInText + " to continue."
-        case "memory": return "Waiting for memory to verify source history." + retry
-        case "limit": return "\(conversations) \(count == 1 ? "exceeds" : "exceed") the history limit and \(count == 1 ? "remains" : "remain") in \(account.label)."
+        case "memory": return "Waiting for memory to verify history." + retry
+        case "limit": return "\(conversations) \(count == 1 ? "exceeds" : "exceed") the history limit of 1,000,000 events and \(count == 1 ? "remains" : "remain") in \(account.label)."
+        case "budget-limit": return "\(conversations) could not fit the operation's memory budget, even one at a time. \(count == 1 ? "It remains" : "They remain") in \(account.label)."
+        case "parser-limit": return "\(conversations) exceeded the history reader's limit and \(count == 1 ? "remains" : "remain") in \(account.label)."
         case "unsupported": return "\(conversations) \(count == 1 ? "stays" : "stay") in \(account.label) because \(count == 1 ? "it has" : "they have") attachments that can't be copied to this Mac."
         case "worker": return "Waiting for local Claude work to stop before checking \(copies.lowercased()) in \(account.label)".punctuated + (account.signedIn == true ? "" : " \(signInText) to continue.")
         case "external": return "Waiting for external Claude sessions to stop before moving \(amount.lowercased()) remaining sessions."
@@ -485,10 +489,10 @@ final class Model: ObservableObject {
         else { move() }
     }
     var scopedChecks: [String] {
-        let eligible = pendingAccounts.filter { ($0.pendingCount ?? 0) > 0 && (["unsupported", "limit"].contains($0.pendingState ?? "") || $0.pending == "cloud" && $0.pendingState == "cleanup" && $0.signedIn == false) }
+        let eligible = pendingAccounts.filter { ($0.pendingCount ?? 0) > 0 && (["unsupported", "limit", "budget-limit", "parser-limit"].contains($0.pendingState ?? "") || $0.pending == "cloud" && $0.pendingState == "cleanup" && $0.signedIn == false) }
         return eligible.compactMap(\.pendingCancel)
     }
-    var stopTitle: String { !scopedChecks.isEmpty ? pendingAccounts.filter { scopedChecks.contains($0.pendingCancel ?? "") }.allSatisfy { ["unsupported", "limit"].contains($0.pendingState ?? "") } ? "Got it" : "Leave them" : "Stop here" }
+    var stopTitle: String { !scopedChecks.isEmpty ? pendingAccounts.filter { scopedChecks.contains($0.pendingCancel ?? "") }.allSatisfy { ["unsupported", "limit", "budget-limit", "parser-limit"].contains($0.pendingState ?? "") } ? "Got it" : "Leave them" : "Stop here" }
     func stopHere() {
         guard canKeepLocal else { return }
         if stopTitle != "Stop here" { start(["keep-local", "--json"] + scopedChecks.flatMap { ["--leave-check", $0] }) }
@@ -498,7 +502,7 @@ final class Model: ObservableObject {
         if let event = sourceActivity, event.sourceId == account.id { return (event.activity ?? event.stage) == "cloud" ? "clearing" : (event.activity ?? event.stage) == "rescue" ? "bringing over" : "checking" }
         if account.kept == true { return "kept" }
         guard account.pending != nil else { return nil }
-        if ["unsupported", "limit"].contains(account.pendingState ?? "") { return "kept" }
+        if ["unsupported", "limit", "budget-limit", "parser-limit"].contains(account.pendingState ?? "") { return "kept" }
         if account.pendingState == "login", account.signedIn == true { return "signing in" }
         if account.pendingState == "open" && account.pendingAutomatic == true { return "waiting" }
         if account.pendingAction == "restart" { return "restart needed" }
@@ -597,6 +601,8 @@ final class Model: ObservableObject {
 
     private func clearResult() {
         failedFinish = nil
+        sweepFailureReceipt = nil
+        restartNote = nil
         retryReceipt = nil
         pendingResult = false
         sourceActivity = nil
@@ -627,7 +633,12 @@ final class Model: ObservableObject {
             guard status == 0, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
             accounts = list
             settle()
-            if !pendingAccounts.isEmpty && !preserveNotice { note = ""; completion = nil; badge = ""; symbol = "clock.arrow.circlepath" }
+            if !pendingAccounts.isEmpty && !preserveNotice {
+                completion = nil
+                badge = ""
+                let recovering = pendingAccounts.contains { ["recovery", "undo"].contains($0.pending ?? "") }
+                if recovering || !restartAvailable && symbol != "exclamationmark.triangle" { note = ""; symbol = "clock.arrow.circlepath" }
+            }
             let identity = list.filter { $0.active == true }.map(\.id).joined(separator: ",")
             let changed = identity != activeIdentity
             activeIdentity = identity
@@ -658,6 +669,8 @@ final class Model: ObservableObject {
 
     func begin(resetProgress: Bool = true) {
         failedFinish = nil
+        sweepFailureReceipt = nil
+        restartNote = nil
         retryReceipt = nil
         sourceActivity = nil
         lines = []
@@ -969,7 +982,9 @@ final class Model: ObservableObject {
             if result?.code == "LOCK_BUSY" { return }
             let problem = result?.error.flatMap { $0.isEmpty ? nil : $0 } ?? (status != 0 || result?.ok != true ? (error.isEmpty ? "Background check did not complete" : error) : nil)
             let clean = problem == nil && result?.issues == 0
-            if clean, result?.complete == true { lines.removeAll { ["background", "previous check"].contains($0.0) } }
+            let resolvedRestartError = restartAvailable && clean && result?.complete == true && canMutate && pendingAccounts.isEmpty && (result?.changed ?? []).isEmpty &&
+                result?.receipt != nil && result?.receipt == sweepFailureReceipt && failedFinish == nil && !preserveNotice
+            if clean, result?.complete == true, !restartAvailable || resolvedRestartError { lines.removeAll { ["background", "previous check"].contains($0.0) } }
             if clean, !restartAvailable, failedFinish == nil || result?.receipt == failedFinish && result?.complete == true && pendingAccounts.isEmpty && (result?.changed ?? []).isEmpty, let sweepNote, note == sweepNote {
                 note = ""
                 symbol = "arrow.left.arrow.right"
@@ -978,6 +993,7 @@ final class Model: ObservableObject {
             if result != nil { lines.removeAll { $0.0 == "metadata" } }
             let previousNote = note
             if let problem {
+                sweepFailureReceipt = result?.receipt
                 lines.removeAll { ["background", "previous check"].contains($0.0) }
                 lines.append(("background", problem))
                 note = pendingAccounts.contains(where: { ["waiting", "login", "memory"].contains($0.pendingState ?? "") }) ? "" : "The remaining work needs attention"
@@ -990,6 +1006,7 @@ final class Model: ObservableObject {
                 }
             } else if let changed = result?.changed, !changed.isEmpty {
                 let unavailable = changed.filter { $0.fields.contains("record unavailable") }
+                if !unavailable.isEmpty { sweepFailureReceipt = nil }
                 let names = ["title": "title", "isArchived": "archive state", "isStarred": "starred state"]
                 let fields = Set(changed.flatMap(\.fields)).sorted().map { names[$0] ?? $0 }.joined(separator: ", ")
                 note = unavailable.isEmpty
@@ -998,6 +1015,11 @@ final class Model: ObservableObject {
                 symbol = unavailable.isEmpty ? "info.circle" : "exclamationmark.triangle"
                 lines.append(("metadata", changed.map { self.identity($0.title, $0.id) + " | " + $0.fields.map { names[$0] ?? $0 }.joined(separator: ", ") }.joined(separator: "\n")))
             }
+            if resolvedRestartError {
+                sweepFailureReceipt = nil
+                symbol = "info.circle"
+                note = restartNote ?? "The source checks finished. Restart Claude to refresh the sidebar."
+            }
             if problem == nil, result?.restart == true, result?.changed?.contains(where: { $0.fields.contains("record unavailable") }) != true {
                 restartAvailable = true
                 if !running {
@@ -1005,6 +1027,7 @@ final class Model: ObservableObject {
                     if symbol != "exclamationmark.triangle" { symbol = "info.circle" }
                 }
                 note = (result?.moved ?? 0) > 0 ? "Moved \(quantity(result!.moved!, "more session", "more sessions")). Restart Claude to see them." : "The source checks finished. Restart Claude to refresh the sidebar."
+                restartNote = note
                 if result?.complete == true && !running { selectionComplete = true; from = []; to = nil }
             }
             if clean, let failedFinish, result?.receipt == failedFinish, result?.complete == true,

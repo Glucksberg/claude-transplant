@@ -10,7 +10,7 @@ import path from 'node:path'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
-import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, resumeLast, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -2043,7 +2043,7 @@ test('cloud history reads past 10000 events and refuses incomplete or oversized 
     })
     const memory = scenario === 'memory pressure' ? memoryBudget({ total: 10 * 1024 * 1024, heap: 2 ** 30, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 2 ** 30 }) : undefined
     const cloud = await cloudClient(h.paths, null, { active: { state: 'known', account: h.acct.P, org: h.org.P }, cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture', memory })
-    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 1,000,000 events/, 'memory pressure': /Waiting for memory/ }[scenario]
+    const error = { 'repeated cursor': /cursor did not advance/, 'repeated sequence': /sequence changed/, 'oversized page': /response changed/, 'event limit': /exceeded 1,000,000 events/, 'memory pressure': /memory budget/ }[scenario]
     if (error) await assert.rejects(cloud.eventRows('cse_large'), error)
     else {
       const rows = await cloud.eventRows('cse_large')
@@ -2059,7 +2059,7 @@ test('cloud history reads past 10000 events and refuses incomplete or oversized 
 test('operation memory scales to RAM and reduces concurrency before its ceiling', () => {
   for (const gib of [16, 48]) {
     let rss = 0, heapUsed = 0, available = 8 * 2 ** 30
-    const budget = memoryBudget({ total: gib * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss, heapUsed }), available: () => available })
+    const budget = memoryBudget({ platform: 'linux', total: gib * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss, heapUsed }), available: () => available })
     assert.equal(budget.limit, Math.floor(gib * 2 ** 30 * 0.2))
     assert.equal(budget.parallel(), 8)
     rss = budget.limit * 0.6
@@ -2067,9 +2067,9 @@ test('operation memory scales to RAM and reduces concurrency before its ceiling'
     rss = budget.limit * 0.8
     assert.equal(budget.parallel(), 1)
     rss = budget.limit
-    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_BUDGET' })
     rss = 0; heapUsed = 4 * 2 ** 30
-    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_BUDGET' })
     heapUsed = 0; available = 0
     assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
     available = 2 ** 30
@@ -2088,7 +2088,7 @@ test('concurrent cloud bodies share reservations and return them after refusal',
     yield Buffer.from('"')
   })() })
   await ready
-  await assert.rejects(budget.read(Response.json('x'.repeat(300))), { code: 'CLOUD_MEMORY_PRESSURE' })
+  await assert.rejects(budget.read(Response.json('x'.repeat(300))), { code: 'CLOUD_MEMORY_BUDGET' })
   resume()
   assert.equal(await first, 'x'.repeat(150))
   assert.equal(await budget.read(Response.json('x'.repeat(300))), 'x'.repeat(300))
@@ -2101,7 +2101,7 @@ test('memory pressure during final cloud proof keeps its source active until a c
   await h.write(SOURCE, entries)
   await h.record('P', SOURCE, rehomeRecord({ title: 'Memory history', bridgeSessionIds: ['session_memory'] }))
   let pressure = false, reads = 0, status = 'active'
-  const memory = memoryBudget({ total: 16 * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss: pressure ? 16 * 2 ** 30 : 0, heapUsed: 0 }), available: () => 4 * 2 ** 30 })
+  const memory = memoryBudget({ platform: 'darwin', total: 16 * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss: 0, heapUsed: 0 }), pressure: () => pressure ? 4 : 1, now: () => pressure ? 2000 : 0 })
   const cloud = cloudFixture(h, { memory, list: async () => [remoteSession({ id: 'cse_memory', title: 'Memory history', status })],
     session: async () => remoteState(status), archive: async () => { status = 'archived' },
     eventRows: async () => { if (++reads === 2) pressure = true; return memory.read(Response.json(remoteRows(entries))) } })
@@ -9008,7 +9008,10 @@ function wordingFixtures() {
     const rows = structuredClone(base).map((row, index) => ({ ...row, active: index === activeIndex, signedIn: row.account === base[activeIndex].account })), account = rows[index], source = { account: account.account, org: account.org, sessionIds: Array.from({ length: count }, (_, i) => `session_${i}`) }
     if (code === 'CLOUD_RESCUE_WORKER') source.waiting = source.sessionIds.map(session => ({ id: session, title: 'Research conversation', code, localId: SOURCE, recordId: `local_${id(99)}` }))
     else if (code) source.failures = source.sessionIds.map(id => ({ id, title: 'Research conversation', code, error: code }))
-    if (code === 'CLOUD_HISTORY_LIMIT') source.attemptEngine = createHash('sha256').update(readFileSync(path.join(here, 'transplant.js'))).digest('hex')
+    if (['CLOUD_HISTORY_LIMIT', 'CLOUD_BUDGET_LIMIT', 'CLOUD_PARSER_LIMIT'].includes(code)) {
+      source.attemptEngine = createHash('sha256').update(readFileSync(path.join(here, 'transplant.js'))).digest('hex')
+      source.attemptBudget = memoryBudget().signature
+    }
     const held = mode === 'local' ? Array.from({ length: count }, (_, i) => ({ id: id(i + 1), recordId: `local_${id(i + 1)}`, release, title: `Open chat ${i + 1}`, sources: [{ ...source, file: `/synthetic/${i}.json` }] })) : []
     const receipt = { held, remote: mode === 'undo' ? [{ id: 'cse_0' }, { id: 'cse_1' }] : [], remoteUndoing: mode === 'undo' ? [{ ...source, id: 'cse_1' }] : [] }
     const table = release === 'worker' ? [desktopFixture()[0], ...held.map((row, index) => ({ ...desktopFixture()[1], pid: 501 + index, ids: [row.id] }))] : desktopFixture()
@@ -9080,7 +9083,9 @@ function wordingFixtures() {
     { name: '43-partial-quit-veto', accounts: held, event: { done: true, ok: false, complete: false, receipt: 'synthetic-receipt', moved: 259, heldCount: 102, code: 'QUIT_UNCONFIRMED', retryable: true }, contains: ['259 moved. Move stopped:', 'Claude did not confirm it had closed.'], primary: 'Try again' },
     { name: '44-login-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_AUTH_PENDING').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for Claude to finish signing in.', 'Retrying in'], primary: null },
     { name: '45-memory-retry', accounts: pending(0, 'cloud', 1, 'CLOUD_MEMORY_PRESSURE').map(row => row.pending ? { ...row, pendingRetryAt: Date.now() + 60000 } : row), contains: ['Waiting for memory', 'Retrying in'], primary: null },
-    { name: '46-history-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_LIMIT'), contains: ['exceeds the history limit'], primary: null, stop: 'Got it' }
+    { name: '46-history-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_HISTORY_LIMIT'), contains: ['exceeds the history limit'], primary: null, stop: 'Got it' },
+    { name: '47-budget-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_BUDGET_LIMIT'), contains: ['memory budget', 'even one at a time'], primary: null, stop: 'Got it' },
+    { name: '48-parser-limit', accounts: pending(0, 'cloud', 1, 'CLOUD_PARSER_LIMIT'), contains: ["history reader's limit"], primary: null, stop: 'Got it' }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
@@ -9715,6 +9720,30 @@ struct StateChecks {
             requests[index].1(accounts)
             requests[index].2(0, "")
         }
+        for (name, reason) in [("46-history-limit", "1,000,000 events"), ("47-budget-limit", "memory budget"), ("48-parser-limit", "history reader's limit")] {
+            let limited = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(name).utf8)))
+            precondition(limited.displaySummary.contains(reason))
+            precondition(!limited.pendingReady && limited.primaryTitle == nil && limited.stopTitle == "Got it")
+            if name == "48-parser-limit" { precondition(limited.detailLines.contains { $0.1.contains("CLOUD_PARSER_LIMIT") }) }
+        }
+        for completedReceipt in ["synthetic-receipt", "another-receipt"] {
+            requests = []
+            let resolved = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("17-uncertain").utf8)))
+            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":2,"receipt":"synthetic-receipt"}"#)
+            let notice = resolved.note
+            sweepReply(resolved, #"{"swept":true,"ok":false,"complete":false,"issues":1,"error":"Synthetic cloud failure","receipt":"synthetic-receipt"}"#)
+            precondition(resolved.restartAvailable && resolved.symbol == "exclamationmark.triangle")
+            refreshReply(resolved, wordingAccounts("01-done"))
+            precondition(resolved.pendingAccounts.isEmpty)
+            sweepReply(resolved, #"{"swept":true,"ok":true,"complete":true,"issues":0,"receipt":""# + completedReceipt + #""}"#)
+            if completedReceipt == "another-receipt" {
+                precondition(resolved.symbol == "exclamationmark.triangle")
+                precondition(resolved.detailLines.contains { $0.1.contains("Synthetic cloud failure") })
+                sweepReply(resolved, #"{"swept":true,"ok":true,"complete":true,"issues":0,"receipt":"synthetic-receipt"}"#)
+            }
+            precondition(resolved.restartAvailable && resolved.symbol == "info.circle" && resolved.note == notice)
+            precondition(!resolved.detailLines.contains { $0.1.contains("Synthetic cloud failure") })
+        }
         automaticRefreshFixture = true
         for outcome in [
             #"{"swept":true,"ok":true,"complete":false}"#,
@@ -9748,6 +9777,24 @@ struct StateChecks {
                 precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
                 if outcome.contains("Incomplete bounded check") { precondition(item.detailLines.contains { $0.1.contains("Incomplete bounded check") }) }
             }
+        }
+        for failed in [false, true] {
+            requests = []
+            let partial = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("17-uncertain").utf8)))
+            let target = partial.to, sources = partial.from
+            if failed { sweepReply(partial, #"{"swept":true,"ok":false,"error":"Synthetic pending failure"}"#) }
+            sweepReply(partial, #"{"swept":true,"ok":true,"complete":false,"issues":0,"restart":true,"moved":2}"#)
+            let notice = partial.note
+            precondition(partial.restartAvailable && notice.contains("Restart Claude"))
+            refreshReply(partial, wordingAccounts("17-uncertain"))
+            precondition(partial.restartAvailable && partial.note == notice && partial.to == target && partial.from == sources)
+            precondition(requests.last!.0 == ["sweep", "--json"])
+            requests.last!.1(#"{"swept":true,"ok":true,"complete":false,"issues":0}"#)
+            requests.last!.2(0, "")
+            precondition(partial.restartAvailable && partial.note == notice && partial.symbol == (failed ? "exclamationmark.triangle" : "info.circle"))
+            partial.selectTarget("work/personal")
+            precondition(!partial.restartAvailable && partial.note.isEmpty)
+            if !failed { precondition(partial.symbol == "arrow.left.arrow.right") }
         }
         for failed in [false, true] {
             requests = []
@@ -10393,10 +10440,13 @@ test('sidecar link leaves survive parent and child moves and Undo without readin
       links.push({ file, destination, inode: (await lstat(file)).ino })
     }
   }
+  const physicalExternal = await fs.realpath(external)
+  const physicalLinks = await Promise.all(links.map(async item => path.join(await fs.realpath(path.dirname(item.file)), path.basename(item.file))))
   const originals = { readFile: fs.readFile, open: fs.open, readdir: fs.readdir }
   for (const key of Object.keys(originals)) fs[key] = (file, ...args) => {
     assert.ok(!String(file).startsWith(external), `external target ${key}`)
-    assert.ok(!links.some(link => link.file === String(file)), `link target ${key}`)
+    assert.ok(!links.some(link => link.file === String(file)) && !physicalLinks.includes(String(file)), `link target ${key}`)
+    assert.ok(!String(file).startsWith(physicalExternal), `physical external target ${key}`)
     return originals[key](file, ...args)
   }
   syncBuiltinESMExports()
@@ -10466,6 +10516,7 @@ test('synthetic menubar installation reports the package version without invokin
     const script = path.join(h.paths.state, 'Claude Transplant.app/Contents/Resources/transplant.js')
     const { stdout } = await promisify(execFile)(process.execPath, [script, '--version'], { env: { ...process.env, HOME: h.root } })
     assert.equal(stdout.trim(), JSON.parse(await readFile(path.join(here, 'package.json'))).version)
+    assert.deepEqual(JSON.parse(await readFile(path.join(h.paths.state, 'menubar.json'))).nodeArgs, [`--max-old-space-size=${menubarHeapMiB()}`])
   }
 })
 
@@ -10493,12 +10544,13 @@ test('sidecar link replacements are refused during regular reads and warm cache 
     await writeFile(external, 'never read this synthetic target')
     const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
     if (warm) await inventory([from], to, h.paths, () => {}, { processes: [], writeCache: true })
+    const physicalFile = await fs.realpath(file), physicalExternal = await fs.realpath(external)
     const originalOpen = fs.open, originalLstat = fs.lstat
     let replaced = false
     const replace = async () => { replaced = true; await unlink(file); await symlink(external, file) }
     fs.open = async (name, flags, ...args) => {
-      assert.notEqual(name, external)
-      if (name === file && !warm && !replaced) {
+      assert.notEqual(name, physicalExternal)
+      if (name === physicalFile && !warm && !replaced) {
         assert.ok(flags & fsSync.constants.O_NOFOLLOW)
         await replace()
       }
@@ -10506,7 +10558,7 @@ test('sidecar link replacements are refused during regular reads and warm cache 
     }
     fs.lstat = async (name, ...args) => {
       const detail = await originalLstat(name, ...args)
-      if (name === file && warm && !replaced) await replace()
+      if (name === physicalFile && warm && !replaced) await replace()
       return detail
     }
     syncBuiltinESMExports()
@@ -10519,26 +10571,20 @@ test('sidecar link replacements are refused during regular reads and warm cache 
   }
 })
 
-test('sidecar root links and symlinked ancestors refuse inventory without traversing targets or changing accounts', async () => {
-  for (const scenario of ['dangling root', 'live root', 'linked ancestor']) {
+test('sidecar root links refuse inventory without traversing targets or changing accounts', async () => {
+  for (const scenario of ['dangling root', 'live root']) {
     const h = await home(), dir = path.join(h.project, SOURCE), external = path.join(h.root, 'unrelated'), other = id(8302)
     await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
     await h.record('P', SOURCE, rehomeRecord())
     await h.write(other, [entry('user', 2, null, other)])
     await h.record('Z', other, rehomeRecord())
-    if (scenario === 'linked ancestor') {
-      await mkdir(dir)
-      await writeFile(path.join(dir, 'unrelated.txt'), 'Synthetic target that the walker must not read')
-      await rename(h.project, external)
-      await symlink(external, h.project)
-    } else {
-      if (scenario === 'live root') {
-        await mkdir(external)
-        await writeFile(path.join(external, 'unrelated.txt'), 'Synthetic target that the walker must not read')
-      }
-      await symlink(external, dir)
+    if (scenario === 'live root') {
+      await mkdir(external)
+      await writeFile(path.join(external, 'unrelated.txt'), 'Synthetic target that the walker must not read')
     }
-    const link = scenario === 'linked ancestor' ? h.project : dir, inode = (await lstat(link)).ino
+    await symlink(external, dir)
+    const link = dir, inode = (await lstat(link)).ino
+    const physicalDir = path.join(await fs.realpath(h.project), SOURCE), physicalExternal = path.join(await fs.realpath(h.root), 'unrelated')
     const before = await fixtureSnapshot(h, [h.dir('P'), h.dir('Z')])
     const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
     const originals = { readdir: fs.readdir, readFile: fs.readFile, open: fs.open }
@@ -10546,6 +10592,8 @@ test('sidecar root links and symlinked ancestors refuse inventory without traver
       const name = String(file)
       assert.ok(name !== dir && !name.startsWith(dir + path.sep), `sidecar root target ${key}`)
       assert.ok(name !== external && !name.startsWith(external + path.sep), `external target ${key}`)
+      assert.ok(name !== physicalDir && !name.startsWith(physicalDir + path.sep), `physical sidecar target ${key}`)
+      assert.ok(name !== physicalExternal && !name.startsWith(physicalExternal + path.sep), `physical external target ${key}`)
       return originals[key](file, ...args)
     }
     syncBuiltinESMExports()
@@ -10685,5 +10733,458 @@ test('retained bridge bindings deduplicate exact repeats and keep a conflicting 
     assert.equal(warm.cacheStats.historyMisses, 0)
     inspect(warm)
     assert.deepEqual(await readFile(f.priorFile), before)
+  }
+})
+
+test('Darwin pressure uses dispatch flags and samples at a bounded cadence without capping healthy free pages', () => {
+  let now = 0, level = 1, probes = 0
+  const budget = memoryBudget({ platform: 'darwin', total: 48 * 2 ** 30, heap: 8 * 2 ** 30, usage: () => ({ rss: 2 ** 30, heapUsed: 2 ** 30 }),
+    available: () => 2.4 * 2 ** 30, now: () => now, pressure: () => { probes++; return level } })
+  for (let i = 0; i < 100; i++) { budget.check(3 * 2 ** 30); assert.equal(budget.parallel(), 8) }
+  assert.equal(probes, 1)
+  level = 4; now = 999
+  assert.doesNotThrow(() => budget.check(3 * 2 ** 30))
+  now = 1000
+  assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+  assert.equal(probes, 2)
+  level = 2; now = 2000
+  assert.doesNotThrow(() => budget.check(3 * 2 ** 30))
+  assert.equal(budget.parallel(), 1)
+  for (const invalid of [null, 0, 3, '1', NaN]) {
+    level = invalid; now += 1000
+    assert.equal(budget.parallel(), 1)
+    assert.throws(() => budget.check(3 * 2 ** 30), { code: 'CLOUD_MEMORY_PRESSURE' })
+    assert.doesNotThrow(() => budget.check(1024))
+  }
+  level = 1; now += 1000
+  assert.equal(budget.parallel(), 8)
+})
+
+test('Darwin pressure probes the read-only sysctl and falls back conservatively when unavailable', t => {
+  let result = { status: 0, stdout: '2\n' }, calls = 0, now = 0
+  const mock = t.mock.method(childProcess, 'spawnSync', (command, args, options) => {
+    assert.equal(command, '/usr/sbin/sysctl')
+    assert.deepEqual(args, ['-n', 'kern.memorystatus_vm_pressure_level'])
+    assert.ok(options.timeout <= 1000)
+    calls++
+    return result
+  })
+  syncBuiltinESMExports()
+  try {
+    const budget = memoryBudget({ platform: 'darwin', total: 16 * 2 ** 30, heap: 4 * 2 ** 30, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 0, now: () => now })
+    assert.doesNotThrow(() => budget.check(1024))
+    assert.equal(budget.parallel(), 1)
+    assert.equal(calls, 1)
+    result = { status: 1, stdout: '' }; now = 1000
+    assert.throws(() => budget.check(), { code: 'CLOUD_MEMORY_PRESSURE' })
+    assert.equal(calls, 2)
+  } finally { mock.mock.restore(); syncBuiltinESMExports() }
+})
+
+test('pressure and deterministic parser failures release shared parsing reservations', async () => {
+  let now = 0, level = 1
+  const budget = memoryBudget({ platform: 'darwin', total: 10000, heap: 10000, usage: () => ({ rss: 0, heapUsed: 0 }), available: () => 0, now: () => now, pressure: () => level })
+  let resume, entered
+  const started = new Promise(resolve => { entered = resolve }), paused = new Promise(resolve => { resume = resolve })
+  const first = budget.read({ body: (async function* () { yield Buffer.from('"' + 'x'.repeat(150)); entered(); await paused; yield Buffer.from('"') })() })
+  await started
+  level = 4; now = 1000
+  await assert.rejects(budget.read(Response.json('x')), { code: 'CLOUD_MEMORY_PRESSURE' })
+  level = 1; now = 2000
+  resume()
+  assert.equal(await first, 'x'.repeat(150))
+  await assert.rejects(budget.read({ body: (async function* () { yield Buffer.from('"' + 'x'.repeat(150)); throw Object.assign(new RangeError('synthetic string limit'), { code: 'ERR_STRING_TOO_LONG' }) })() }), { code: 'CLOUD_PARSER_LIMIT' })
+  assert.equal(await budget.read(Response.json('x'.repeat(300))), 'x'.repeat(300))
+})
+
+test('menubar heap calculations never reduce the installing Node heap on 8, 16 or 48 GiB Macs', () => {
+  const heap = 4 * 2 ** 30 + 48 * 1024 * 1024
+  for (const gib of [8, 16, 48]) {
+    const setting = menubarHeapMiB(gib * 2 ** 30, heap)
+    assert.ok(setting * 1024 * 1024 >= heap)
+    assert.equal(setting, Math.max(Math.ceil(heap / 1024 / 1024), Math.floor(gib * 2 ** 30 * 0.2 * 0.65 / 1024 / 1024)))
+  }
+  assert.ok(menubarHeapMiB(48 * 2 ** 30, heap) > menubarHeapMiB(8 * 2 ** 30, heap))
+})
+
+test('trusted project aliases preserve logical move and Undo paths including legacy receipts', async () => {
+  for (const legacy of [false, true]) {
+    const h = await home(), physical = path.join(h.root, 'physical-project'), data = Buffer.from('Synthetic ordinary sidecar')
+    if (process.env.CT_REQUIRE_ALIAS) assert.notEqual(await fs.realpath(os.tmpdir()), os.tmpdir())
+    await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+    await h.record('P', SOURCE, rehomeRecord())
+    await mkdir(path.join(h.project, SOURCE))
+    await writeFile(path.join(h.project, SOURCE, 'ordinary'), data)
+    await symlink('absent', path.join(h.project, SOURCE, 'dangling'))
+    await rename(h.project, physical)
+    await symlink(physical, h.project)
+    const transcript = path.join(h.project, `${SOURCE}.jsonl`), before = await readFile(transcript)
+    const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+    const moved = await move(await inventory([from], to, h.paths, () => {}, { processes: [] }), to, h.paths)
+    assert.equal(moved.ok, true, JSON.stringify(moved.receipt.failed))
+    assert.equal(moved.receipt.sessions[0].targetTranscript, transcript)
+    assert.equal(moved.receipt.sessions[0].record, path.join(h.dir('Z'), `local_${SOURCE}.json`))
+    assert.equal(moved.receipt.sessions[0].sidecars.canonicalRoot, path.join(await fs.realpath(physical), SOURCE))
+    if (legacy) { delete moved.receipt.sessions[0].sidecars.canonicalRoot; await writeFile(moved.file, JSON.stringify(moved.receipt)) }
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(await readFile(transcript), before)
+    assert.deepEqual(await readFile(path.join(h.project, SOURCE, 'ordinary')), data)
+    assert.equal(await readlink(path.join(h.project, SOURCE, 'dangling')), 'absent')
+  }
+})
+
+async function mappedProjectFixture(h) {
+  const original = path.join(h.root, 'original-project'), replacement = path.join(h.root, 'replacement-project')
+  await rename(h.project, original)
+  await symlink(original, h.project)
+  await mkdir(replacement)
+  for (const name of await readdir(original)) {
+    const source = path.join(original, name), target = path.join(replacement, name)
+    if ((await lstat(source)).isFile()) await fs.link(source, target)
+    else if ((await lstat(source)).isDirectory()) {
+      await mkdir(target)
+      for (const child of await readdir(source)) await fs.link(path.join(source, child), path.join(target, child))
+    }
+  }
+  return async () => { await unlink(h.project); await symlink(replacement, h.project) }
+}
+
+test('a changed trusted project alias cannot authorize a move through identical file inodes', async () => {
+  const h = await home()
+  await h.write(SOURCE, branchEntries(4, SOURCE, 1))
+  await h.record('P', SOURCE, rehomeRecord())
+  await mkdir(path.join(h.project, SOURCE))
+  await writeFile(path.join(h.project, SOURCE, 'ordinary'), 'Synthetic sidecar')
+  const change = await mappedProjectFixture(h)
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const inv = await inventory([from], to, h.paths, () => {}, { processes: [] })
+  await change()
+  const moved = await move(inv, to, h.paths)
+  assert.equal(moved.ok, false)
+  assert.equal(moved.receipt.sessions.length, 0)
+  assert.deepEqual(await readdir(h.dir('Z')), [])
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('retained native proof pins a trusted project alias before archival', async () => {
+  for (const deferred of [false, true]) {
+    const f = await nativePriorFixture(), { h } = f, change = await mappedProjectFixture(h)
+    const inv = await inventory([f.from], f.to, h.paths, () => {}, { cloudRequested: true, cloud: deferred ? null : f.cloud, processes: [] })
+    if (!deferred) await change()
+    const moved = await move(inv, f.to, h.paths)
+    if (deferred) {
+      f.cloud.eventRows = async () => { if (++f.reads === 3) await change(); return remoteRows(f.remote) }
+      const finished = await finishPending(h.paths, { cloud: f.cloud, processes: [] })
+      assert.equal(finished.ok, false)
+    } else assert.equal(moved.ok, false)
+    assert.equal(f.archives, 0)
+  }
+})
+
+async function limitRetryFixture(modes) {
+  const h = await home(), rows = modes.map((mode, index) => ({ mode, id: `cse_limit${index}`, sid: id(8700 + index), title: `Synthetic limit ${index}`, entries: branchEntries(4, id(8700 + index), 8800 + index * 10), status: 'active', reads: 0 }))
+  for (const row of rows) {
+    await h.write(row.sid, row.entries)
+    await h.record('P', row.sid, rehomeRecord({ title: row.title, bridgeSessionIds: [row.id.replace('cse_', 'session_')] }))
+  }
+  const all = await accounts(h.paths, []), from = all.find(row => row.account === h.acct.P), to = all.find(row => row.account === h.acct.Z)
+  const moved = await move(await inventory([from], to, h.paths, () => {}, { cloudRequested: true, processes: [] }), to, h.paths)
+  const memory = { ...memoryBudget(), check: () => {}, parallel: () => 8 }
+  const f = { h, rows, moved, from, to, memory, inflight: 0, peak: 0 }
+  const lookup = id => { const row = rows.find(row => row.id === id); assert.ok(row, id); return row }
+  const cloud = cloudFixture(h, { memory,
+    list: async () => rows.map(row => remoteSession({ id: row.id, title: row.title, status: row.status })),
+    session: async id => { const row = lookup(id); return remoteState(row.status, row.mode === 'connected' ? { connection_status: 'connected' } : {}) },
+    eventRows: async id => {
+      const row = lookup(id)
+      row.reads++
+      f.peak = Math.max(f.peak, ++f.inflight)
+      try {
+        await new Promise(resolve => setImmediate(resolve))
+        const code = { event: 'CLOUD_HISTORY_LIMIT', budget: 'CLOUD_MEMORY_BUDGET', pressure: 'CLOUD_MEMORY_PRESSURE', parser: 'ERR_STRING_TOO_LONG' }[row.mode]
+        if (code) throw Object.assign(new Error(`Synthetic ${row.mode} refusal`), { code })
+        assert.equal(cloud.memory, memory)
+        return remoteRows(row.entries)
+      } finally { f.inflight-- }
+    },
+    archive: async id => { lookup(id).status = 'archived' }, unarchive: async id => { lookup(id).status = 'active' }
+  })
+  return { ...f, cloud, state: f, options: { cloud, memory, active: { state: 'known', account: h.acct.P, org: h.org.P }, processes: [], automatic: true } }
+}
+
+test('event-limited mirrors stay excluded while connected work clears and keep their failure afterward', async t => {
+  const f = await limitRetryFixture(['event', 'connected'])
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const first = await finishPending(f.h.paths, f.options), source = first.receipt.cloudChecks[0]
+  assert.equal(source.waiting.length, 1)
+  assert.equal(pendingPresentation(first.receipt, source, { signedIn: true }, 'cloud').pendingAutomatic, true)
+  assert.equal(f.rows[0].reads, 1)
+  assert.equal(f.rows[1].reads, 0)
+  now += 60000
+  const stillWaiting = await finishPending(f.h.paths, f.options)
+  assert.equal(stillWaiting.receipt.failed[0].code, 'CLOUD_HISTORY_LIMIT')
+  assert.equal(f.rows[0].reads, 1)
+  f.rows[1].mode = 'ok'; now += 60000
+  const cleared = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(f.rows[0].reads, 1)
+  assert.equal(cleared.complete, false)
+  assert.equal(cleared.receipt.failed.length, 1)
+  assert.equal(cleared.receipt.cloudChecks[0].failures[0].code, 'CLOUD_HISTORY_LIMIT')
+  assert.equal(pendingPresentation(cleared.receipt, cleared.receipt.cloudChecks[0], { signedIn: true }, 'cloud').pendingState, 'limit')
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, 1)
+  f.rows[0].mode = 'ok'
+  const manual = await finishPending(f.h.paths, { ...f.options, automatic: false })
+  assert.equal(manual.complete, true)
+  assert.equal(manual.receipt.failed.length, 0)
+})
+
+test('operation budget failures get one shared-budget serial retry that clears state on success', async t => {
+  const f = await limitRetryFixture(['budget', 'budget'])
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const first = await finishPending(f.h.paths, f.options)
+  assert.equal(first.receipt.failed.length, 2)
+  assert.ok(first.receipt.failed.every(row => row.code === 'CLOUD_MEMORY_BUDGET'))
+  assert.equal(f.state.peak, 2)
+  f.rows.forEach(row => { row.mode = 'ok' })
+  f.state.peak = 0
+  now += 60000
+  const retried = await finishPending(f.h.paths, f.options)
+  assert.equal(f.state.peak, 1)
+  assert.equal(retried.complete, false)
+  assert.equal(retried.receipt.failed.length, 0)
+  assert.equal(retried.receipt.cloudChecks[0].failures, undefined)
+  assert.equal(retried.receipt.cloudChecks[0].attemptBudget, f.memory.signature)
+  assert.equal(retried.receipt.cloudChecks[0].waiting.length, 1)
+  now += 60000
+  const completed = await finishPending(f.h.paths, f.options)
+  assert.equal(completed.complete, true)
+  assert.equal(completed.receipt.failed.length, 0)
+  assert.equal(completed.receipt.cloudChecks[0].waiting.length, 0)
+  assert.equal(f.state.peak, 1)
+  assert.ok(f.rows.every(row => row.status === 'archived'))
+})
+
+test('serial budget limits pause unchanged work but manual, engine and budget changes permit another attempt', async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  for (const reset of ['manual', 'engine', 'budget']) {
+    const f = await limitRetryFixture(['budget'])
+    await finishPending(f.h.paths, f.options)
+    now += 60000
+    const limited = await finishPending(f.h.paths, f.options)
+    assert.equal(limited.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+    const presentation = pendingPresentation(limited.receipt, limited.receipt.cloudChecks[0], { signedIn: true }, 'cloud')
+    assert.equal(presentation.pendingState, 'budget-limit')
+    assert.equal(presentation.pendingAction, 'blocked')
+    assert.equal(presentation.pendingAutomatic, false)
+    const reads = f.rows[0].reads
+    now += 120000
+    assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+    assert.equal(f.rows[0].reads, reads)
+    f.rows[0].mode = 'ok'
+    if (reset === 'engine') {
+      limited.receipt.cloudChecks[0].attemptEngine = 'synthetic-previous-engine'
+      await writeFile(f.moved.file, JSON.stringify(limited.receipt))
+    }
+    if (reset === 'budget') f.memory.signature += ':increased'
+    const recovered = await finishPending(f.h.paths, { ...f.options, automatic: reset !== 'manual' })
+    assert.equal(recovered.complete, true, reset)
+    assert.equal(recovered.receipt.failed.length, 0)
+    assert.ok(f.rows[0].reads > reads)
+  }
+})
+
+test('transient pressure recovers while deterministic parser limits remain scoped to their mirror', async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const f = await limitRetryFixture(['parser', 'pressure'])
+  const first = await finishPending(f.h.paths, f.options)
+  assert.deepEqual(first.receipt.failed.map(row => row.code).sort(), ['CLOUD_MEMORY_PRESSURE', 'CLOUD_PARSER_LIMIT'])
+  const parserReads = f.rows[0].reads
+  now += 60000
+  f.rows[1].mode = 'ok'
+  const recovered = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[0].reads, parserReads)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(recovered.receipt.failed.length, 1)
+  assert.equal(recovered.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+  assert.equal(pendingPresentation(recovered.receipt, recovered.receipt.cloudChecks[0], { signedIn: true }, 'cloud').pendingState, 'parser-limit')
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, parserReads)
+})
+
+test('limited budget work does not starve other source organizations or revive cancelled checks', async t => {
+  const f = await pendingOrganizations({ orgs: ['P', 'T', 'Q'] })
+  let now = Date.now(), failures = 0
+  t.mock.method(Date, 'now', () => now)
+  const receipt = JSON.parse(await readFile(f.moved.file))
+  receipt.cloudChecks[2].status = 'cancelled'
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  const options = { ...f.options, cloud: source => {
+    if (source.org === f.rows[0].org) { failures++; throw Object.assign(new Error('Synthetic budget exhausted'), { code: 'CLOUD_MEMORY_BUDGET' }) }
+    return f.client(source)
+  } }
+  await sweep(f.h.paths, options)
+  const other = await sweep(f.h.paths, options)
+  assert.equal(other.result.receipt.remote[0].org, f.rows[1].org)
+  assert.equal(f.rows[1].status, 'archived')
+  now += 60000
+  const limited = await sweep(f.h.paths, options)
+  assert.equal(limited.result.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+  now += 120000
+  assert.equal((await sweep(f.h.paths, options)).pending, true)
+  assert.equal(failures, 2)
+  assert.equal(JSON.parse(await readFile(f.moved.file)).cloudChecks[2].status, 'cancelled')
+  assert.equal(f.rows[2].status, 'active')
+})
+
+test('a serial budget limit stays excluded while a connected mirror clears', async t => {
+  const f = await limitRetryFixture(['budget', 'connected'])
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  await finishPending(f.h.paths, f.options)
+  now += 60000
+  const limited = await finishPending(f.h.paths, f.options)
+  assert.equal(limited.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+  assert.equal(limited.receipt.cloudChecks[0].waiting.length, 1)
+  assert.equal(pendingPresentation(limited.receipt, limited.receipt.cloudChecks[0], { signedIn: true }, 'cloud').pendingAutomatic, true)
+  const reads = f.rows[0].reads
+  f.rows[1].mode = 'ok'; now += 60000
+  const cleared = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[0].reads, reads)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(cleared.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT')
+  assert.equal(cleared.receipt.cloudChecks[0].waiting.length, 0)
+  assert.equal(cleared.complete, false)
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, reads)
+})
+
+test('budget fairness isolates a previously failed history through archival while another mirror becomes idle', async t => {
+  const f = await limitRetryFixture(['connected', 'budget'])
+  let now = Date.now(), competingHistory = false, retrying = false
+  t.mock.method(Date, 'now', () => now)
+  const read = f.cloud.eventRows, trace = []
+  f.cloud.eventRows = async id => {
+    trace.push(id)
+    if (retrying && id === f.rows[0].id) competingHistory = true
+    if (retrying && id === f.rows[1].id && competingHistory) throw Object.assign(new Error('Synthetic earlier history used this operation budget'), { code: 'CLOUD_MEMORY_BUDGET' })
+    return read(id)
+  }
+  const first = await finishPending(f.h.paths, f.options), scope = first.receipt.cloudChecks[0].sessionIds
+  assert.equal(first.receipt.cloudChecks[0].waiting[0].id, f.rows[0].id)
+  assert.equal(first.receipt.failed[0].id, f.rows[1].id)
+  f.rows.forEach(row => { row.mode = 'ok' })
+  retrying = true; trace.length = 0; now += 60000
+  const second = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[1].status, 'archived', JSON.stringify(second.receipt.failed))
+  assert.ok(trace.every(id => id === f.rows[1].id), 'the selected history must keep the pass through its final rechecks')
+  assert.equal(second.complete, false)
+  assert.equal(second.receipt.cloudChecks[0].waiting[0].id, f.rows[0].id)
+  assert.deepEqual(second.receipt.cloudChecks[0].sessionIds, scope)
+  competingHistory = false; now += 60000
+  const third = await finishPending(f.h.paths, f.options)
+  assert.equal(third.complete, true)
+  assert.ok(f.rows.every(row => row.status === 'archived'))
+  assert.equal(third.receipt.failed.length, 0)
+})
+
+test('budget fairness stops an oversized history while a second initial budget failure gets a fresh pass', async t => {
+  const f = await limitRetryFixture(['budget', 'budget'])
+  let now = Date.now(), spent = false, retrying = false
+  t.mock.method(Date, 'now', () => now)
+  const read = f.cloud.eventRows
+  f.cloud.eventRows = async id => {
+    if (retrying && id === f.rows[0].id) spent = true
+    if (retrying && id === f.rows[1].id && spent) throw Object.assign(new Error('Synthetic budget was already consumed'), { code: 'CLOUD_MEMORY_BUDGET' })
+    return read(id)
+  }
+  await finishPending(f.h.paths, f.options)
+  retrying = true; f.rows[1].mode = 'ok'; now += 60000
+  const second = await finishPending(f.h.paths, f.options)
+  assert.deepEqual(second.receipt.failed.map(row => [row.id, row.code]), [[f.rows[0].id, 'CLOUD_BUDGET_LIMIT']])
+  assert.equal(second.receipt.cloudChecks[0].waiting[0].id, f.rows[1].id)
+  const oversizedReads = f.rows[0].reads
+  spent = false; now += 60000
+  const third = await finishPending(f.h.paths, f.options)
+  assert.equal(f.rows[1].status, 'archived')
+  assert.equal(f.rows[0].reads, oversizedReads)
+  assert.equal(third.complete, false)
+  assert.deepEqual(third.receipt.failed.map(row => [row.id, row.code]), [[f.rows[0].id, 'CLOUD_BUDGET_LIMIT']])
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  assert.equal(f.rows[0].reads, oversizedReads)
+})
+
+test('budget fairness discovers remaining work without narrowing scope or dropping permanent failures', async t => {
+  const f = await limitRetryFixture(['event', 'parser', 'budget', 'budget', 'connected'])
+  const receipt = JSON.parse(await readFile(f.moved.file))
+  delete receipt.cloudChecks[0].sessionIds
+  await writeFile(f.moved.file, JSON.stringify(receipt))
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  const first = await finishPending(f.h.paths, f.options)
+  assert.equal(first.receipt.cloudChecks[0].sessionIds, undefined)
+  const extra = { mode: 'ok', id: 'cse_discovered', sid: id(8799), title: 'Discovered synthetic history', entries: branchEntries(4, id(8799), 8990), status: 'active', reads: 0 }
+  f.rows.push(extra)
+  await f.h.write(extra.sid, extra.entries)
+  await f.h.record('Z', extra.sid, rehomeRecord({ title: extra.title }))
+  f.rows[3].mode = 'ok'
+  let latest
+  for (let pass = 0; pass < 5; pass++) {
+    now += 60000
+    if (pass === 4) f.rows[4].mode = 'ok'
+    latest = await finishPending(f.h.paths, f.options)
+    assert.equal(latest.receipt.cloudChecks[0].sessionIds, undefined)
+    assert.equal(latest.complete, false)
+    assert.deepEqual(latest.receipt.failed.map(row => row.code).sort(), ['CLOUD_BUDGET_LIMIT', 'CLOUD_HISTORY_LIMIT', 'CLOUD_PARSER_LIMIT'])
+    if (pass === 0) assert.deepEqual(new Set(latest.receipt.cloudChecks[0].waiting.map(row => row.id)), new Set([f.rows[3].id, f.rows[4].id, extra.id]))
+  }
+  assert.ok(f.rows.slice(3).every(row => row.status === 'archived'))
+  assert.equal(latest.receipt.cloudChecks[0].waiting.length, 0)
+  assert.deepEqual(f.rows.slice(0, 3).map(row => row.reads), [1, 1, 2])
+  now += 120000
+  assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+  const reads = f.rows.map(row => row.reads)
+  assert.equal((await keepLocal(f.h.paths)).ok, true)
+  await finishPending(f.h.paths, f.options)
+  assert.deepEqual(f.rows.map(row => row.reads), reads)
+  assert.equal(JSON.parse(await readFile(f.moved.file)).cloudChecks[0].status, 'cancelled')
+})
+
+test('budget fairness preserves deferred work when an isolated history exhausts memory after analysis', async t => {
+  let now = Date.now()
+  t.mock.method(Date, 'now', () => now)
+  for (const mode of ['ok', 'budget']) {
+    const f = await limitRetryFixture(['budget', 'connected'])
+    let exhausted = false, retrying = false
+    const first = await finishPending(f.h.paths, f.options), scope = first.receipt.cloudChecks[0].sessionIds
+    f.rows[0].mode = mode
+    const read = f.cloud.eventRows
+    f.cloud.eventRows = async id => {
+      try { return await read(id) }
+      finally { if (retrying && id === f.rows[0].id) exhausted = true }
+    }
+    f.memory.check = () => { if (exhausted) throw Object.assign(new Error('Synthetic post-analysis budget exhaustion'), { code: 'CLOUD_MEMORY_BUDGET' }) }
+    retrying = true; now += 60000
+    const limited = await finishPending(f.h.paths, f.options)
+    assert.equal(limited.receipt.failed[0].code, 'CLOUD_BUDGET_LIMIT', mode)
+    assert.equal(limited.receipt.failed[0].id.replace('session_', 'cse_'), f.rows[0].id, mode)
+    assert.deepEqual(limited.receipt.cloudChecks[0].waiting.map(row => row.id), [f.rows[1].id], mode)
+    assert.deepEqual(limited.receipt.cloudChecks[0].sessionIds, scope, mode)
+    assert.equal(limited.receipt.remote.length, 0, mode)
+    exhausted = false; retrying = false; f.rows[1].mode = 'ok'; now += 60000
+    const completed = await finishPending(f.h.paths, f.options)
+    assert.equal(completed.complete, false, mode)
+    assert.equal(f.rows[1].status, 'archived', mode)
+    assert.equal(completed.receipt.failed.length, 1, mode)
+    assert.deepEqual(completed.receipt.cloudChecks[0].sessionIds, scope, mode)
   }
 })
