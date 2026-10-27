@@ -1566,7 +1566,7 @@ enum Demo {
         try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         var durations: [Int] = []
         model.selectTarget(accounts[2].id)
-        model.lines = [("inventory", "318 records | 3 already there | 307 to move"), ("move", "308 ✓ | 307 zero-copy | 1 rescued"), ("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
+        model.lines = [("inventory", "318 records | 3 already there | 307 to move"), ("move", "308 ✓ | 307 zero-copy | 1 rescued"), ("verify", "chat messages unchanged ✓ | sidecars unchanged ✓ | desktop ✓")]
         model.note = "308 sessions moved"
         model.completion = (model.note, "History verified · 8.1 seconds")
         let size = ImageRenderer(content: Panel().environmentObject(model).environment(\.colorScheme, .dark)).nsImage?.size
@@ -1600,7 +1600,7 @@ enum Demo {
         model.running = false
         model.badge = ""
         model.lines.append(("move", "308 ✓ | 307 zero-copy | 1 rescued"))
-        model.lines.append(("verify", "transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
+        model.lines.append(("verify", "chat messages unchanged ✓ | sidecars unchanged ✓ | desktop ✓"))
         model.symbol = "checkmark"
         model.handle("{\"done\":true,\"ok\":true,\"complete\":true,\"moved\":308,\"failed\":[],\"waiting\":[]}")
         model.completion = (model.note, "History verified · 8.1 seconds")

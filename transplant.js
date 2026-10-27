@@ -2321,38 +2321,201 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   }
 }
 
-const BRIDGE_RECORD = Buffer.from('"type":"bridge-session"')
+const bridgeClear = sessionId => ({ type: 'bridge-session', sessionId, bridgeSessionId: '', lastSequenceNum: 0 })
+const bridgeError = text => Object.assign(new Error(`Local bridge metadata: ${text}`), { code: 'BRIDGE_RECOVERY' })
+const bridgeEntry = (entry, sessionId) => Boolean(entry && typeof entry === 'object' && !Array.isArray(entry) &&
+  entry.type === 'bridge-session' && entry.sessionId === sessionId && typeof (entry.bridgeSessionId ?? entry.bridge_session_id) === 'string')
 
-async function releaseBridge(transcript, sessionId, bytes) {
-  if (bytes.at(-1) !== 10) return null
-  for (let at = bytes.lastIndexOf(BRIDGE_RECORD); at >= 0;) {
-    const start = bytes.lastIndexOf(10, at) + 1
-    let entry = null
-    try { entry = JSON.parse(bytes.subarray(start, bytes.indexOf(10, at)).toString('utf8')) } catch {}
-    if (entry?.type === 'bridge-session' && entry.sessionId === sessionId) {
-      if (!entry.bridgeSessionId) return null
-      const handle = await open(transcript, 'a')
-      try {
-        await handle.writeFile(`${JSON.stringify({ type: 'bridge-session', sessionId, bridgeSessionId: '', lastSequenceNum: 0 })}\n`)
-        await handle.sync()
-      } finally {
-        await handle.close()
-      }
-      return fingerprint(transcript)
-    }
-    at = start ? bytes.lastIndexOf(BRIDGE_RECORD, start - 1) : -1
+function bridgePlans(row) {
+  if (row.bridgeAppend == null && row.bridgeUndo == null) return []
+  const id = row.targetId ?? row.id, plans = [row.bridgeAppend, ...(row.bridgeUndo == null ? [] : [row.bridgeUndo])]
+  for (const [index, plan] of plans.entries()) {
+    const invalid = () => { throw bridgeError('invalid bridge recovery receipt') }
+    if (!UUID.test(id ?? '') || !plan || typeof plan !== 'object' || Array.isArray(plan) || plan.sessionId !== id ||
+        !bridgeEntry(plan.original, id) || !(plan.original.bridgeSessionId ?? plan.original.bridge_session_id)) invalid()
+    if (['transcript', 'canonical'].some(key => typeof plan[key] !== 'string' || !path.isAbsolute(plan[key]) || path.basename(plan[key]) !== `${id}.jsonl`) ||
+        ['dev', 'ino'].some(key => typeof plan[key] !== 'string' || !/^\d+$/.test(plan[key])) ||
+        !Number.isSafeInteger(plan.length) || plan.length < 0 ||
+        ['sha', 'afterSha'].some(key => typeof plan[key] !== 'string' || !/^[a-f0-9]{64}$/.test(plan[key]))) invalid()
+    const signature = typeof plan.fingerprint === 'string' ? plan.fingerprint.split(':') : []
+    if (signature.length !== 5 || signature.slice(0, 3).join(':') !== `${plan.dev}:${plan.ino}:${plan.length}` || signature.slice(3).some(value => !/^-?\d+$/.test(value))) invalid()
+    const bytes = jsonText(index ? plans[0].original : bridgeClear(id), 0)
+    if (plan.bytes !== bytes && plan.bytes !== `\n${bytes}` || !Number.isSafeInteger(plan.length + Buffer.byteLength(plan.bytes))) invalid()
+    if ((row.targetTranscript ?? row.transcript ?? plan.transcript) !== plan.transcript || index &&
+        (['transcript', 'canonical', 'dev', 'ino'].some(key => plan[key] !== plans[0][key]) ||
+         stable(plan.original) !== stable(plans[0].original) || plan.length < plans[0].length + Buffer.byteLength(plans[0].bytes))) invalid()
   }
-  return null
+  return plans
+}
+
+async function bridgeFile(plan, writable, work) {
+  if (await mappedPath(plan.transcript) !== plan.canonical || await realpath(plan.canonical) !== plan.canonical) throw bridgeError('transcript path changed')
+  const before = await lstat(plan.canonical, { bigint: true })
+  if (!before.isFile() || plan.dev !== String(before.dev) || plan.ino !== String(before.ino)) throw bridgeError('transcript identity changed')
+  const handle = await open(plan.canonical, (writable ? constants.O_RDWR | constants.O_APPEND : constants.O_RDONLY) | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    await bridgeStable(plan, handle, statIdentity(before))
+    return await work(handle)
+  } finally { await handle.close() }
+}
+
+async function bridgeStable(plan, handle, signature, inspect = null) {
+  if (inspect && ownsWorker(workers(inspect()), plan.sessionId)) throw bridgeError('running worker')
+  const current = await handle.stat({ bigint: true })
+  const named = await lstat(plan.canonical, { bigint: true })
+  if (!current.isFile() || !named.isFile() || statIdentity(current) !== signature || statIdentity(named) !== signature ||
+      String(current.dev) !== plan.dev || String(current.ino) !== plan.ino ||
+      await mappedPath(plan.transcript) !== plan.canonical || await realpath(plan.canonical) !== plan.canonical) throw bridgeError('transcript changed')
+}
+
+async function bridgeRead(plan, handle) {
+  const detail = await handle.stat({ bigint: true }), size = Number(detail.size), signature = statIdentity(detail)
+  if (!Number.isSafeInteger(size)) throw bridgeError('transcript size is unsupported')
+  const memory = operationMemory()
+  const hash = createHash('sha256'), prefix = createHash('sha256'), tail = []
+  const buffer = Buffer.alloc(64 * 1024), limit = Buffer.byteLength(plan.bytes ?? '')
+  let parts = [], length = 0, last = null, prefixLast = null, invalid = false, newline = false
+  const consume = end => {
+    memory.check(length * 4)
+    const text = Buffer.concat(parts, length).toString('utf8').trim()
+    parts = []; length = 0
+    if (!text) return
+    try {
+      const entry = JSON.parse(text)
+      if (entry?.type === 'bridge-session' && entry.sessionId === plan.sessionId) {
+        last = entry
+        if (end <= plan.length) prefixLast = entry
+      }
+    } catch { invalid = true }
+  }
+  for (let at = 0; at < size;) {
+    const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, size - at), at)
+    if (!bytesRead) throw bridgeError('transcript changed while reading')
+    memory.check(bytesRead)
+    const chunk = buffer.subarray(0, bytesRead)
+    hash.update(chunk)
+    if (at < plan.length) prefix.update(chunk.subarray(0, Math.min(bytesRead, plan.length - at)))
+    const startTail = Math.max(0, plan.length - at), endTail = Math.min(bytesRead, plan.length + limit - at)
+    if (endTail > startTail) tail.push(Buffer.from(chunk.subarray(startTail, endTail)))
+    let start = 0
+    for (let end = chunk.indexOf(10); end >= 0; end = chunk.indexOf(10, start)) {
+      parts.push(Buffer.from(chunk.subarray(start, end))); length += end - start
+      consume(at + end)
+      start = end + 1
+    }
+    if (start < bytesRead) { parts.push(Buffer.from(chunk.subarray(start))); length += bytesRead - start }
+    newline = chunk.at(-1) === 10
+    at += bytesRead
+  }
+  if (length) consume(size)
+  await bridgeStable(plan, handle, signature)
+  return { length: size, fingerprint: signature, sha: hash.copy().digest('hex'), hash,
+    intendedSha: prefix.copy().update(plan.bytes ?? '').digest('hex'), prefixSha: prefix.digest('hex'), prefixLast, tail: Buffer.concat(tail), last, invalid, newline }
+}
+
+function bridgePlan(base, state, entry) {
+  if (!bridgeEntry(entry, base.sessionId)) throw bridgeError('invalid bridge metadata entry')
+  const bytes = `${state.length && !state.newline ? '\n' : ''}${JSON.stringify(entry)}\n`
+  return { ...base, length: state.length, sha: state.sha, fingerprint: state.fingerprint, bytes,
+    afterSha: state.hash.copy().update(bytes).digest('hex') }
+}
+
+async function bridgeSource(s, to) {
+  const canonical = await mappedPath(s.transcript), detail = await lstat(canonical, { bigint: true })
+  const base = { transcript: s.transcript, canonical, sessionId: s.id, dev: String(detail.dev), ino: String(detail.ino) }
+  return bridgeFile(base, false, async handle => {
+    const state = await bridgeRead(base, handle)
+    if (s.transcriptFingerprint && state.fingerprint !== s.transcriptFingerprint || !s.contentSha || state.sha !== s.contentSha) throw new Error('source changed since inventory')
+    const pointer = state.last?.bridgeSessionId ?? state.last?.bridge_session_id
+    const destinationOwned = state.last?.ownerAccountUuid === to.account && state.last?.ownerOrganizationUuid === to.org
+    const append = typeof pointer === 'string' && pointer && !state.invalid && !destinationOwned
+      ? { ...bridgePlan(base, state, bridgeClear(s.id)), original: state.last } : null
+    if (append) bridgePlans({ id: s.id, transcript: s.transcript, bridgeAppend: append })
+    return { fingerprint: state.fingerprint, append }
+  })
+}
+
+async function appendBridge(plan, inspect, recovering = false) {
+  let attempted = false
+  try {
+    return await bridgeFile(plan, true, async handle => {
+      let state = await bridgeRead(plan, handle)
+      if (recovering && state.length >= plan.length + Buffer.byteLength(plan.bytes) && state.prefixSha === plan.sha && state.tail.equals(Buffer.from(plan.bytes)) &&
+          !state.invalid && stable(state.last) === stable(JSON.parse(plan.bytes))) return state
+      if (recovering && state.length > plan.length) {
+        await truncateBridge(plan, handle, state, inspect)
+        state = await bridgeRead(plan, handle)
+      }
+      if (state.length !== plan.length || state.sha !== plan.sha || !recovering && state.fingerprint !== plan.fingerprint) throw bridgeError('source changed before append')
+      await bridgeStable(plan, handle, state.fingerprint, inspect)
+      attempted = true
+      await handle.writeFile(plan.bytes)
+      await handle.sync()
+      const after = await bridgeRead(plan, handle)
+      if (after.length !== plan.length + Buffer.byteLength(plan.bytes) || after.sha !== plan.afterSha || after.prefixSha !== plan.sha || !after.tail.equals(Buffer.from(plan.bytes))) throw bridgeError('unexpected content after append')
+      await bridgeStable(plan, handle, after.fingerprint, inspect)
+      return after
+    })
+  } catch (error) { error.bridgeUntouched = !attempted; throw error }
+}
+
+async function truncateBridge(plan, handle, state, inspect) {
+  const bytes = Buffer.from(plan.bytes), extra = state.length - plan.length
+  if (extra < 0 || extra > bytes.length || state.prefixSha !== plan.sha || !state.tail.equals(bytes.subarray(0, extra))) throw bridgeError('append recovery witness changed')
+  await bridgeStable(plan, handle, state.fingerprint, inspect)
+  if (extra) { await handle.truncate(plan.length); await handle.sync() }
+  const after = await bridgeRead(plan, handle)
+  if (after.length !== plan.length || after.sha !== plan.sha) throw bridgeError('transcript changed during append recovery')
+}
+
+async function restoreBridge(row, save, inspect, allowLater = true) {
+  const [plan] = bridgePlans(row)
+  if (!plan) return
+  if (row.bridgeUndo) {
+    await appendBridge(row.bridgeUndo, inspect, true)
+    return
+  }
+  await bridgeFile(plan, true, async handle => {
+    const state = await bridgeRead(plan, handle)
+    if (state.length <= plan.length + Buffer.byteLength(plan.bytes)) return truncateBridge(plan, handle, state, inspect)
+    if (!allowLater || state.prefixSha !== plan.sha || !state.tail.equals(Buffer.from(plan.bytes)) || state.invalid ||
+        stable(state.last) !== stable(bridgeClear(plan.sessionId))) throw bridgeError('newer transcript content prevents bridge restoration')
+    row.bridgeUndo = bridgePlan(plan, state, plan.original)
+    await save()
+    await appendBridge(row.bridgeUndo, inspect)
+  })
+}
+
+async function bridgeProblems(rows) {
+  const problems = []
+  for (const row of rows) {
+    try {
+      const plans = bridgePlans(row)
+      for (const [index, plan] of plans.entries()) await bridgeFile(plan, false, async handle => {
+        const state = await bridgeRead(plan, handle), bytes = Buffer.from(plan.bytes), extra = state.length - plan.length
+        const original = index ? bridgeClear(plan.sessionId) : plan.original
+        const expected = index ? plans[0].original : bridgeClear(plan.sessionId)
+        if (extra < 0 || state.prefixSha !== plan.sha || state.intendedSha !== plan.afterSha || stable(state.prefixLast) !== stable(original) ||
+            !state.tail.equals(bytes.subarray(0, Math.max(0, extra))) ||
+            index < plans.length - 1 && extra < bytes.length || index === plans.length - 1 && extra > bytes.length &&
+            (state.invalid || stable(state.last) !== stable(expected))) throw bridgeError('transcript restoration witness changed')
+      })
+    } catch (error) { problems.push(`${row.title} | ${error.message}`) }
+  }
+  return problems
+}
+
+async function bridgeIntact(row) {
+  if (!row.bridgeAppend) return true
+  const plan = row.bridgeAppend
+  return bridgeFile(plan, false, async handle => {
+    const state = await bridgeRead(plan, handle)
+    return state.prefixSha === plan.sha && state.tail.equals(Buffer.from(plan.bytes))
+  }).catch(() => false)
 }
 
 async function rehomeOne(s, to, journal, guard) {
-  const transcriptBefore = await fingerprint(s.transcript)
-  if (s.transcriptFingerprint && transcriptBefore !== s.transcriptFingerprint) throw new Error('source changed since inventory')
-  const sourceBytes = await readFile(s.transcript)
-  const sourceSha = sha(sourceBytes)
-  const transcriptFingerprint = await fingerprint(s.transcript)
-  if (transcriptFingerprint !== transcriptBefore) throw new Error('source changed while reading')
-  if (!s.contentSha || sourceSha !== s.contentSha) throw new Error('source changed since inventory')
+  const { fingerprint: transcriptFingerprint, append } = await bridgeSource(s, to)
   if (!s.snapshot) throw new Error('source analysis unavailable')
   const sidecarRoot = path.join(path.dirname(s.transcript), s.id)
   const sidecarTree = await treeFingerprint(sidecarRoot)
@@ -2389,7 +2552,25 @@ async function rehomeOne(s, to, journal, guard) {
   if (sha(afterRecord) !== sourceRecordSha) throw new Error('source Desktop record changed during move')
   if (!sameTree(sourceSidecars, afterSidecars)) throw new Error('source sidecars changed during move')
   guard.check?.()
-  const placedFingerprint = await releaseBridge(s.transcript, s.id, sourceBytes) ?? transcriptFingerprint
+  let placedFingerprint = transcriptFingerprint
+  if (append) {
+    await journal({ bridgeAppend: append }, true)
+    let after
+    try { after = await appendBridge(append, guard.inspect) }
+    catch (error) {
+      if (error.bridgeUntouched) await journal({ bridgeAppend: null }, true)
+      throw error
+    }
+    placedFingerprint = after.fingerprint
+    append.applied = true
+    await journal({ bridgeAppend: append }, true)
+    const sourceSha = s.contentSha
+    for (const member of guard.sources) if (member.transcript === s.transcript && member.contentSha === sourceSha && member.transcriptFingerprint === transcriptFingerprint) {
+      member.contentSha = after.sha
+      member.transcriptFingerprint = placedFingerprint
+      member.bridgeAppend = append
+    }
+  }
   for (const member of s.members ?? [s]) {
     member.strategy = 'rehome'
     member.transcriptFingerprint = placedFingerprint
@@ -2413,6 +2594,7 @@ async function rehomeOne(s, to, journal, guard) {
     taskOwned: false,
     ...(s.taskFamily ? { taskFamily: s.taskFamily.key } : {}),
     transcriptFingerprint: placedFingerprint,
+    ...(append ? { bridgeAppend: append } : {}),
     sidecars: { count: sourceSidecars.count, bytes: sourceSidecars.bytes, fingerprint: sourceSidecars.fingerprint, canonicalRoot: sourceSidecars.canonicalRoot },
     events: s.roots.size
   }
@@ -2543,6 +2725,7 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
     const currentFingerprint = await fingerprint(row.targetTranscript).catch(() => null)
     if (!currentFingerprint) changes.push('transcript missing')
     else if (checkShared && row.transcriptFingerprint && currentFingerprint !== row.transcriptFingerprint) changes.push('transcript')
+    else if (!await bridgeIntact(row)) changes.push('transcript')
     const targetDir = row.targetDir ?? path.join(path.dirname(row.targetTranscript), row.targetId)
     const sidecarsExist = !row.sidecars?.count || await exists(targetDir)
     if (!sidecarsExist) changes.push('sidecars missing')
@@ -2652,7 +2835,7 @@ async function verify(rows, report = () => {}, check = () => {}) {
   }
   const mark = (v) => (v ? `✗ ${v}` : '✓')
   const lines = [
-    `transcripts unchanged ${mark(bad.transcript)}`,
+    `chat messages unchanged ${mark(bad.transcript)}`,
     `sidecars unchanged ${mark(bad.sidecars)}`,
     `desktop ${mark(bad.desktop)}`
   ]
@@ -2695,19 +2878,26 @@ async function deferredWorkflow(paths, latest) {
   return sources.length ? { ...latest, mode: 'cloud', sources } : null
 }
 
-const saveText = async (file, text, before = () => {}) => {
+const syncPath = async file => {
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+  try { await handle.sync() } finally { await handle.close() }
+}
+
+const saveText = async (file, text, before = () => {}, durable = false) => {
   const temp = `${file}.${process.pid}.${randomUUID()}.tmp`
   try {
     await writeFile(temp, text, { flag: 'wx', mode: 0o600 })
+    if (durable) await syncPath(temp)
     await before()
     await rename(temp, file)
+    if (durable) await syncPath(path.dirname(file))
     return text
   } finally {
     await unlink(temp).catch(() => {})
   }
 }
 
-const saveJson = (file, value, spacing = 2) => saveText(file, jsonText(value, spacing))
+const saveJson = (file, value, spacing = 2, durable = false) => saveText(file, jsonText(value, spacing), undefined, durable)
 
 export async function readReceipt(file) {
   const receipt = await readJson(file)
@@ -2761,11 +2951,14 @@ async function placementJournal(file, receipt, check = () => {}) {
   const handle = await open(name, 'ax', 0o600)
   const sizes = Object.fromEntries(['sessions', 'failed', 'retained'].map(key => [key, receipt[key]?.length ?? 0]))
   return {
-    save: async () => {
+    save: async (durable = false) => {
       check()
       const patch = { sequence: (receipt.journalSequence ?? 0) + 1, pending: receipt.pending ?? null }
       for (const key of Object.keys(sizes)) patch[key] = (receipt[key] ?? []).slice(sizes[key])
-      try { await handle.writeFile(jsonText(patch, 0)) }
+      try {
+        await handle.writeFile(jsonText(patch, 0))
+        if (durable) { await handle.sync(); await syncPath(file); await syncPath(path.dirname(file)) }
+      }
       catch (error) { error.code = 'JOURNAL_WRITE'; throw error }
       receipt.journalSequence = patch.sequence
       for (const key of Object.keys(sizes)) sizes[key] = receipt[key]?.length ?? 0
@@ -2942,11 +3135,12 @@ async function finishUndo(receipt, file, paths, options = {}) {
   const problems = [
     ...await restoreProblems(superseded, root),
     ...await restoreProblems(undoing, root),
+    ...await bridgeProblems(receipt.sessions),
     ...await activationProblems(receipt),
     ...await taskTransferProblems(receipt.taskTransfers, paths, inspector(paths, options), true, options.check)
   ]
   if (await exists(path.join(dest, 'receipt.json'))) problems.push('undo receipt path occupied')
-  const liveWorkers = workers()
+  const liveWorkers = workers(inspector(paths, options)())
   for (const row of receipt.sessions) {
     if (ownsWorker(liveWorkers, row.targetId, row.targetRecordId)) problems.push(`${row.title} | running worker kept in destination`)
     if (!row.taskFamily && row.taskFile && (await taskSessions(row.taskFile)).has(row.targetRecordId ?? `local_${row.targetId}`) !== row.taskOwned) problems.push(`${row.title} | scheduled tasks changed`)
@@ -2960,6 +3154,7 @@ async function finishUndo(receipt, file, paths, options = {}) {
     await restore(superseded, root, options.check)
     await park(undoing, async () => options.check?.())
     await restoreActivations(receipt)
+    for (const row of receipt.sessions) await restoreBridge(row, () => saveJson(file, receipt, 2, true), inspect)
     await writeTaskRegistrations(receipt.taskTransfers, 'source', true, paths, inspect, options.check)
     await mkdir(dest, { recursive: true })
   } catch (error) { failure = error }
@@ -2983,7 +3178,7 @@ async function finishUndo(receipt, file, paths, options = {}) {
   return { receipt, dest }
 }
 
-async function rollbackTarget(row, dest, liveWorkers = workers()) {
+async function rollbackTarget(row, dest, liveWorkers = workers(), before = () => {}) {
   const locateArtifact = async (original) => {
     const parked = path.join(dest, path.basename(original))
     const [hasOriginal, hasParked] = await Promise.all([exists(original), exists(parked)])
@@ -3009,9 +3204,12 @@ async function rollbackTarget(row, dest, liveWorkers = workers()) {
     }
     if (row.taskFile && (await taskSessions(row.taskFile)).has(row.targetRecordId ?? `local_${row.targetId}`) !== row.taskOwned) changes.push('scheduled tasks changed')
     if (ownsWorker(liveWorkers, row.targetId, row.targetRecordId)) changes.push('running worker')
-    if (!changes.length && record.move) {
-      await mkdir(dest, { recursive: true })
-      await rename(record.original, record.parked)
+    if (!changes.length) {
+      await before()
+      if (record.move) {
+        await mkdir(dest, { recursive: true })
+        await rename(record.original, record.parked)
+      }
     }
     return changes
   }
@@ -3082,6 +3280,8 @@ async function reconcileFiles(paths, options = {}) {
     return { title: p.name, error: 'corrupt receipt set aside' }
   }
   const { receipt } = p
+  const bridgeIssues = await bridgeProblems([...(receipt.sessions ?? []), ...(receipt.pending ? [receipt.pending] : [])])
+  if (bridgeIssues.length) return { title: 'bridge recovery blocked', error: bridgeIssues.join(', '), problems: bridgeIssues }
   const inspect = inspector(paths, options)
   const taskTransfers = recoveryFamilies(receipt)
   const taskProblems = await taskTransferProblems(taskTransfers, paths, inspect, true, options.check)
@@ -3144,6 +3344,8 @@ async function reconcileFiles(paths, options = {}) {
     if (!['rehome', 'remote'].includes(strategy)) throw new Error('unsupported pending receipt strategy')
     const found = creationRequired ? await stat(made[0]).catch(() => null) : null
     const foreign = creationRequired && found && (!created || found.dev !== created.dev || found.ino !== created.ino)
+    try { await restoreBridge(receipt.pending, () => saveJson(p.file, receipt, 2, true), inspect) }
+    catch (error) { return { title: 'bridge recovery blocked', error: error.message } }
     const used = strategy === 'rehome'
       ? await readFile(made[0]).then((raw) => Boolean(receipt.pending.recordSha && sha(raw) !== receipt.pending.recordSha), () => false)
       : await changed(made[0], targetId, knownOf(receipt.pending))
@@ -3160,7 +3362,8 @@ async function reconcileFiles(paths, options = {}) {
     const checkpoint = receipt.appendCheckpoint
     const root = path.join(paths.state, 'quarantine')
     const superseded = receipt.superseded.slice(checkpoint?.superseded ?? 0)
-    const blocked = await restoreProblems(superseded, root)
+    const rollingBack = (receipt.sessions ?? []).slice(checkpoint?.sessions ?? 0)
+    const blocked = [...await restoreProblems(superseded, root), ...await bridgeProblems(rollingBack)]
     if (blocked.length) return { title: 'recovery blocked', error: blocked.join(', '), problems: blocked }
     await writeTaskRegistrations(taskTransfers, 'target', false, paths, inspect, options.check)
     await restore(superseded, root, options.check)
@@ -3168,9 +3371,12 @@ async function reconcileFiles(paths, options = {}) {
     let rolledBack = 0
     const dest = path.join(paths.state, 'quarantine', receipt.at, 'failed')
     const liveWorkers = workers()
-    for (const row of (receipt.sessions ?? []).slice(checkpoint?.sessions ?? 0)) {
+    for (const row of rollingBack) {
       options.check?.()
-      const changes = await rollbackTarget(row.taskFamily ? { ...row, taskOwned: false } : row, dest, liveWorkers)
+      let changes
+      try { changes = await rollbackTarget(row.taskFamily ? { ...row, taskOwned: false } : row, dest, liveWorkers,
+        () => restoreBridge(row, () => saveJson(p.file, receipt, 2, true), inspect)) }
+      catch (error) { return { title: 'bridge recovery blocked', error: error.message } }
       if (changes.length) {
         kept.push(row)
         receipt.failed.push({ id: row.id, title: row.title, error: `interrupted finalization, ${changes.join(', ')} changed since, left in place` })
@@ -3216,7 +3422,7 @@ async function witnessed(row, liveWorkers, checkShared = true) {
     ])
     const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has(desktopRecordOf(row).sessionId) === row.taskOwned
     const shared = Boolean(currentTranscript) && (!expectedSidecars.count || await exists(sidecarRoot)) && (!expectedSidecars.canonicalRoot || currentSidecars?.canonicalRoot === expectedSidecars.canonicalRoot) && (!checkShared || (currentTranscript === row.transcriptFingerprint && sameTree(expectedSidecars, currentSidecars)))
-    return shared && sameTask && !ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId)
+    return shared && sameTask && !ownsWorker(liveWorkers, row.id, desktopRecordOf(row).sessionId) && await bridgeIntact(row)
   }
   const now = await sidecars(row.transcript, row.id).catch(() => null)
   const sameTask = !row.account?.taskFile || (await taskSessions(row.account.taskFile)).has(desktopRecordOf(row).sessionId) === row.taskOwned
@@ -3979,7 +4185,7 @@ async function restoreRemote(receipt, file, paths, options = {}) {
 }
 
 async function transfer(inv, to, paths, report, context = {}) {
-  context = { ...context, snapshots: context.restart ? new Map() : null }
+  context = { ...context, sources: [...new Set([...inv.sources, ...inv.move, ...inv.move.flatMap(s => s.members ?? [])])], snapshots: context.restart ? new Map() : null }
   if (context.restart) {
     const batches = new Map(), grouped = new Map()
     for (const family of new Set(inv.move.map(row => row.taskFamily).filter(Boolean))) {
@@ -4162,7 +4368,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     await writeTaskRegistrations([transfer], 'source', false, paths, inv.inspect, context.check, context.snapshots)
     for (const row of inv.sources) row.taskOwned = false
   }
-  const rehomeGuard = { workers: workers(), taskSessions: new Map(), created: new Map(), check: context.check }
+  const rehomeGuard = { workers: workers(inv.inspect()), inspect: inv.inspect, sources: context.sources, taskSessions: new Map(), created: new Map(), check: context.check }
   for (const file of new Set([...inv.move.map((row) => row.account.taskFile), to.taskFile])) {
     rehomeGuard.taskSessions.set(file, await taskSessions(file))
   }
@@ -4178,11 +4384,15 @@ async function transferRecords(inv, to, paths, report, context = {}) {
       await journal.save()
       try {
         if (s.record.forkedFromSessionId && !landedRecordIds.has(s.record.forkedFromSessionId)) throw new Error('parent Desktop record did not move')
-        const row = await rehomeOne(s, to, async (patch) => { Object.assign(receipt.pending, patch); await journal.save() }, rehomeGuard)
+        const row = await rehomeOne(s, to, async (patch, durable) => { Object.assign(receipt.pending, patch); await journal.save(durable) }, rehomeGuard)
         receipt.sessions.push(row)
         if (row.targetRecordId) landedRecordIds.add(row.targetRecordId)
       } catch (error) {
         if (error.code === 'JOURNAL_WRITE' || error.code === 'RESTART_CAPACITY') throw error
+        if (receipt.pending.bridgeAppend) {
+          try { await restoreBridge(receipt.pending, () => journal.save(true), inv.inspect, false) }
+          catch (recovery) { throw bridgeError(`${error.message}. ${recovery.message}`) }
+        }
         const raw = await readFile(made[0]).catch(() => null)
         const created = rehomeGuard.created.get(made[0])
         const found = await stat(made[0]).catch(() => null)
@@ -4276,7 +4486,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     ].filter(Boolean).join(' | '))
     report('verify', [...lines, `${Math.round((Date.now() - started) / 1000)}s`].join(' | '))
   }
-  if (retired) report('retired', `${count(retired)} source records → quarantine | transcripts untouched`)
+  if (retired) report('retired', `${count(retired)} source records → quarantine | chat messages unchanged`)
   const resultOkay = receiptOkay(receipt)
   const newerCloud = receipt.cloudChecks.reduce((total, check) => total + (check.later?.length ?? 0), 0)
   return { file, receipt, summary: receiptSummary(receipt), checks: lines, problems: receipt.verification.problems, ok: resultOkay, complete: pendingCloud === 0 && !receipt.held.length, added: receipt.sessions.length - previousCount, rescuedTitles: rescued.rows.map(row => row.title), targetChanged: receipt.sessions.length > previousCount || receipt.superseded.slice(previousSuperseded).some((row) => !row.source), held: receipt.held, pendingCloud, pendingLabels: cloudCheckLabels(receipt), newerCloud, cloudChecked: inv.cloud?.checked ? 1 : 0 }
@@ -4842,6 +5052,7 @@ async function undoFiles(paths, options = {}) {
   if (kept.length) return { receipt, changed: kept }
   const root = path.join(paths.state, 'quarantine')
   const blocked = [...await restoreProblems(receipt.superseded ?? [], root),
+    ...await bridgeProblems(receipt.sessions),
     ...await taskTransferProblems(receipt.taskTransfers, paths, inspect) ]
   const schedulerHeld = blocked.length > 0 && blocked.every(problem => problem === SCHEDULER_OWNS) && !options.check
   if (schedulerHeld && !receipt.remote?.length) return { restartNeeded: true, file, receipt }
@@ -5304,7 +5515,7 @@ async function main(argv) {
       rescued.length ? `  ${count(rescued.length)} rescued remote transcripts | ${count(rescued.length)} desktop records → quarantine` : null,
       back ? `  ${count(back)} source records put back` : null,
       cloudBack ? `  ${count(cloudBack)} cloud mirrors restored` : null,
-      '  shared transcripts unchanged ✓',
+      '  chat messages unchanged ✓',
       `  quarantine  ${result.dest}`,
       `  then        ${NOTE}`,
       ''
