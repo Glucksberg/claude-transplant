@@ -2573,8 +2573,7 @@ test('same-account organization moves rehome one record without copying history'
   const recordName = `${recordId}.json`
   await h.record('P', SOURCE, rehomeRecord({ sessionId: recordId, bridgeSessionIds: ['session_fixture'] }))
   await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('P'), recordName))
-  const before = await readFile(transcript)
-  const beforeStat = await stat(transcript)
+  const before = Buffer.concat([await readFile(transcript), Buffer.from(`${JSON.stringify({ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })}\n`)])
 
   const select = async (fromOrg, toOrg) => {
     const all = await accounts(h.paths)
@@ -2593,7 +2592,7 @@ test('same-account organization moves rehome one record without copying history'
   assert.equal(first.receipt.sessions[0].strategy, 'rehome')
   assert.equal(first.receipt.sessions[0].targetId, SOURCE)
   assert.deepEqual(await readFile(transcript), before)
-  assert.equal((await stat(transcript)).mtimeMs, beforeStat.mtimeMs)
+  const clearedStat = await stat(transcript)
   assert.deepEqual((await readdir(h.project)).sort(), [SOURCE, `${SOURCE}.jsonl`].sort())
   assert.deepEqual(await readdir(h.dir('P')), [])
   assert.deepEqual(await readdir(teamDir), [recordName])
@@ -2617,6 +2616,7 @@ test('same-account organization moves rehome one record without copying history'
     assert.equal(inv.move[0].strategy, 'rehome')
     assert.equal((await move(inv, picked.to, h.paths)).ok, true)
     assert.deepEqual(await readFile(transcript), before)
+    assert.equal((await stat(transcript)).mtimeMs, clearedStat.mtimeMs)
     assert.deepEqual((await readdir(h.project)).sort(), [SOURCE, `${SOURCE}.jsonl`].sort())
   }
 
@@ -2658,6 +2658,38 @@ test('cross-login moves rehome across same and different organizations', async (
     assert.deepEqual(await readdir(h.dir('P')), [])
     assert.deepEqual(await readdir(targetDir), [`local_${SOURCE}.json`])
   }
+})
+
+test('a rehome appends one pointer clear for the source bridge so the next Remote Control session keeps its title', async () => {
+  const h = await home()
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  await h.write(SOURCE, [
+    entry('user', 1, null, SOURCE),
+    entry('assistant', 2, 1, SOURCE),
+    { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_prior', lastSequenceNum: 7, ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+  ])
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior'] }))
+  const targetDir = path.join(h.paths.records, h.acct.Z, h.org.Z)
+  await mkdir(targetDir, { recursive: true })
+  const before = await readFile(transcript)
+  const cleared = Buffer.concat([before, Buffer.from(`${JSON.stringify({ type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })}\n`)])
+  const moveOnce = async () => {
+    const all = await accounts(h.paths)
+    const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+    const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+    const inv = await inventory([from], to, h.paths)
+    assert.equal(inv.move[0].strategy, 'rehome')
+    return move(inv, to, h.paths)
+  }
+  const first = await moveOnce()
+  assert.equal(first.ok, true)
+  assert.deepEqual(await readFile(transcript), cleared)
+  assert.deepEqual(JSON.parse(await readFile(path.join(targetDir, `local_${SOURCE}.json`), 'utf8')).bridgeSessionIds, [])
+  assert.ok((await undo(h.paths)).dest)
+  assert.deepEqual(await readdir(targetDir), [])
+  assert.deepEqual(await readFile(transcript), cleared)
+  assert.equal((await moveOnce()).ok, true)
+  assert.deepEqual(await readFile(transcript), cleared)
 })
 
 test('local moves finish while inaccessible source cloud checks stay pending', async () => {

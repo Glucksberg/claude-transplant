@@ -162,7 +162,7 @@ Shorter answers:
 - Which plans and accounts work? Any plan that runs Claude Code in Claude Desktop, Pro, Max, Team, or Enterprise. Two organizations on one email, a Team seat next to a personal plan, are two sidebars and both are supported.
 - What happens to sessions that are running when I switch? Desktop ends the workers of the account you leave. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
 - Is anything uploaded or read from Keychain? From the CLI, not unless you pass `--cloud`. The menubar's Move always passes it: Desktop's claude.ai session is read from Keychain in memory, sent only to claude.ai to reconcile Remote Control mirrors, and never stored.
-- What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account.
+- What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account. The new Remote Control session keeps the session's title.
 - Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side, is still open, or a new fork still needs the moved parent.
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
@@ -249,7 +249,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 <summary>Rules</summary>
 
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
-- No transcript or sidecar is renamed, edited, or deleted. The quarantined record is the rollback.
+- No transcript or sidecar is renamed, edited, or deleted. The one write to a transcript is Claude Code's own Remote Control pointer clear, appended once to a moved session whose last bridge pointer is still set. Without it, the session's next wake on the destination account sees a foreign pointer and starts its Remote Control session under a neutral host name such as `mac-lan-silly-adleman`. The quarantined record is the rollback.
 - Moves with no active worker or affected scheduler need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
 - Remote rescue copies payloads exactly. No model reconstructs history.
 - Remote Control is touched only with `--cloud`, with no credential persistence.

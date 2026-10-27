@@ -2321,10 +2321,35 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
   }
 }
 
+const BRIDGE_RECORD = Buffer.from('"type":"bridge-session"')
+
+async function releaseBridge(transcript, sessionId, bytes) {
+  if (bytes.at(-1) !== 10) return null
+  for (let at = bytes.lastIndexOf(BRIDGE_RECORD); at >= 0;) {
+    const start = bytes.lastIndexOf(10, at) + 1
+    let entry = null
+    try { entry = JSON.parse(bytes.subarray(start, bytes.indexOf(10, at)).toString('utf8')) } catch {}
+    if (entry?.type === 'bridge-session' && entry.sessionId === sessionId) {
+      if (!entry.bridgeSessionId) return null
+      const handle = await open(transcript, 'a')
+      try {
+        await handle.writeFile(`${JSON.stringify({ type: 'bridge-session', sessionId, bridgeSessionId: '', lastSequenceNum: 0 })}\n`)
+        await handle.sync()
+      } finally {
+        await handle.close()
+      }
+      return fingerprint(transcript)
+    }
+    at = start ? bytes.lastIndexOf(BRIDGE_RECORD, start - 1) : -1
+  }
+  return null
+}
+
 async function rehomeOne(s, to, journal, guard) {
   const transcriptBefore = await fingerprint(s.transcript)
   if (s.transcriptFingerprint && transcriptBefore !== s.transcriptFingerprint) throw new Error('source changed since inventory')
-  const sourceSha = sha(await readFile(s.transcript))
+  const sourceBytes = await readFile(s.transcript)
+  const sourceSha = sha(sourceBytes)
   const transcriptFingerprint = await fingerprint(s.transcript)
   if (transcriptFingerprint !== transcriptBefore) throw new Error('source changed while reading')
   if (!s.contentSha || sourceSha !== s.contentSha) throw new Error('source changed since inventory')
@@ -2364,9 +2389,10 @@ async function rehomeOne(s, to, journal, guard) {
   if (sha(afterRecord) !== sourceRecordSha) throw new Error('source Desktop record changed during move')
   if (!sameTree(sourceSidecars, afterSidecars)) throw new Error('source sidecars changed during move')
   guard.check?.()
+  const placedFingerprint = await releaseBridge(s.transcript, s.id, sourceBytes) ?? transcriptFingerprint
   for (const member of s.members ?? [s]) {
     member.strategy = 'rehome'
-    member.transcriptFingerprint = transcriptFingerprint
+    member.transcriptFingerprint = placedFingerprint
     member.sidecar = { ...member.sidecar, fingerprint: sourceSidecars.fingerprint }
   }
   return {
@@ -2386,7 +2412,7 @@ async function rehomeOne(s, to, journal, guard) {
     taskFile: to.taskFile,
     taskOwned: false,
     ...(s.taskFamily ? { taskFamily: s.taskFamily.key } : {}),
-    transcriptFingerprint,
+    transcriptFingerprint: placedFingerprint,
     sidecars: { count: sourceSidecars.count, bytes: sourceSidecars.bytes, fingerprint: sourceSidecars.fingerprint, canonicalRoot: sourceSidecars.canonicalRoot },
     events: s.roots.size
   }
