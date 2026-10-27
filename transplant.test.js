@@ -2861,6 +2861,7 @@ test('round trips keep transcript mirrors with their explicit account and organi
       await writeFile(file, JSON.stringify(stored))
     }
     const current = await accounts(h.paths), source = current.find(a => a.account === to.account && a.org === to.org), target = current.find(a => a.account === from.account && a.org === from.org)
+    if (cache === 'warm') await inventory([source], target, h.paths, () => {}, { cloudRequested: true, cloud, writeCache: true })
     const inv = await inventory([source], target, h.paths, () => {}, { cloudRequested: true, cloud })
     assert.ok(inv.cacheStats[cache === 'warm' ? 'historyHits' : 'historyMisses'] > 0)
     const second = await move(inv, target, h.paths)
