@@ -11188,3 +11188,58 @@ test('budget fairness preserves deferred work when an isolated history exhausts 
     assert.deepEqual(completed.receipt.cloudChecks[0].sessionIds, scope, mode)
   }
 })
+
+test('native string-size errors during deferred rescue and final verification become scoped parser limits', async t => {
+  for (const phase of ['rescue serialization', 'final verification']) await t.test(phase, async t => {
+    const f = await limitRetryFixture(['ok', 'connected'])
+    let now = Date.now(), ready = false, thrown = 0
+    t.mock.method(Date, 'now', () => now)
+    if (phase === 'rescue serialization') f.rows[0].entries.push(entry('assistant', 8999, null, f.rows[0].sid, { message: { role: 'assistant', content: 'Synthetic remote-only branch' } }))
+    const before = await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool])
+    const stringify = JSON.stringify
+    const mock = t.mock.method(JSON, 'stringify', (value, ...args) => {
+      const target = phase === 'rescue serialization'
+        ? value?.type === 'custom-title' && value.customTitle === f.rows[0].title + ' · from Remote Control'
+        : value?.event_type === 'user' && value.payload?.uuid === f.rows[0].entries[0].uuid && f.rows[0].reads === 3
+      if (ready && target && !thrown) {
+        thrown++
+        const error = new RangeError('Invalid string length')
+        assert.equal(error.code, undefined)
+        throw error
+      }
+      return stringify(value, ...args)
+    })
+    let failed
+    try {
+      failed = await finishPending(f.h.paths, { ...f.options, report: (stage, text, extra) => {
+        if (phase === 'rescue serialization' ? stage === 'rescue' && text.startsWith('Bringing over ') : stage === 'cloud' && extra?.completed === 0 && extra?.total > 0) ready = true
+      } })
+    } finally { mock.mock.restore() }
+    assert.equal(ready, true)
+    assert.equal(thrown, 1)
+    assert.equal(failed.ok, false)
+    assert.equal(failed.receipt.failed[0].id, f.rows[0].id)
+    assert.equal(failed.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+    if (phase === 'final verification') assert.equal(failed.receipt.failed[0].localId, f.rows[0].sid)
+    assert.equal(f.rows[0].status, 'active')
+    assert.equal(failed.receipt.remote.length, 0)
+    assert.equal(failed.receipt.sessions.length, f.moved.receipt.sessions.length)
+    for (const key of ['pending', 'remotePending', 'finalizing', 'retiring', 'undoing']) assert.ok(!failed.receipt[key], key)
+    assert.deepEqual(await fixtureSnapshot(f.h, [f.h.paths.records, f.h.paths.pool]), before)
+    const reads = f.rows[0].reads
+    now += 60000
+    const waiting = await finishPending(f.h.paths, f.options)
+    assert.equal(waiting.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+    assert.equal(f.rows[0].reads, reads)
+    f.rows[1].mode = 'ok'; now += 60000
+    const independent = await finishPending(f.h.paths, f.options)
+    assert.equal(f.rows[1].status, 'archived')
+    assert.equal(f.rows[0].status, 'active')
+    assert.equal(f.rows[0].reads, reads)
+    assert.equal(independent.complete, false)
+    assert.equal(independent.receipt.failed[0].code, 'CLOUD_PARSER_LIMIT')
+    now += 60000
+    assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
+    assert.equal(f.rows[0].reads, reads)
+  })
+})

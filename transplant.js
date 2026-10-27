@@ -3795,7 +3795,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
       const currentConversation = conversationFromRows(current.rows)
       if (sha(stable(currentConversation)) !== match.conversationSha) throw new Error('Remote Control history changed since inventory')
     } catch (error) {
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code, localId: match.target.id })
+      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: memoryErrorCode(error), localId: match.target.id })
       progress(report, 'cloud', ++archived, matches.length, cloudProgress(receipt, inv.cloud))
       continue
     }
@@ -3803,7 +3803,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
     try {
       activation = await targetActivation(row, match.target.kind === 'existing' && receipt.sessions.some(session => session.record === row.session?.file && !session.archived))
     } catch (error) {
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code, localId: match.target.id })
+      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: memoryErrorCode(error), localId: match.target.id })
       progress(report, 'cloud', ++archived, matches.length, cloudProgress(receipt, inv.cloud))
       continue
     }
@@ -3843,7 +3843,7 @@ async function archiveCloud(inv, receipt, save, report = () => {}) {
           rolledBack = true
         } catch {}
       }
-      addCloudFailure(receipt, inv.cloud, { id: pending.id, title: pending.title, error: error.message, code: error.code, localId: match.target.id })
+      addCloudFailure(receipt, inv.cloud, { id: pending.id, title: pending.title, error: error.message, code: memoryErrorCode(error), localId: match.target.id })
       if (!rolledBack) {
         for (const skipped of matches.slice(index + 1)) addCloudFailure(receipt, inv.cloud, { id: skipped.session.id, title: skipped.session.title, error: 'not attempted while Remote Control recovery is pending' })
       }
@@ -3872,7 +3872,7 @@ async function rescueCloud(inv, receipt, to, paths, save, report = () => {}) {
       events += row.events
     } catch (error) {
       await quarantine(receipt.pending.made ?? [], path.join(paths.state, 'quarantine', receipt.at, 'failed'))
-      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: error.code, localId: error.localId, recordId: error.recordId })
+      addCloudFailure(receipt, inv.cloud, { id: match.session.id, title: match.session.title, error: error.message, code: memoryErrorCode(error), localId: error.localId, recordId: error.recordId })
       match.target.failed = true
     }
     receipt.pending = null
