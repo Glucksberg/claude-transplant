@@ -192,7 +192,7 @@ Restarts:
 
 - When an operation needs Desktop to close, the engine emits a plan first. The menubar warns which Code workers, windows, Chat, Cowork, and background commands will close.
 - Restart and move approves that exact process inventory. A changed inventory invalidates approval. Task registry changes require Desktop to be stopped or both source and target account/organization pairs to be known inactive. An active or unknown scheduler requires this plan even without a worker. Other cold moves show no dialog.
-- An approved restart moves eligible records before quitting Desktop, then waits for Desktop and its descendants to exit, moves held task families together, and reopens Desktop. 30 second budget, graceful quit, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
+- An approved restart moves eligible records before quitting Desktop, then waits for Desktop and its descendants to exit, moves held task families together, and reopens Desktop. The 60s budget reserves separate phases of up to 30s for shutdown, 22s for moving and 8s for reopening. Graceful quit, no force kill, no cloud work in that window. A veto leaves held records untouched. An interrupted task family stays recoverable.
 - Background retries never start a new shutdown.
 - Private, bounded `restart-events.jsonl` logs retain attempt outcomes without prompts or raw errors. Diagnostics never rewrite unfinished receipts or their journals, or recreate discarded receipts. Completed recovery folds matching outcomes into an existing receipt's `restartHistory` once, preserving `receipt.restart`.
 
@@ -201,10 +201,13 @@ Remote Control (`--cloud`):
 - Reads selected source organizations under the signed-in login through Claude Desktop's authenticated `claude.ai` session. Cookies are decrypted in memory via Keychain, sent only to `claude.ai`, never stored.
 - After history verification, a single matching local target or a unique bridge link among matching targets identifies the destination. Otherwise a same-title target must share eight consecutive exact remote messages to anchor a separate companion named `<original title> · from Remote Control`, with supported payloads copied exactly into a new local transcript.
 - The source mirror is archived only after the remote worker is disconnected and unchanged and the local target verifies.
+- Consumed queued prompts count once per proven command. Enqueued, cancelled, foreign-session and conflicting copies cannot supply missing history. A declared prior transcript in the same project can cover a mirror through its receipt link or its own matching session, source account and organization bridge record. One complete comparable prior must cover the mirror, and its file and project mapping are checked again before archival.
 - A unique bridge-linked parent can also prove owned subagent messages and absorbed queued prompts, including images. UUID, role, payload, delivery evidence and per-stream order must agree. The receipt records main, subagent and queued event counts. Final archival repeats the proof against fresh files and remote rows.
 - Supplemental reads share 512 MiB per operation, with a 16 MiB relevant-line parse limit. Time hints only prioritize files. Incomplete, unreadable or budget-limited checks remain uncertain and cannot authorize rescue. A complete check that establishes missing history can use the existing guarded rescue path.
 - Supplemental reads run one candidate at a time while remote fetching stays concurrent. Candidates deferred by earlier reads receive priority on a later pass. Only failures measured against the full byte allowance, and per-session line limits, suppress unchanged automatic retries. Existing main-only matching and warm history caches remain usable.
 - Known source mirrors retry automatically across organizations under the signed-in login. Other logins stay pending until you sign in. Retries check identity, history, and connection state before touching a remote row. A failed source stays active and retryable.
+- Login transitions get prompt retries with brief backoff. The panel separates completed work from the next action and shows the next retry. Event limits pause only affected mirrors until an engine change or manual retry.
+- Memory-budget failures retry one history per pass through final verification and archival. Deferred histories get priority in later passes. Only an isolated budget failure or Node string limit pauses that work until an engine/budget change or manual retry. Other mirrors continue, and temporary system pressure remains retryable.
 
 Safety:
 
@@ -214,6 +217,9 @@ Safety:
 - A disabled destination task twin can be replaced only when its definition matches, its notification record and dependencies are absent, every destination record is readable, and its selected state is absent or equal. The receipt saves the twin and its position for undo and recovery. Later unrelated registry edits survive.
 - Later moves and sweeps report changes to title, archive state, and starred state under `drift/<receipt>`. Other Desktop bookkeeping stays quiet. Missing or unreadable records retain a warning. Undo, retirement, and source archival also ignore branch and PR bookkeeping.
 - Background checks keep the panel enabled. A click captures its command and selection, shows a waiting state, and cannot be replaced by another action before the check finishes.
+- A background move that needs a sidebar refresh keeps its information icon and notice through pending-account refreshes and idle checks. Restart still requires the existing approval, and background checks add no notifications.
+- Sidecar symbolic links are accepted only as leaves inside real session folders, including dangling and external links. Only link destination text and link identity are read. Trusted project-parent aliases are resolved and rechecked without changing stored paths. Relative links resolving to different paths remain distinct. Session folder links and special files are refused.
+- Receipt snapshots retain identity, folder, title, archive and starred fields. Full Desktop records and rollback hashes stay intact. Journal replay reads one complete line at a time and ignores only an unfinished final line.
 - Lineage follows `forkedFrom` pointers to their roots. Existing replay choices stay unchanged. Other duplicate message ids count as replays only when one existing copy contains every filled tool-result value and producer marker, with exact message content and matching fields except runtime metadata, token usage, a missing producer marker, and an `edited_text_file` attachment's display path. Arrays compare whole. Different filled values and complementary partial copies are refused.
 - A disposable planning cache lives at `~/Library/Application Support/claude-transplant/cache.json`. Every write decision uses live files. Delete it any time.
 - Retirement filters potential source carriers by strict record, history and sidecar inclusion before live checks, avoiding rereads of unrelated destination histories in each ordinary and task-family pass. Superseded targets, actual carriers and parent references keep their live checks.
@@ -271,22 +277,29 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Repair changed records from old snapshots | Would overwrite legitimate title, archive, and pin edits |
 | Read the active org from Desktop's extensions allowlist timestamp | Can point at the wrong org after a failed refresh |
 | Trust the `lastActiveOrg` cookie for the active organization | Stale after an in-Desktop switch, the log-derived identity wins and the cookie is a fallback |
+| Require `/usr/bin/lockf` on every macOS version | macOS 14.5 lacks the utility. Bundled Perl takes the same kernel lock when it is absent |
+| Require a deleted task's registration to move its archived runs | Archived runs without notification routes or scheduler state can move through the guarded task-family path without recreating the task |
+| Raise each history's memory limit independently | Concurrent reads multiply memory use. Share a process budget and reduce concurrency under pressure |
 
 </details>
 
 ## Limits
 
 - macOS 13 or newer with Claude Desktop. Sign Desktop into the target account to see moved history.
+- Live Sonoma execution remains unverified. The missing-`lockf` fallback is covered by synthetic checks.
 - Remote Control ownership does not transfer. Re-enable it per session under the destination account.
 - Artifact ownership, versions, comments, and share links stay with the original account.
 - Embedded base64, text, and HTTP(S) images and documents can be rescued. Account-owned file ids and unknown shapes are refused.
 - Remote Control uses private Claude endpoints and fails closed if their shape or auth changes.
-- Supplemental coverage of retained histories after a CLI identity change remains unsupported.
+- Remote history reads stop at 1,000,000 events. The whole operation, including local inventory, shares a memory target of up to 20% of RAM with heap headroom and parsing reservations. On macOS, sampled system pressure controls throttling and deferral. Free pages alone do not cap work under normal pressure. The menubar heap setting never reduces Node's existing limit. This remains a cooperative target, not an OS-enforced cap. Incomplete history is never used to authorize cleanup.
+- Subagent artifact coverage from retained histories after a CLI identity change remains unsupported.
+- A large legacy base receipt still needs a full JSON parse before its snapshots can be trimmed. Journal replay bounds temporary parsing memory by the current line, while the reconstructed receipt remains in memory.
 - File layouts, log wording, and endpoints are undocumented and may change. Tested combinations are in the table below.
 - Moving history out of a Team organization is your organization's decision.
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.1.4 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.3 | 27.0.1 | 2.42304.0 | 2.1.299 | 2026-10-15 |
 | 4.1.2 | 27.0 | 2.26454.0 | 2.1.289 | 2026-10-07 |
 | 4.1.1 | 27.0 | 2.19675.0 | 2.1.286 | 2026-10-03 |
