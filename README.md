@@ -89,7 +89,7 @@ To    ↑↓ move · enter confirm
 
   inventory   318 records | 3 already there | 307 to move
   move        308 ✓ | 307 zero-copy | 1 rescued
-  verify      transcripts unchanged ✓ | sidecars unchanged ✓ | desktop ✓
+  verify      chat messages unchanged ✓ | sidecars unchanged ✓ | desktop ✓
 
   receipt     ~/Library/Application Support/claude-transplant/2026-09-02T16-04-11-208.json
   undo        npx claude-transplant undo
@@ -115,13 +115,13 @@ To    ↑↓ move · enter confirm
 
 ## What each command touches
 
-Every command may write the tool's own files under `~/Library/Application Support/claude-transplant`: cache, lock, restart plan, restart diagnostics, receipts, quarantine, and drift evidence. A move, `finish`, `sweep`, `undo`, and `restart` first handle interrupted work, which can move records, rewrite the receipt and quarantine, and reopen Claude Desktop. Sweep leaves interrupted Undo for explicit Finish undo. `--dry-run` and `keep-local` refuse during recovery.
+Every command may write the tool's own files under `~/Library/Application Support/claude-transplant`: cache, lock, restart plan, restart diagnostics, receipts, quarantine, and drift evidence. A move, `finish`, `sweep`, `undo`, and `restart` first handle interrupted work, which can move records, recover local bridge metadata, rewrite the receipt and quarantine, and reopen Claude Desktop. Sweep leaves interrupted Undo for explicit Finish undo. `--dry-run` and `keep-local` refuse during recovery.
 
 | Command | Beyond the tool's own folder |
 |---|---|
 | `accounts`, `--dry-run`, `--version`, `keep-local` | nothing, `--dry-run --cloud` also reads Remote Control metadata over the network |
 | `restart` without a token | nothing beyond the recovery above |
-| move, `finish`, `sweep`, `undo` | Desktop session records and scheduled task registries under `claude-code-sessions` |
+| move, `finish`, `sweep`, `undo` | Desktop session records and scheduled task registries under `claude-code-sessions`, local Remote Control bridge metadata in shared transcripts |
 | `--restart-approved <token>` | quits and reopens Claude Desktop around the requested operation |
 | a move with `--cloud`, and `finish`, `sweep`, `undo`, or `restart` while the receipt has pending or staged cloud work | Desktop's claude.ai session read from Keychain in memory, network to `claude.ai` only, Remote Control mirrors archived or restored there, rescued local transcripts when a remote branch diverged |
 | `menubar`, `menubar --remove` | the app bundle in the tool's folder and a LaunchAgent under `~/Library/LaunchAgents` |
@@ -134,7 +134,7 @@ Command and flag names are stable. Renames get a deprecation release first.
 
 ### Why is the Code sidebar empty after switching accounts?
 
-Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account and untouched.
+Desktop keeps one record per session under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>` and lists only the signed-in folder. The transcripts in `~/.claude/projects` are shared by every account. Chat messages and sidecars stay intact, with a narrow local bridge-metadata exception below.
 
 ### My sessions disappeared after signing out, an update, or a reset. Is this the fix?
 
@@ -162,7 +162,7 @@ Shorter answers:
 - Which plans and accounts work? Any plan that runs Claude Code in Claude Desktop, Pro, Max, Team, or Enterprise. Two organizations on one email, a Team seat next to a personal plan, are two sidebars and both are supported.
 - What happens to sessions that are running when I switch? Desktop ends the workers of the account you leave. Sessions with a running worker are held until you approve a restart, or skipped with Move only the rest.
 - Is anything uploaded or read from Keychain? From the CLI, not unless you pass `--cloud`. The menubar's Move always passes it: Desktop's claude.ai session is read from Keychain in memory, sent only to claude.ai to reconcile Remote Control mirrors, and never stored.
-- What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account.
+- What about Remote Control and cloud sessions? They stay with the account that created them. `--cloud` archives the source's mirrors after the local copy verifies, and you re-enable Remote Control per session under the new account. Clearing a stale foreign pointer avoids its title-suppression path, but existing history suppression remains effective.
 - Can I undo? Yes. `undo` puts every record back, all or nothing, and refuses if a moved session changed on the target side, is still open, or a new fork still needs the moved parent.
 - Does the CLI or the VS Code extension have this problem? The CLI does not, `claude --resume` reads the shared transcripts regardless of login. The VS Code extension keeps its own session index, untested and not handled here.
 - What about Claude chats and Projects? Those live on claude.ai per organization and are not touched.
@@ -176,7 +176,7 @@ Manual walkthrough: [recovering missing Claude Desktop history](https://dev.to/v
 
 ## How it works
 
-A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. The transcript pool is shared across accounts, so a move writes the same record into the target organization with the same `cliSessionId`, verifies that transcript, sidecars, and both records are unchanged, then parks the source record in quarantine.
+A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. A move keeps shared chat messages and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine. Local bridge metadata may be appended as described below.
 
 Eligibility:
 
@@ -249,10 +249,10 @@ Active identity comes from the newest complete initialization entry in Claude De
 <summary>Rules</summary>
 
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
-- No transcript or sidecar is renamed, edited, or deleted. The quarantined record is the rollback.
+- Chat messages and sidecars stay intact. A move can append Claude Code's native empty Remote Control pointer to avoid stale foreign-owner title and history suppression. A destination-owned pointer stays. Recovery only appends, completing a proven partial metadata tail before restoring the saved pointer when still owned. Undo of a completed move leaves later transcript edits and newer pointers alone. Unproven interrupted writes stay pending. Existing history suppression stays, and existing cloud sessions are not renamed. Local metadata needs no `--cloud`, which controls network work.
 - Moves with no active worker or affected scheduler need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
 - Remote rescue copies payloads exactly. No model reconstructs history.
-- Remote Control is touched only with `--cloud`, with no credential persistence.
+- Remote Control network requests require `--cloud`, with no credential persistence. Local bridge metadata does not.
 - Automatic retries cover the receipt's named work only. They never start a restart, store credentials, or create destination bridges.
 - One JavaScript file, no dependencies, Node 22. The menubar is one Swift file.
 
@@ -299,6 +299,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.1.5 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.4 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.3 | 27.0.1 | 2.42304.0 | 2.1.299 | 2026-10-15 |
 | 4.1.2 | 27.0 | 2.26454.0 | 2.1.289 | 2026-10-07 |
@@ -309,5 +310,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | 4.0.5 | 27.0 | 1.49585.0 | 2.1.260 | 2026-09-08 |
 | 4.0.4 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-08 |
 | 4.0.3 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-07 |
+
+4.1.5 validation uses synthetic fixtures and read-only native-code inspection. No new live move or cloud-title check was performed.
 
 Receipts, quarantine, drift evidence, cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
