@@ -1056,7 +1056,7 @@ test('human CLI names staged Undo instead of printing false success', async () =
   assert.equal(result.code, 1)
   assert.match(result.stdout, /pending.*t@example.com/i)
   assert.doesNotMatch(result.stdout, /quarantine\s+undefined/)
-  assert.doesNotMatch(result.stdout, /chat messages unchanged/)
+  assert.doesNotMatch(result.stdout, /chat messages (?:unchanged|preserved)/)
   const continued = await cli(h.root, ['finish', '--json'])
   assert.equal(continued.code, 1)
   assert.equal(JSON.parse(continued.stdout.trim().split('\n').at(-1)).pendingUndo.length, 1)
@@ -2669,6 +2669,146 @@ async function bridgeFixture() {
   return { ...h, transcript: await fs.realpath(transcript), bridge, from, to, before: await readFile(transcript) }
 }
 
+function assertBridgeRestored(before, after, bridge) {
+  assert.ok(after.subarray(0, before.length).equals(before))
+  const parse = bytes => bytes.toString('utf8').split('\n').filter(line => line.trim()).map(line => [line, JSON.parse(line)])
+  const original = parse(before), current = parse(after)
+  assert.deepEqual(current.filter(([, row]) => MESSAGES.has(row.type)).map(([line]) => line), original.filter(([, row]) => MESSAGES.has(row.type)).map(([line]) => line))
+  assert.deepEqual(current.filter(([, row]) => row.type === 'bridge-session' && row.sessionId === bridge.sessionId).at(-1)?.[1], bridge)
+}
+
+test('bridge review recovery leaves committed rows outside a held continuation alone', async () => {
+  const h = await bridgeFixture(), cold = id(300)
+  await h.write(cold, [entry('user', 300, null, cold), { ...h.bridge, sessionId: cold }])
+  await h.record('P', cold, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.find(a => a.account === h.acct.P)
+  const first = await executeMove([from], h.to, h.paths, { processes: desktopFixture(), moveOnly: true })
+  assert.deepEqual(first.receipt.sessions.map(row => row.id), [cold])
+  await assert.rejects(finishHeld(h.paths, { processes: [], report: (stage, text) => {
+    if (stage === 'retire' && text === 'checking') throw new Error('Synthetic interrupted continuation')
+  } }), /Synthetic interrupted continuation/)
+  const transcript = path.join(h.project, `${cold}.jsonl`)
+  await appendFile(transcript, `${JSON.stringify({ ...h.bridge, sessionId: cold, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+  const before = await readFile(transcript)
+  await undo(h.paths, { processes: [] })
+  const recovered = await readReceipt(first.file)
+  assert.deepEqual(recovered.sessions.map(row => row.id), [cold])
+  assert.equal(Boolean(recovered.finalizing || recovered.appendCheckpoint || recovered.pending), false)
+  assert.deepEqual(await readFile(transcript), before)
+  assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.equal(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)).catch(() => null), null)
+})
+
+test('bridge recovery of remote-only work leaves unrelated completed metadata alone', async () => {
+  const h = await bridgeFixture()
+  const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+  await appendFile(h.transcript, `${JSON.stringify({ ...h.bridge, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+  const receipt = await readReceipt(moved.file)
+  receipt.remotePending = { id: 'cse_pending', title: 'Synthetic source mirror', account: h.from.account, org: h.from.org }
+  await writeFile(moved.file, JSON.stringify(receipt))
+  const before = await fixtureSnapshot(h, [h.paths.records, h.paths.pool])
+  let reads = 0
+  const cloud = cloudFixture(h, { session: async id => { reads++; assert.equal(id, 'cse_pending'); return remoteState('archived') } })
+  const result = await undo(h.paths, { processes: [], cloud })
+  assert.match(result.reconciled.error, /interrupted Remote Control archive completed/)
+  assert.equal(reads, 1)
+  assert.deepEqual(await fixtureSnapshot(h, [h.paths.records, h.paths.pool]), before)
+})
+
+test('bridge review Undo preserves a newer pointer while retaining the Desktop record guard', async t => {
+  for (const recordChanged of [false, true]) await t.test(String(recordChanged), async () => {
+    const h = await bridgeFixture()
+    const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+    await appendFile(h.transcript, `${JSON.stringify({ ...h.bridge, bridgeSessionId: 'cse_newer', ownerAccountUuid: h.to.account, ownerOrganizationUuid: h.to.org })}\n`)
+    const record = moved.receipt.sessions[0].record
+    if (recordChanged) await writeFile(record, JSON.stringify({ ...JSON.parse(await readFile(record)), bridgeSessionIds: ['session_newer'] }))
+    const before = await readFile(h.transcript), desktop = await readFile(record)
+    const result = await undo(h.paths, { processes: [] })
+    assert.equal(Boolean(result.dest), !recordChanged)
+    assert.deepEqual(await readFile(h.transcript), before)
+    if (recordChanged) assert.deepEqual(await readFile(record), desktop)
+    else assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`))).bridgeSessionIds, ['session_prior'])
+  })
+})
+
+test('bridge review Undo cannot discard a message arriving immediately before mutation', async t => {
+  const h = await bridgeFixture()
+  await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
+  const before = await readFile(h.transcript), realOpen = fs.open
+  let injected = false, truncated = false
+  const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+    const handle = await realOpen(file, flags, ...args)
+    if (file === h.transcript && mutatingOpen(flags)) for (const method of ['truncate', 'writeFile']) {
+      const original = handle[method].bind(handle)
+      t.mock.method(handle, method, async (...args) => {
+        if (!injected) { injected = true; await appendFile(file, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`) }
+        if (method === 'truncate') truncated = true
+        return original(...args)
+      })
+    }
+    return handle
+  })
+  syncBuiltinESMExports()
+  try { await undo(h.paths, { processes: [] }).catch(error => assert.match(error.message, /bridge/)) }
+  finally { mock.mock.restore(); syncBuiltinESMExports() }
+  const after = await readFile(h.transcript)
+  assert.equal(injected, true)
+  assert.ok(lines(after.toString()).some(row => row.uuid === id(3)))
+  assert.deepEqual(after.subarray(0, before.length), before)
+  assert.equal(truncated, false)
+})
+
+test('bridge review final worker guard includes distinct Desktop aliases', async t => {
+  for (const mode of ['record only', 'shared child', 'external worker']) await t.test(mode, async t => {
+    const h = await bridgeFixture(), recordUuid = id(9001), recordId = `local_${recordUuid}`
+    if (mode === 'shared child') await h.record('P', recordUuid, rehomeRecord({ cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` }))
+    else {
+      await h.record('P', SOURCE, rehomeRecord({ sessionId: recordId }))
+      await rename(path.join(h.dir('P'), `local_${SOURCE}.json`), path.join(h.dir('P'), `${recordId}.json`))
+    }
+    let active = false, injected = false
+    const inspect = () => active ? [{ worker: true, pid: 123, desktopPid: mode === 'external worker' ? null : 100, ids: [recordUuid] }] : []
+    const all = await accounts(h.paths, []), from = all.find(a => a.account === h.acct.P)
+    const inv = await inventory([from], h.to, h.paths, () => {}, { inspect }), realOpen = fs.open
+    const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+      if (file === h.transcript && mutatingOpen(flags)) { active = true; injected = true }
+      return realOpen(file, flags, ...args)
+    })
+    syncBuiltinESMExports()
+    let result
+    try { result = await move(inv, h.to, h.paths) }
+    finally { mock.mock.restore(); syncBuiltinESMExports() }
+    assert.equal(injected, true)
+    assert.equal(result.ok, false)
+    assert.deepEqual(await readFile(h.transcript), h.before)
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+  })
+})
+
+test('bridge byte verification parses history only when inventory found metadata', async t => {
+  for (const mode of ['no bridge metadata', 'bridge metadata', 'shared transcript records']) await t.test(mode, async t => {
+    const bridge = mode !== 'no bridge metadata'
+    const h = await bridgeFixture(), messages = branchEntries(48, SOURCE, 1).map(row => ({ ...row, message: { ...row.message, content: 'synthetic history '.repeat(128) } }))
+    await h.write(SOURCE, [...messages, ...(bridge ? [h.bridge] : [])])
+    if (mode === 'shared transcript records') {
+      await h.record('P', id(777), rehomeRecord({ cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` }))
+      h.from = (await accounts(h.paths, [])).find(row => row.account === h.acct.P)
+    }
+    const before = await readFile(h.transcript), inv = await inventory([h.from], h.to, h.paths, () => {}, { processes: [] })
+    let parsed = 0
+    const parse = JSON.parse, mock = t.mock.method(JSON, 'parse', (text, ...args) => {
+      if (/^\{"type":"(?:user|assistant)"/.test(String(text))) parsed++
+      return parse(text, ...args)
+    })
+    let result
+    try { result = await move(inv, h.to, h.paths) }
+    finally { mock.mock.restore() }
+    assert.equal(result.ok, true)
+    assert.equal(parsed, bridge ? messages.length : 0)
+    assert.ok((await readFile(h.transcript)).subarray(0, before.length).equals(before))
+  })
+})
+
 test('bridge append rejects the reproduced partial write and concurrent rewrite failures', async t => {
   for (const mode of ['partial-write', 'concurrent-rewrite']) await t.test(mode, async t => {
     const h = await bridgeFixture(), inv = await inventory([h.from], h.to, h.paths, () => {}, { processes: [] })
@@ -2696,7 +2836,7 @@ test('bridge append rejects the reproduced partial write and concurrent rewrite 
     assert.equal(result.ok, false)
     await undo(h.paths, { processes: [] })
     const after = await readFile(h.transcript)
-    if (mode === 'partial-write') assert.deepEqual(after, h.before)
+    if (mode === 'partial-write') assertBridgeRestored(h.before, after, h.bridge)
     else assert.equal(after.toString(), h.before.toString().replace('message 1', 'concurrently changed history'))
     assert.deepEqual(lines(after.toString()).at(-1), h.bridge)
     assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
@@ -2730,9 +2870,10 @@ test('a rehome clears the source bridge and Undo restores its original attachmen
   assert.deepEqual(JSON.parse(await readFile(path.join(targetDir, `local_${SOURCE}.json`), 'utf8')).bridgeSessionIds, [])
   assert.ok((await undo(h.paths)).dest)
   assert.deepEqual(await readdir(targetDir), [])
-  assert.deepEqual(await readFile(transcript), before)
+  const restored = await readFile(transcript)
+  assertBridgeRestored(before, restored, lines(before.toString()).at(-1))
   assert.equal((await moveOnce()).ok, true)
-  assert.deepEqual(await readFile(transcript), cleared)
+  assertBridgeRestored(restored, await readFile(transcript), { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })
 })
 
 test('bridge append honors native ownership, formatting, aliases and an already cleared pointer', async t => {
@@ -2799,7 +2940,8 @@ test('bridge rehome keeps ordinary lines just over 16 MiB movable', async t => {
     assert.ok(JSON.stringify(moved.receipt.sessions[0].bridgeAppend ?? null).length < 4096)
     assert.deepEqual(await readdir(h.dir('P')), [])
     assert.ok((await undo(h.paths, { processes: [] })).dest)
-    assert.ok((await readFile(h.transcript)).equals(before))
+    if (bridge) assertBridgeRestored(after, await readFile(h.transcript), h.bridge)
+    else assert.ok((await readFile(h.transcript)).equals(before))
     assert.deepEqual(await readdir(h.dir('Z')), [])
   })
 })
@@ -2862,7 +3004,8 @@ test('bridge append crash checkpoints recover through the placement receipt', as
     if (later) {
       assert.deepEqual(after.subarray(0, beforeRecovery.length), beforeRecovery)
       assert.equal(lines(after.toString()).filter(e => MESSAGES.has(e.type)).length, 3)
-    } else assert.deepEqual(after, h.before)
+    } else assertBridgeRestored(h.before, after, h.bridge)
+    assert.deepEqual(after.subarray(0, beforeRecovery.length), beforeRecovery)
     assert.deepEqual(lines(after.toString()).at(-1), h.bridge)
     assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
     assert.deepEqual(await readdir(h.dir('Z')), [])
@@ -2951,7 +3094,7 @@ test('bridge append keeps unexpected post-write changes pending and untouched', 
   })
 })
 
-test('bridge Undo preserves later messages and refuses unrelated newer bridges', async t => {
+test('bridge Undo preserves later messages, newer bridges and replaced transcripts', async t => {
   for (const mode of ['later messages', 'newer bridge', 'rewritten prefix', 'replacement']) await t.test(mode, async () => {
     const h = await bridgeFixture()
     assert.equal((await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)).ok, true)
@@ -2960,10 +3103,11 @@ test('bridge Undo preserves later messages and refuses unrelated newer bridges',
     if (mode === 'rewritten prefix') await writeFile(h.transcript, (await readFile(h.transcript, 'utf8')).replace('message 1', 'changed history'))
     if (mode === 'replacement') { await rename(h.transcript, `${h.transcript}.old`); await writeFile(h.transcript, await readFile(`${h.transcript}.old`)) }
     const before = await readFile(h.transcript), undone = await undo(h.paths, { processes: [] }), after = await readFile(h.transcript)
+    assert.ok(undone.dest)
     if (mode !== 'later messages') {
-      assert.ok((undone.restoreProblems ?? undone.changed)?.length)
       assert.deepEqual(after, before)
-      assert.ok(await readFile(path.join(h.dir('Z'), `local_${SOURCE}.json`)))
+      assert.deepEqual(await readdir(h.dir('Z')), [])
+      assert.ok(await readFile(path.join(h.dir('P'), `local_${SOURCE}.json`)))
       return
     }
     assert.ok(undone.dest)
@@ -2991,11 +3135,19 @@ test('bridge recovery refuses corrupt receipt metadata before changing transcrip
     ['malformed content hash', 'undo', row => { row.bridgeAppend.sha = null }],
     ['inconsistent append hash', 'undo', row => { row.bridgeAppend.afterSha = '0'.repeat(64) }],
     ['missing identity witness', 'undo', row => { delete row.bridgeAppend.fingerprint }],
+    ['missing worker aliases', 'undo', row => { delete row.bridgeAppend.recordIds }],
+    ['invalid worker alias', 'undo', row => { row.bridgeAppend.recordIds = ['not-a-record'] }],
+    ['missing owning record alias', 'undo', row => { row.bridgeAppend.recordIds = [`local_${id(799)}`] }],
+    ['missing shared record alias', 'shared', row => { row.bridgeAppend.recordIds = [`local_${SOURCE}`] }],
     ['invalid Undo append', 'interrupted undo', row => { row.bridgeUndo.bytes = 'undefined\n' }],
     ['wrong-session Undo original', 'interrupted undo', row => { row.bridgeUndo.original.sessionId = id(799) }]
   ]
   for (const [name, phase, corrupt] of cases) await t.test(name, async t => {
     const h = await bridgeFixture()
+    if (phase === 'shared') {
+      await h.record('P', id(799), rehomeRecord({ cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` }))
+      h.from = (await accounts(h.paths, [])).find(row => row.account === h.acct.P)
+    }
     const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
     assert.equal(moved.ok, true)
     await appendFile(h.transcript, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
@@ -3036,7 +3188,7 @@ test('bridge recovery refuses corrupt receipt metadata before changing transcrip
 })
 
 test('bridge Undo append checkpoints resume without dropping later content', async t => {
-  for (const checkpoint of ['intent', 'partial', 'synced', 'restored']) await t.test(checkpoint, async t => {
+  for (const checkpoint of ['intent', 'partial', 'partial twice', 'synced', 'restored']) await t.test(checkpoint, async t => {
     const h = await bridgeFixture()
     const moved = await move(await inventory([h.from], h.to, h.paths, () => {}, { processes: [] }), h.to, h.paths)
     await appendFile(h.transcript, `${JSON.stringify(entry('user', 3, 2, SOURCE))}\n`)
@@ -3047,8 +3199,8 @@ test('bridge Undo append checkpoints resume without dropping later content', asy
       if (file === h.transcript && mutatingOpen(flags)) {
         const write = handle.writeFile.bind(handle), sync = handle.sync.bind(handle)
         t.mock.method(handle, 'writeFile', async data => {
-          await write(checkpoint === 'partial' && !injected ? data.slice(0, 25) : data)
-          if (checkpoint === 'partial' && !injected) { injected = true; throw new Error('Synthetic Undo interruption') }
+          await write(checkpoint.startsWith('partial') && !injected ? data.slice(0, 25) : data)
+          if (checkpoint.startsWith('partial') && !injected) { injected = true; throw new Error('Synthetic Undo interruption') }
         })
         t.mock.method(handle, 'sync', async () => {
           await sync()
@@ -3067,6 +3219,30 @@ test('bridge Undo append checkpoints resume without dropping later content', asy
     try { await assert.rejects(undo(h.paths, { processes: [] }), /Synthetic Undo interruption/) }
     finally { for (const mock of mocks) mock.mock.restore(); syncBuiltinESMExports() }
     assert.equal(injected, true)
+    if (checkpoint === 'partial twice') {
+      const partial = await readFile(h.transcript)
+      let repeated = false
+      const mock = t.mock.method(fs, 'open', async (file, flags, ...args) => {
+        const handle = await realOpen(file, flags, ...args)
+        if (file === h.transcript && mutatingOpen(flags) && !repeated) {
+          const write = handle.writeFile.bind(handle)
+          t.mock.method(handle, 'writeFile', async bytes => {
+            const plan = (await readReceipt(moved.file)).sessions[0].bridgeUndo
+            assert.equal(plan.continuation.bytes, bytes.toString('base64'))
+            assert.equal(plan.continuation.length, partial.length)
+            repeated = true
+            await write(bytes.subarray(0, 7))
+            throw new Error('Synthetic continuation interruption')
+          })
+        }
+        return handle
+      })
+      syncBuiltinESMExports()
+      try { await assert.rejects(undo(h.paths, { processes: [] }), /Synthetic continuation interruption/) }
+      finally { mock.mock.restore(); syncBuiltinESMExports() }
+      assert.equal(repeated, true)
+      assert.deepEqual((await readFile(h.transcript)).subarray(0, partial.length), partial)
+    }
     if (checkpoint === 'synced' || checkpoint === 'restored') await appendFile(h.transcript, `${JSON.stringify(entry('assistant', 4, 3, SOURCE))}\n`)
     const recovered = await undo(h.paths, { processes: [] })
     assert.ok(recovered.dest)
@@ -3096,7 +3272,7 @@ test('bridge append is shared by distinct parent and child Desktop records', asy
   assert.deepEqual(await readdir(h.dir('P')), [])
   assert.equal(JSON.parse(await readFile(path.join(h.dir('Z'), `local_${child}.json`))).forkedFromSessionId, `local_${SOURCE}`)
   assert.ok((await undo(h.paths, { processes: [] })).dest)
-  assert.deepEqual(await readFile(h.transcript), h.before)
+  assertBridgeRestored(h.before, await readFile(h.transcript), h.bridge)
   assert.deepEqual((await readdir(h.dir('P'))).sort(), [SOURCE, child].map(sid => `local_${sid}.json`).sort())
 })
 
@@ -3123,7 +3299,7 @@ test('bridge restoration follows task-family publication rollback and continuati
     assert.equal(result.ok, false)
     assert.deepEqual(result.receipt.sessions.map(row => row.id), [h.cold])
     const restored = await readFile(transcript)
-    if (!later) assert.deepEqual(restored, before)
+    if (!later) assertBridgeRestored(before, restored, bridge)
     assert.deepEqual(lines(restored.toString()).filter(e => e.type === 'bridge-session').at(-1), bridge)
     assert.equal(lines(restored.toString()).filter(e => MESSAGES.has(e.type)).length, later ? 2 : 1)
     assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
@@ -3133,7 +3309,7 @@ test('bridge restoration follows task-family publication rollback and continuati
     assert.equal(finished.ok, true)
     assert.deepEqual(JSON.parse(await readFile(h.targetFile)), h.targetAfter)
     assert.ok((await undo(h.paths, { processes: [] })).dest)
-    assert.deepEqual(await readFile(transcript), restored)
+    assertBridgeRestored(restored, await readFile(transcript), bridge)
     assert.deepEqual(JSON.parse(await readFile(h.sourceFile)), h.sourceRegistry)
   })
 })

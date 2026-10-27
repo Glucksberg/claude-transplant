@@ -2326,13 +2326,16 @@ const bridgeError = text => Object.assign(new Error(`Local bridge metadata: ${te
 const bridgeEntry = (entry, sessionId) => Boolean(entry && typeof entry === 'object' && !Array.isArray(entry) &&
   entry.type === 'bridge-session' && entry.sessionId === sessionId && typeof (entry.bridgeSessionId ?? entry.bridge_session_id) === 'string')
 
-function bridgePlans(row) {
+function bridgePlans(row, aliases = []) {
   if (row.bridgeAppend == null && row.bridgeUndo == null) return []
   const id = row.targetId ?? row.id, plans = [row.bridgeAppend, ...(row.bridgeUndo == null ? [] : [row.bridgeUndo])]
   for (const [index, plan] of plans.entries()) {
     const invalid = () => { throw bridgeError('invalid bridge recovery receipt') }
     if (!UUID.test(id ?? '') || !plan || typeof plan !== 'object' || Array.isArray(plan) || plan.sessionId !== id ||
         !bridgeEntry(plan.original, id) || !(plan.original.bridgeSessionId ?? plan.original.bridge_session_id)) invalid()
+    const recordId = row.targetRecordId ?? row.recordSnapshot?.sessionId ?? row.recordId ?? (row.made?.[0] ? path.basename(row.made[0], '.json') : null)
+    if (!Array.isArray(plan.recordIds) || !plan.recordIds.length || plan.recordIds.some(id => typeof id !== 'string' || !LOCAL_RECORD.test(id)) ||
+        new Set(plan.recordIds).size !== plan.recordIds.length || [recordId, ...aliases].some(id => id && !plan.recordIds.includes(id))) invalid()
     if (['transcript', 'canonical'].some(key => typeof plan[key] !== 'string' || !path.isAbsolute(plan[key]) || path.basename(plan[key]) !== `${id}.jsonl`) ||
         ['dev', 'ino'].some(key => typeof plan[key] !== 'string' || !/^\d+$/.test(plan[key])) ||
         !Number.isSafeInteger(plan.length) || plan.length < 0 ||
@@ -2342,8 +2345,15 @@ function bridgePlans(row) {
     const bytes = jsonText(index ? plans[0].original : bridgeClear(id), 0)
     if (plan.bytes !== bytes && plan.bytes !== `\n${bytes}` || !Number.isSafeInteger(plan.length + Buffer.byteLength(plan.bytes))) invalid()
     if ((row.targetTranscript ?? row.transcript ?? plan.transcript) !== plan.transcript || index &&
-        (['transcript', 'canonical', 'dev', 'ino'].some(key => plan[key] !== plans[0][key]) ||
+        (['transcript', 'canonical', 'dev', 'ino'].some(key => plan[key] !== plans[0][key]) || stable(plan.recordIds) !== stable(plans[0].recordIds) ||
          stable(plan.original) !== stable(plans[0].original) || plan.length < plans[0].length + Buffer.byteLength(plans[0].bytes))) invalid()
+    if (plan.continuation != null) {
+      const continuation = plan.continuation, offset = continuation.length - plan.length
+      if (!Number.isSafeInteger(offset) || offset < 0 || offset >= Buffer.byteLength(plan.bytes) ||
+          typeof continuation.sha !== 'string' || !/^[a-f0-9]{64}$/.test(continuation.sha) ||
+          continuation.bytes !== Buffer.from(plan.bytes).subarray(offset).toString('base64') ||
+          typeof continuation.fingerprint !== 'string' || !new RegExp(`^${plan.dev}:${plan.ino}:${continuation.length}:-?\\d+:-?\\d+$`).test(continuation.fingerprint)) invalid()
+    }
   }
   return plans
 }
@@ -2360,7 +2370,10 @@ async function bridgeFile(plan, writable, work) {
 }
 
 async function bridgeStable(plan, handle, signature, inspect = null) {
-  if (inspect && ownsWorker(workers(inspect()), plan.sessionId)) throw bridgeError('running worker')
+  if (inspect) {
+    const live = workers(inspect())
+    if ((plan.recordIds ?? [null]).some(recordId => ownsWorker(live, plan.sessionId, recordId))) throw bridgeError('running worker')
+  }
   const current = await handle.stat({ bigint: true })
   const named = await lstat(plan.canonical, { bigint: true })
   if (!current.isFile() || !named.isFile() || statIdentity(current) !== signature || statIdentity(named) !== signature ||
@@ -2368,7 +2381,7 @@ async function bridgeStable(plan, handle, signature, inspect = null) {
       await mappedPath(plan.transcript) !== plan.canonical || await realpath(plan.canonical) !== plan.canonical) throw bridgeError('transcript changed')
 }
 
-async function bridgeRead(plan, handle) {
+async function bridgeRead(plan, handle, parse = true) {
   const detail = await handle.stat({ bigint: true }), size = Number(detail.size), signature = statIdentity(detail)
   if (!Number.isSafeInteger(size)) throw bridgeError('transcript size is unsupported')
   const memory = operationMemory()
@@ -2397,61 +2410,64 @@ async function bridgeRead(plan, handle) {
     if (at < plan.length) prefix.update(chunk.subarray(0, Math.min(bytesRead, plan.length - at)))
     const startTail = Math.max(0, plan.length - at), endTail = Math.min(bytesRead, plan.length + limit - at)
     if (endTail > startTail) tail.push(Buffer.from(chunk.subarray(startTail, endTail)))
-    let start = 0
-    for (let end = chunk.indexOf(10); end >= 0; end = chunk.indexOf(10, start)) {
-      parts.push(Buffer.from(chunk.subarray(start, end))); length += end - start
-      consume(at + end)
-      start = end + 1
+    if (parse) {
+      let start = 0
+      for (let end = chunk.indexOf(10); end >= 0; end = chunk.indexOf(10, start)) {
+        parts.push(Buffer.from(chunk.subarray(start, end))); length += end - start
+        consume(at + end)
+        start = end + 1
+      }
+      if (start < bytesRead) { parts.push(Buffer.from(chunk.subarray(start))); length += bytesRead - start }
     }
-    if (start < bytesRead) { parts.push(Buffer.from(chunk.subarray(start))); length += bytesRead - start }
     newline = chunk.at(-1) === 10
     at += bytesRead
   }
   if (length) consume(size)
   await bridgeStable(plan, handle, signature)
   return { length: size, fingerprint: signature, sha: hash.copy().digest('hex'), hash,
-    intendedSha: prefix.copy().update(plan.bytes ?? '').digest('hex'), prefixSha: prefix.digest('hex'), prefixLast, tail: Buffer.concat(tail), last, invalid, newline }
+    prefixHash: prefix.copy(), intendedSha: prefix.copy().update(plan.bytes ?? '').digest('hex'), prefixSha: prefix.digest('hex'), prefixLast, tail: Buffer.concat(tail), last, invalid, newline }
 }
 
 function bridgePlan(base, state, entry) {
   if (!bridgeEntry(entry, base.sessionId)) throw bridgeError('invalid bridge metadata entry')
   const bytes = `${state.length && !state.newline ? '\n' : ''}${JSON.stringify(entry)}\n`
-  return { ...base, length: state.length, sha: state.sha, fingerprint: state.fingerprint, bytes,
+  return { ...without(base, ['continuation']), length: state.length, sha: state.sha, fingerprint: state.fingerprint, bytes,
     afterSha: state.hash.copy().update(bytes).digest('hex') }
 }
 
-async function bridgeSource(s, to) {
+async function bridgeSource(s, to, guard) {
   const canonical = await mappedPath(s.transcript), detail = await lstat(canonical, { bigint: true })
-  const base = { transcript: s.transcript, canonical, sessionId: s.id, dev: String(detail.dev), ino: String(detail.ino) }
+  const recordIds = [...new Set([s, ...guard.sources, ...guard.targets].filter(row => row.id === s.id).map(row => desktopRecordOf(row).sessionId))].sort()
+  const base = { transcript: s.transcript, canonical, sessionId: s.id, recordIds, dev: String(detail.dev), ino: String(detail.ino) }
   return bridgeFile(base, false, async handle => {
-    const state = await bridgeRead(base, handle)
+    const state = await bridgeRead(base, handle, s.bridge !== false && s.contentSha !== s.bridgeAppend?.afterSha)
     if (s.transcriptFingerprint && state.fingerprint !== s.transcriptFingerprint || !s.contentSha || state.sha !== s.contentSha) throw new Error('source changed since inventory')
     const pointer = state.last?.bridgeSessionId ?? state.last?.bridge_session_id
     const destinationOwned = state.last?.ownerAccountUuid === to.account && state.last?.ownerOrganizationUuid === to.org
     const append = typeof pointer === 'string' && pointer && !state.invalid && !destinationOwned
       ? { ...bridgePlan(base, state, bridgeClear(s.id)), original: state.last } : null
-    if (append) bridgePlans({ id: s.id, transcript: s.transcript, bridgeAppend: append })
+    if (append) bridgePlans({ id: s.id, recordId: s.record.sessionId, transcript: s.transcript, bridgeAppend: append })
     return { fingerprint: state.fingerprint, append }
   })
 }
 
-async function appendBridge(plan, inspect, recovering = false) {
+async function appendBridge(plan, inspect, recovering = false, save = null) {
   let attempted = false
   try {
     return await bridgeFile(plan, true, async handle => {
-      let state = await bridgeRead(plan, handle)
-      if (recovering && state.length >= plan.length + Buffer.byteLength(plan.bytes) && state.prefixSha === plan.sha && state.tail.equals(Buffer.from(plan.bytes)) &&
-          !state.invalid && stable(state.last) === stable(JSON.parse(plan.bytes))) return state
-      if (recovering && state.length > plan.length) {
-        await truncateBridge(plan, handle, state, inspect)
-        state = await bridgeRead(plan, handle)
+      const state = await bridgeRead(plan, handle, false), bytes = Buffer.from(plan.bytes), extra = state.length - plan.length
+      if (recovering) {
+        if (!bridgeWitness(plan, state)) throw bridgeError('append recovery witness changed')
+        if (extra >= bytes.length) return state
+        plan.continuation = { length: state.length, sha: state.sha, fingerprint: state.fingerprint, bytes: bytes.subarray(extra).toString('base64') }
+        await save()
       }
-      if (state.length !== plan.length || state.sha !== plan.sha || !recovering && state.fingerprint !== plan.fingerprint) throw bridgeError('source changed before append')
+      if (!recovering && (state.length !== plan.length || state.sha !== plan.sha || state.fingerprint !== plan.fingerprint)) throw bridgeError('source changed before append')
       await bridgeStable(plan, handle, state.fingerprint, inspect)
       attempted = true
-      await handle.writeFile(plan.bytes)
+      await handle.writeFile(recovering ? bytes.subarray(extra) : bytes)
       await handle.sync()
-      const after = await bridgeRead(plan, handle)
+      const after = await bridgeRead(plan, handle, false)
       if (after.length !== plan.length + Buffer.byteLength(plan.bytes) || after.sha !== plan.afterSha || after.prefixSha !== plan.sha || !after.tail.equals(Buffer.from(plan.bytes))) throw bridgeError('unexpected content after append')
       await bridgeStable(plan, handle, after.fingerprint, inspect)
       return after
@@ -2459,47 +2475,59 @@ async function appendBridge(plan, inspect, recovering = false) {
   } catch (error) { error.bridgeUntouched = !attempted; throw error }
 }
 
-async function truncateBridge(plan, handle, state, inspect) {
+function bridgeWitness(plan, state) {
   const bytes = Buffer.from(plan.bytes), extra = state.length - plan.length
-  if (extra < 0 || extra > bytes.length || state.prefixSha !== plan.sha || !state.tail.equals(bytes.subarray(0, extra))) throw bridgeError('append recovery witness changed')
-  await bridgeStable(plan, handle, state.fingerprint, inspect)
-  if (extra) { await handle.truncate(plan.length); await handle.sync() }
-  const after = await bridgeRead(plan, handle)
-  if (after.length !== plan.length || after.sha !== plan.sha) throw bridgeError('transcript changed during append recovery')
+  if (state.prefixSha === plan.sha && (state.intendedSha !== plan.afterSha || plan.continuation &&
+      state.prefixHash.copy().update(bytes.subarray(0, plan.continuation.length - plan.length)).digest('hex') !== plan.continuation.sha)) throw bridgeError('invalid bridge recovery receipt witness')
+  return extra >= 0 && state.prefixSha === plan.sha && state.tail.equals(bytes.subarray(0, extra))
 }
 
-async function restoreBridge(row, save, inspect, allowLater = true) {
-  const [plan] = bridgePlans(row)
-  if (!plan) return
-  if (row.bridgeUndo) {
-    await appendBridge(row.bridgeUndo, inspect, true)
-    return
+async function bridgeRecovery(row, optional = false, aliases = []) {
+  const plans = bridgePlans(row, aliases), plan = plans[0]
+  if (!plan) return null
+  let state
+  try { state = await bridgeFile(plan, false, handle => bridgeRead(plan, handle)) }
+  catch (error) { if (optional && !row.bridgeUndo) return null; throw error }
+  if (state.prefixSha === plan.sha && stable(state.prefixLast) !== stable(plan.original)) throw bridgeError('invalid original bridge witness')
+  const witnessed = bridgeWitness(plan, state), extra = state.length - plan.length
+  if (!witnessed) {
+    if (optional && !row.bridgeUndo) return null
+    throw bridgeError('transcript restoration witness changed')
   }
-  await bridgeFile(plan, true, async handle => {
-    const state = await bridgeRead(plan, handle)
-    if (state.length <= plan.length + Buffer.byteLength(plan.bytes)) return truncateBridge(plan, handle, state, inspect)
-    if (!allowLater || state.prefixSha !== plan.sha || !state.tail.equals(Buffer.from(plan.bytes)) || state.invalid ||
-        stable(state.last) !== stable(bridgeClear(plan.sessionId))) throw bridgeError('newer transcript content prevents bridge restoration')
-    row.bridgeUndo = bridgePlan(plan, state, plan.original)
-    await save()
-    await appendBridge(row.bridgeUndo, inspect)
-  })
+  if (row.bridgeUndo) {
+    if (extra < Buffer.byteLength(plan.bytes)) throw bridgeError('transcript restoration witness changed')
+    const restored = await bridgeFile(row.bridgeUndo, false, handle => bridgeRead(row.bridgeUndo, handle, false))
+    if (!bridgeWitness(row.bridgeUndo, restored)) throw bridgeError('transcript restoration witness changed')
+    return { plan, state, restoring: true }
+  }
+  if (!extra) return null
+  if (extra >= Buffer.byteLength(plan.bytes) && (state.invalid || stable(state.last) !== stable(bridgeClear(plan.sessionId)))) {
+    if (optional) return null
+    throw bridgeError('transcript restoration witness changed')
+  }
+  return { plan, state, partial: extra < Buffer.byteLength(plan.bytes) }
 }
 
-async function bridgeProblems(rows) {
+async function restoreBridge(row, save, inspect, optional = false, allowLater = true) {
+  const recovery = await bridgeRecovery(row, optional)
+  if (!recovery) return
+  const { plan, partial, restoring } = recovery
+  if (restoring) return appendBridge(row.bridgeUndo, inspect, true, save)
+  if (!allowLater && recovery.state.length > plan.length + Buffer.byteLength(plan.bytes)) throw bridgeError('newer transcript content prevents bridge restoration')
+  if (partial) await appendBridge(plan, inspect, true, save)
+  const ready = await bridgeRecovery(row, optional)
+  if (!ready) return
+  row.bridgeUndo = bridgePlan(plan, ready.state, plan.original)
+  await save()
+  await appendBridge(row.bridgeUndo, inspect)
+}
+
+async function bridgeProblems(rows, optional = false) {
   const problems = []
+  const related = Map.groupBy(rows, row => row.targetId ?? row.id)
   for (const row of rows) {
     try {
-      const plans = bridgePlans(row)
-      for (const [index, plan] of plans.entries()) await bridgeFile(plan, false, async handle => {
-        const state = await bridgeRead(plan, handle), bytes = Buffer.from(plan.bytes), extra = state.length - plan.length
-        const original = index ? bridgeClear(plan.sessionId) : plan.original
-        const expected = index ? plans[0].original : bridgeClear(plan.sessionId)
-        if (extra < 0 || state.prefixSha !== plan.sha || state.intendedSha !== plan.afterSha || stable(state.prefixLast) !== stable(original) ||
-            !state.tail.equals(bytes.subarray(0, Math.max(0, extra))) ||
-            index < plans.length - 1 && extra < bytes.length || index === plans.length - 1 && extra > bytes.length &&
-            (state.invalid || stable(state.last) !== stable(expected))) throw bridgeError('transcript restoration witness changed')
-      })
+      await bridgeRecovery(row, optional, related.get(row.targetId ?? row.id).map(row => row.targetRecordId ?? row.recordSnapshot?.sessionId))
     } catch (error) { problems.push(`${row.title} | ${error.message}`) }
   }
   return problems
@@ -2509,13 +2537,13 @@ async function bridgeIntact(row) {
   if (!row.bridgeAppend) return true
   const plan = row.bridgeAppend
   return bridgeFile(plan, false, async handle => {
-    const state = await bridgeRead(plan, handle)
+    const state = await bridgeRead(plan, handle, false)
     return state.prefixSha === plan.sha && state.tail.equals(Buffer.from(plan.bytes))
   }).catch(() => false)
 }
 
 async function rehomeOne(s, to, journal, guard) {
-  const { fingerprint: transcriptFingerprint, append } = await bridgeSource(s, to)
+  const { fingerprint: transcriptFingerprint, append } = await bridgeSource(s, to, guard)
   if (!s.snapshot) throw new Error('source analysis unavailable')
   const sidecarRoot = path.join(path.dirname(s.transcript), s.id)
   const sidecarTree = await treeFingerprint(sidecarRoot)
@@ -2725,7 +2753,7 @@ async function targetChanges(row, liveWorkers, checkShared = true, allowRecordDr
     const currentFingerprint = await fingerprint(row.targetTranscript).catch(() => null)
     if (!currentFingerprint) changes.push('transcript missing')
     else if (checkShared && row.transcriptFingerprint && currentFingerprint !== row.transcriptFingerprint) changes.push('transcript')
-    else if (!await bridgeIntact(row)) changes.push('transcript')
+    else if (checkShared && !await bridgeIntact(row)) changes.push('transcript')
     const targetDir = row.targetDir ?? path.join(path.dirname(row.targetTranscript), row.targetId)
     const sidecarsExist = !row.sidecars?.count || await exists(targetDir)
     if (!sidecarsExist) changes.push('sidecars missing')
@@ -3135,7 +3163,7 @@ async function finishUndo(receipt, file, paths, options = {}) {
   const problems = [
     ...await restoreProblems(superseded, root),
     ...await restoreProblems(undoing, root),
-    ...await bridgeProblems(receipt.sessions),
+    ...await bridgeProblems(receipt.sessions, true),
     ...await activationProblems(receipt),
     ...await taskTransferProblems(receipt.taskTransfers, paths, inspector(paths, options), true, options.check)
   ]
@@ -3154,7 +3182,7 @@ async function finishUndo(receipt, file, paths, options = {}) {
     await restore(superseded, root, options.check)
     await park(undoing, async () => options.check?.())
     await restoreActivations(receipt)
-    for (const row of receipt.sessions) await restoreBridge(row, () => saveJson(file, receipt, 2, true), inspect)
+    for (const row of receipt.sessions) await restoreBridge(row, () => saveJson(file, receipt, 2, true), inspect, true)
     await writeTaskRegistrations(receipt.taskTransfers, 'source', true, paths, inspect, options.check)
     await mkdir(dest, { recursive: true })
   } catch (error) { failure = error }
@@ -3280,7 +3308,11 @@ async function reconcileFiles(paths, options = {}) {
     return { title: p.name, error: 'corrupt receipt set aside' }
   }
   const { receipt } = p
-  const bridgeIssues = await bridgeProblems([...(receipt.sessions ?? []), ...(receipt.pending ? [receipt.pending] : [])])
+  const bridgeRows = receipt.undoing ? receipt.sessions ?? [] : receipt.remotePending ? [] : [
+    ...(receipt.pending ? [receipt.pending] : []),
+    ...(receipt.finalizing ? (receipt.sessions ?? []).slice(receipt.appendCheckpoint?.sessions ?? 0) : [])
+  ]
+  const bridgeIssues = await bridgeProblems(bridgeRows, Boolean(receipt.undoing))
   if (bridgeIssues.length) return { title: 'bridge recovery blocked', error: bridgeIssues.join(', '), problems: bridgeIssues }
   const inspect = inspector(paths, options)
   const taskTransfers = recoveryFamilies(receipt)
@@ -4368,7 +4400,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     await writeTaskRegistrations([transfer], 'source', false, paths, inv.inspect, context.check, context.snapshots)
     for (const row of inv.sources) row.taskOwned = false
   }
-  const rehomeGuard = { workers: workers(inv.inspect()), inspect: inv.inspect, sources: context.sources, taskSessions: new Map(), created: new Map(), check: context.check }
+  const rehomeGuard = { workers: workers(inv.inspect()), inspect: inv.inspect, sources: context.sources, targets: inv.targets, taskSessions: new Map(), created: new Map(), check: context.check }
   for (const file of new Set([...inv.move.map((row) => row.account.taskFile), to.taskFile])) {
     rehomeGuard.taskSessions.set(file, await taskSessions(file))
   }
@@ -4390,7 +4422,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
       } catch (error) {
         if (error.code === 'JOURNAL_WRITE' || error.code === 'RESTART_CAPACITY') throw error
         if (receipt.pending.bridgeAppend) {
-          try { await restoreBridge(receipt.pending, () => journal.save(true), inv.inspect, false) }
+          try { await restoreBridge(receipt.pending, () => journal.save(true), inv.inspect, false, false) }
           catch (recovery) { throw bridgeError(`${error.message}. ${recovery.message}`) }
         }
         const raw = await readFile(made[0]).catch(() => null)
@@ -5052,7 +5084,7 @@ async function undoFiles(paths, options = {}) {
   if (kept.length) return { receipt, changed: kept }
   const root = path.join(paths.state, 'quarantine')
   const blocked = [...await restoreProblems(receipt.superseded ?? [], root),
-    ...await bridgeProblems(receipt.sessions),
+    ...await bridgeProblems(receipt.sessions, true),
     ...await taskTransferProblems(receipt.taskTransfers, paths, inspect) ]
   const schedulerHeld = blocked.length > 0 && blocked.every(problem => problem === SCHEDULER_OWNS) && !options.check
   if (schedulerHeld && !receipt.remote?.length) return { restartNeeded: true, file, receipt }
@@ -5515,7 +5547,7 @@ async function main(argv) {
       rescued.length ? `  ${count(rescued.length)} rescued remote transcripts | ${count(rescued.length)} desktop records → quarantine` : null,
       back ? `  ${count(back)} source records put back` : null,
       cloudBack ? `  ${count(cloudBack)} cloud mirrors restored` : null,
-      '  chat messages unchanged ✓',
+      `  chat messages preserved ✓${receipt.sessions.some(row => row.bridgeAppend) ? ' | local bridge metadata preserved or restored' : ''}`,
       `  quarantine  ${result.dest}`,
       `  then        ${NOTE}`,
       ''

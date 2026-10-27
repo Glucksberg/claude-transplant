@@ -176,7 +176,7 @@ Manual walkthrough: [recovering missing Claude Desktop history](https://dev.to/v
 
 ## How it works
 
-A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. The transcript pool is shared across accounts, so a move writes the same record into the target organization with the same `cliSessionId`, verifies that transcript, sidecars, and both records are unchanged, then parks the source record in quarantine.
+A session is three files: the transcript in `~/.claude/projects`, the sidecar directory beside it, and the record under `~/Library/Application Support/Claude/claude-code-sessions/<account>/<organization>`. A move keeps shared chat messages and sidecars in place, writes and verifies the destination record with the same `cliSessionId`, then parks the source record in quarantine. Local bridge metadata may be appended as described below.
 
 Eligibility:
 
@@ -249,7 +249,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 <summary>Rules</summary>
 
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
-- Chat messages and sidecars stay intact. A move can append Claude Code's native empty Remote Control pointer locally, avoiding the foreign-owner path that suppresses title and history sharing on the next wake. A pointer already owned by the destination stays. Receipts journal this metadata change alongside quarantined records, allowing recovery and Undo to restore the original pointer safely while preserving later messages and refusing newer bridges. Existing history suppression stays, and already-created cloud sessions are not renamed. This local append needs no `--cloud`, which continues to control network work.
+- Chat messages and sidecars stay intact. A move can append Claude Code's native empty Remote Control pointer to avoid stale foreign-owner title and history suppression. A destination-owned pointer stays. Recovery only appends, completing a proven partial metadata tail before restoring the saved pointer when still owned. Undo of a completed move leaves later transcript edits and newer pointers alone. Unproven interrupted writes stay pending. Existing history suppression stays, and existing cloud sessions are not renamed. Local metadata needs no `--cloud`, which controls network work.
 - Moves with no active worker or affected scheduler need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
 - Remote rescue copies payloads exactly. No model reconstructs history.
 - Remote Control network requests require `--cloud`, with no credential persistence. Local bridge metadata does not.
