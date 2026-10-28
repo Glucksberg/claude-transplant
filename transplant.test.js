@@ -2989,6 +2989,29 @@ test('a rehome clears the source bridge and Undo restores its original attachmen
   assertBridgeRestored(restored, await readFile(transcript), { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })
 })
 
+test('a rehome leaves an SSH transcript mirror byte-identical to its remote', async () => {
+  const h = await home()
+  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
+  await h.write(SOURCE, [
+    entry('user', 1, null, SOURCE),
+    entry('assistant', 2, 1, SOURCE),
+    { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_prior', lastSequenceNum: 7, ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
+  ])
+  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior'], sshConfig: { sshHost: 'dev@build' }, sshRemoteTranscriptPath: `/home/dev/.claude/projects/-home-dev/${SOURCE}.jsonl` }))
+  const targetDir = path.join(h.paths.records, h.acct.Z, h.org.Z)
+  await mkdir(targetDir, { recursive: true })
+  const before = await readFile(transcript)
+  const all = await accounts(h.paths)
+  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
+  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
+  const inv = await inventory([from], to, h.paths)
+  assert.equal(inv.move[0].strategy, 'rehome')
+  assert.equal((await move(inv, to, h.paths)).ok, true)
+  assert.deepEqual(await readFile(transcript), before)
+  assert.ok((await undo(h.paths)).dest)
+  assert.deepEqual(await readFile(transcript), before)
+})
+
 test('bridge append honors native ownership, formatting, aliases and an already cleared pointer', async t => {
   for (const mode of ['foreign', 'unknown owner', 'destination owner', 'other organization', 'legacy', 'spaced', 'no newline', 'empty', 'foreign session', 'parent alias']) await t.test(mode, async () => {
     const h = await bridgeFixture(), entries = lines(h.before.toString())
