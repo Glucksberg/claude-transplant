@@ -2444,7 +2444,8 @@ async function bridgeSource(s, to, guard) {
     if (s.transcriptFingerprint && state.fingerprint !== s.transcriptFingerprint || !s.contentSha || state.sha !== s.contentSha) throw new Error('source changed since inventory')
     const pointer = state.last?.bridgeSessionId ?? state.last?.bridge_session_id
     const destinationOwned = state.last?.ownerAccountUuid === to.account && state.last?.ownerOrganizationUuid === to.org
-    const append = typeof pointer === 'string' && pointer && !state.invalid && !destinationOwned
+    const mirror = typeof s.record.sshRemoteTranscriptPath === 'string' && s.record.sshRemoteTranscriptPath !== ''
+    const append = typeof pointer === 'string' && pointer && !state.invalid && !destinationOwned && !mirror
       ? { ...bridgePlan(base, state, bridgeClear(s.id)), original: state.last } : null
     if (append) bridgePlans({ id: s.id, recordId: s.record.sessionId, transcript: s.transcript, bridgeAppend: append })
     return { fingerprint: state.fingerprint, append }
