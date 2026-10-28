@@ -288,6 +288,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 | Require `/usr/bin/lockf` on every macOS version | macOS 14.5 lacks the utility. Bundled Perl takes the same kernel lock when it is absent |
 | Require a deleted task's registration to move its archived runs | Archived runs without notification routes or scheduler state can move through the guarded task-family path without recreating the task |
 | Raise each history's memory limit independently | Concurrent reads multiply memory use. Share a process budget and reduce concurrency under pressure |
+| Append the bridge clear to an SSH session's local transcript | Desktop extends that mirror with the remote bytes past the local size, so the next remote write lands short and leaves an unparseable fragment. Leave SSH mirrors untouched |
 
 </details>
 
