@@ -818,7 +818,7 @@ final class Model: ObservableObject {
                 if event.ok == true && event.complete == true && issues == 0 { companionTitles = titles }
             }
             let destinationActive = accounts.first(where: { $0.active == true }).map { $0.label == (event.destinationLabel ?? operationDestination) } ?? false
-            restartAvailable = event.code == "REOPEN_FAILED" ? false : event.restart == true || moved > 0 && event.restarted != true && (event.heldCount ?? 0) == 0 && destinationActive
+            restartAvailable = event.code == "REOPEN_FAILED" ? false : event.restart == true || operationArgs.contains("--from") && moved > 0 && event.restarted != true && (event.heldCount ?? 0) == 0 && destinationActive
             if restartAvailable { restartSince = Date() }
             if !pendingResult && event.ok != false { excluded = []; from = []; to = nil; targetChosen = false; selectionComplete = true }
             notify(note, "")

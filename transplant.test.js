@@ -9890,6 +9890,7 @@ async function swiftFixtureSource() {
     var values: [String: Any] = [:]
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
     func dictionary(forKey key: String) -> [String: Any]? { values[key] as? [String: Any] }
+    func string(forKey key: String) -> String? { values[key] as? String }
     func set(_ value: Any?, forKey key: String) { values[key] = value }
 }
 @MainActor let fixtureDefaults = FixtureDefaults()
@@ -10945,8 +10946,8 @@ struct HomeChecks {
         let model = Model(demo: list)
         model.selectTarget(list[0].id)
         model.begin()
-        model.handle(#"DONE"#)
         model.checkOperation(["--from", list[1].selector, "--to", list[0].selector, "--cloud", "--json"])
+        model.handle(#"DONE"#)
         model.checkFinish(0)
         precondition(model.note == "122 moved. 1 session was not moved.", model.note)
         precondition(model.restartAvailable)
@@ -10978,8 +10979,8 @@ struct HomeChecks {
         let early = Model(demo: previous)
         early.selectTarget(previous[0].id)
         early.begin()
-        early.handle(#"DONE"#)
         early.checkOperation(["--from", previous[1].selector, "--to", previous[0].selector, "--cloud", "--json"])
+        early.handle(#"DONE"#)
         early.checkFinish(0)
         early.panelVisibility(false)
         early.accounts = list
