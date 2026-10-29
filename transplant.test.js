@@ -2876,27 +2876,45 @@ test('a rehome clears the source bridge and Undo restores its original attachmen
   assertBridgeRestored(restored, await readFile(transcript), { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: '', lastSequenceNum: 0 })
 })
 
-test('a rehome leaves an SSH transcript mirror byte-identical to its remote', async () => {
-  const h = await home()
-  const transcript = path.join(h.project, `${SOURCE}.jsonl`)
-  await h.write(SOURCE, [
-    entry('user', 1, null, SOURCE),
-    entry('assistant', 2, 1, SOURCE),
-    { type: 'bridge-session', sessionId: SOURCE, bridgeSessionId: 'cse_prior', lastSequenceNum: 7, ownerAccountUuid: h.acct.P, ownerOrganizationUuid: h.org.P }
-  ])
-  await h.record('P', SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior'], sshConfig: { sshHost: 'dev@build' }, sshRemoteTranscriptPath: `/home/dev/.claude/projects/-home-dev/${SOURCE}.jsonl` }))
-  const targetDir = path.join(h.paths.records, h.acct.Z, h.org.Z)
-  await mkdir(targetDir, { recursive: true })
-  const before = await readFile(transcript)
-  const all = await accounts(h.paths)
-  const from = all.find((a) => a.account === h.acct.P && a.org === h.org.P)
-  const to = all.find((a) => a.account === h.acct.Z && a.org === h.org.Z)
-  const inv = await inventory([from], to, h.paths)
-  assert.equal(inv.move[0].strategy, 'rehome')
-  assert.equal((await move(inv, to, h.paths)).ok, true)
-  assert.deepEqual(await readFile(transcript), before)
-  assert.ok((await undo(h.paths)).dest)
-  assert.deepEqual(await readFile(transcript), before)
+test('bridge rehome preserves SSH mirrors and records through Move and Undo', async t => {
+  const sshConfig = { sshHost: 'fixture.invalid' }, sshRemoteTranscriptPath = `/home/fixture/.claude/projects/-home-fixture/${SOURCE}.jsonl`
+  for (const [mode, extra] of [
+    ['remote path', { sshRemoteTranscriptPath }],
+    ['configuration and remote path', { sshConfig, sshRemoteTranscriptPath }],
+    ['configuration without cached path', { sshConfig }],
+    ['configuration with empty cached path', { sshConfig, sshRemoteTranscriptPath: '' }],
+    ['shared configuration', { sshConfig }],
+    ['shared remote path', { sshRemoteTranscriptPath }],
+    ['native mirror location', {}],
+    ['native mirror alias', {}]
+  ]) await t.test(mode, async () => {
+    const h = await bridgeFixture(), shared = mode.startsWith('shared')
+    await h.record('P', shared ? id(777) : SOURCE, rehomeRecord({ bridgeSessionIds: ['session_prior'], ...extra,
+      ...(shared ? { cliSessionId: SOURCE, forkedFromSessionId: `local_${SOURCE}` } : {}) }))
+    if (mode.startsWith('native mirror')) {
+      const project = path.join(h.paths.pool, `ssh-${SOURCE}`)
+      await rename(h.project, project)
+      if (mode === 'native mirror alias') await symlink(project, h.project)
+      h.transcript = await fs.realpath(path.join(project, `${SOURCE}.jsonl`))
+    }
+    const originals = await Promise.all((await readdir(h.dir('P'))).map(async name => ({ name, bytes: await readFile(path.join(h.dir('P'), name)) })))
+    const from = (await accounts(h.paths, [])).find(a => a.account === h.acct.P)
+    const inv = await inventory([from], h.to, h.paths, () => {}, { processes: [] })
+    assert.equal(inv.move.length, originals.length)
+    assert.equal(inv.move[0].record.sessionId, `local_${SOURCE}`)
+    if (mode === 'native mirror alias') assert.equal(inv.move[0].transcript, path.join(h.project, `${SOURCE}.jsonl`))
+    assert.ok(inv.move.every(row => row.strategy === 'rehome'))
+    const moved = await move(inv, h.to, h.paths)
+    assert.equal(moved.ok, true)
+    assert.ok(moved.receipt.sessions.every(row => !row.bridgeAppend))
+    assert.deepEqual(await readFile(h.transcript), h.before)
+    for (const { name, bytes } of originals) assert.deepEqual(JSON.parse(await readFile(path.join(h.dir('Z'), name))), { ...JSON.parse(bytes), bridgeSessionIds: [] })
+    assert.deepEqual(await readdir(h.dir('P')), [])
+    assert.ok((await undo(h.paths, { processes: [] })).dest)
+    assert.deepEqual(await readFile(h.transcript), h.before)
+    for (const { name, bytes } of originals) assert.deepEqual(await readFile(path.join(h.dir('P'), name)), bytes)
+    assert.deepEqual(await readdir(h.dir('Z')), [])
+  })
 })
 
 test('bridge append honors native ownership, formatting, aliases and an already cleared pointer', async t => {

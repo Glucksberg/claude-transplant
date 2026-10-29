@@ -249,7 +249,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 <summary>Rules</summary>
 
 - Rehome local history or refuse. Never duplicate a local transcript, never merge histories.
-- Chat messages and sidecars stay intact. A move can append Claude Code's native empty Remote Control pointer to avoid stale foreign-owner title and history suppression. A destination-owned pointer stays. Recovery only appends, completing a proven partial metadata tail before restoring the saved pointer when still owned. Undo of a completed move leaves later transcript edits and newer pointers alone. Unproven interrupted writes stay pending. Existing history suppression stays, and existing cloud sessions are not renamed. Local metadata needs no `--cloud`, which controls network work.
+- Chat messages and sidecars stay intact. A move can append Claude Code's native empty Remote Control pointer to avoid stale foreign-owner title and history suppression. A destination-owned pointer stays. New moves leave SSH mirrors unchanged. This does not repair existing damage or migrate older bridge-write receipts. Recovery only appends, completing a proven partial metadata tail before restoring the saved pointer when still owned. Undo of a completed move leaves later transcript edits and newer pointers alone. Unproven interrupted writes stay pending. Existing history suppression stays, and existing cloud sessions are not renamed. Local metadata needs no `--cloud`, which controls network work.
 - Moves with no active worker or affected scheduler need no confirmation. Desktop restarts require exact plan approval or the saved warning preference.
 - Remote rescue copies payloads exactly. No model reconstructs history.
 - Remote Control network requests require `--cloud`, with no credential persistence. Local bridge metadata does not.
@@ -300,6 +300,7 @@ Active identity comes from the newest complete initialization entry in Claude De
 
 | claude-transplant | macOS | Claude Desktop | Claude Code | Tested |
 |---|---|---|---|---|
+| 4.1.6 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-29 |
 | 4.1.5 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.4 | 27.0.1 | 3.6556.2 | 2.1.308 | 2026-10-26 |
 | 4.1.3 | 27.0.1 | 2.42304.0 | 2.1.299 | 2026-10-15 |
@@ -312,6 +313,6 @@ Active identity comes from the newest complete initialization entry in Claude De
 | 4.0.4 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-08 |
 | 4.0.3 | 27.0 | 1.46388.4 | 2.1.260 | 2026-09-07 |
 
-4.1.5 validation uses synthetic fixtures and read-only native-code inspection. No new live move or cloud-title check was performed.
+4.1.6 validation uses synthetic fixtures and read-only Desktop-code inspection, with no new live SSH move. 4.1.5 validation used synthetic fixtures and read-only native-code inspection, with no new live move or cloud-title check.
 
 Receipts, quarantine, drift evidence, cache, and the menubar app live in `~/Library/Application Support/claude-transplant`. Delete `quarantine` once its receipts are no longer wanted. A kernel lock prevents overlapping runs. MIT.
